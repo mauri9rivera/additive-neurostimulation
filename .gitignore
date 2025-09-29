@@ -8,3 +8,7 @@ id_ed25519_additive.pub
 # python artifacts
 __pycache__/
 *.pyc
+
+# bash scripts
+*.sh
+

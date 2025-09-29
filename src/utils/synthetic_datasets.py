@@ -126,11 +126,11 @@ class CustomAdditiveFunction(BaseTestProblem):
         self.optimal_value = 1.0 + 2*math.pi**2
         self.d = 2
 
-    def evaluate_true(self, X):
+    def _evaluate_true(self, X):
         return torch.sin(X[:, [0]]) + 0.5 * X[:, [1]]**2
 
     def forward(self, X):
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y += torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
@@ -146,7 +146,7 @@ class CustomNonAdditiveFunction(BaseTestProblem):
         self.optimal_value = 4.15676
         self.d = 2
 
-    def evaluate_true(self, X):
+    def _evaluate_true(self, X):
         x1 = X[:, [0]]
         x2 = X[:, [1]]
         numerator = torch.sin(x1) * (x2 ** 3)
@@ -154,7 +154,7 @@ class CustomNonAdditiveFunction(BaseTestProblem):
         return numerator / (denominator + 1e-8)
     
     def forward(self, X):
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y += torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
@@ -178,7 +178,7 @@ class Schwefel(BaseTestProblem):
         self.optimal_value = 0.0
 
 
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         """
         Evaluate the *maximized* Schwefel function with optimal value = 0.
         """
@@ -187,7 +187,7 @@ class Schwefel(BaseTestProblem):
         return y.reshape(-1)
     
     def forward(self, X):
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y += torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
@@ -202,7 +202,7 @@ class Powell(BaseTestProblem) :
         self._bounds = [(-4.0, 5.0)] * d  # per-dimension bounds
         self.optimal_value = 0.0
 
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         """
         X: tensor of shape (n_samples, d*4)
         Powell-term operates on each group of 4 dims independently,
@@ -222,7 +222,7 @@ class Powell(BaseTestProblem) :
         return fvals.reshape(-1)
 
     def forward(self, X):
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y += torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y  
@@ -243,7 +243,7 @@ class EggholderFunction(BaseTestProblem):
         self.optimal_value = -self._true_min if self.negate else self._true_min
 
 
-    def evaluate_true(self, X):
+    def _evaluate_true(self, X):
         # X is (n,2)
         x1 = X[:, [0]]
         x2 = X[:, [1]]
@@ -253,7 +253,7 @@ class EggholderFunction(BaseTestProblem):
         return f_orig.reshape(-1)
 
     def forward(self, X):
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
@@ -317,13 +317,13 @@ class TwoBlobs(BaseTestProblem):
         exp_term = ((Xnorm**2) - (2 * rho * Xnorm * Ynorm) + (Ynorm**2)) / (2 * (1 - rho**2))
         return torch.exp(-exp_term) / denom
 
-    def evaluate_true(self, X):
+    def _evaluate_true(self, X):
         g1 = self.gaussian_pdf(X, self.mean1, self.std1, self.rho1) * self.weight1
         g2 = self.gaussian_pdf(X, self.mean2, self.std2, self.rho2) * self.weight2
         return g1 + g2
 
     def forward(self, X):
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
@@ -446,11 +446,11 @@ class DBlobs(BaseTestProblem):
         
         return result.unsqueeze(-1)
 
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         return self._evaluate_single_point(X).reshape(-1)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
@@ -484,7 +484,7 @@ class GoldsteinPrice(BaseTestProblem):
         self.negate = negate
         self.optimal_value = 3.0  # known global minimum
 
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         x1, x2 = X[..., 0], X[..., 1]
 
         term1 = (
@@ -508,7 +508,7 @@ class GoldsteinPrice(BaseTestProblem):
         return y.reshape(-1)  # ensure output shape (N, 1)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
@@ -653,7 +653,7 @@ class MultiplicativeInteraction(BaseTestProblem):
 
     # -----------------------------
     # evaluate multiplicative mixture given full X (N,d) or (d,)
-    def evaluate_true(self, X):
+    def _evaluate_true(self, X):
         is_vector = (X.dim() == 1)
         if is_vector:
             X = X.unsqueeze(0)
@@ -661,8 +661,8 @@ class MultiplicativeInteraction(BaseTestProblem):
         Xu = X[:, self.idx_u]
         Xv = X[:, self.idx_v]
 
-        u_raw = self.U.evaluate_true(Xu)
-        v_raw = self.V.evaluate_true(Xv)
+        u_raw = self.U._evaluate_true(Xu)
+        v_raw = self.V._evaluate_true(Xv)
 
         if self.rescale_positive:
             u = torch.exp(-u_raw / (1.0 + Xu.shape[-1]))
@@ -684,16 +684,16 @@ class MultiplicativeInteraction(BaseTestProblem):
         if self.rescale_positive:
             def eval_u_pos(Xsub):
                 # Xsub: (N,m)
-                val = self.U.evaluate_true(Xsub)
+                val = self.U._evaluate_true(Xsub)
                 return torch.exp(-val / (1.0 + Xsub.shape[-1]))
             def eval_v_pos(Xsub):
-                val = self.V.evaluate_true(Xsub)
+                val = self.V._evaluate_true(Xsub)
                 return torch.exp(-val / (1.0 + Xsub.shape[-1]))
             u_eval = eval_u_pos
             v_eval = eval_v_pos
         else:
-            u_eval = lambda Xsub: self.U.evaluate_true(Xsub)
-            v_eval = lambda Xsub: self.V.evaluate_true(Xsub)
+            u_eval = lambda Xsub: self.U._evaluate_true(Xsub)
+            v_eval = lambda Xsub: self.V._evaluate_true(Xsub)
 
         # maximize U on its subspace
         m_u = len(self.idx_u)
@@ -736,14 +736,14 @@ class MultiplicativeInteraction(BaseTestProblem):
             opt = torch.optim.Adam([x], lr=self._full_lr)
             for _ in range(self._full_steps):
                 opt.zero_grad()
-                val = self.evaluate_true(x.unsqueeze(0)).squeeze()
+                val = self._evaluate_true(x.unsqueeze(0)).squeeze()
                 loss = -val
                 loss.backward()
                 opt.step()
                 with torch.no_grad():
                     x.clamp_(0.0, 10.0)
 
-            val_end = float(self.evaluate_true(x.unsqueeze(0)).squeeze().item())
+            val_end = float(self._evaluate_true(x.unsqueeze(0)).squeeze().item())
             if val_end > best_val:
                 best_val = val_end
                 best_x = x.detach().clone()
@@ -755,7 +755,7 @@ class MultiplicativeInteraction(BaseTestProblem):
             combo = torch.zeros(self.d, dtype=dtype, device=device)
             combo[self.idx_u] = x_u_star
             combo[self.idx_v] = x_v_star
-            val_combo = float(self.evaluate_true(combo.unsqueeze(0)).squeeze().item())
+            val_combo = float(self._evaluate_true(combo.unsqueeze(0)).squeeze().item())
             if val_combo > best_val:
                 best_val = val_combo
                 best_x = combo.detach().clone()
@@ -764,7 +764,7 @@ class MultiplicativeInteraction(BaseTestProblem):
 
     # -----------------------------
     def forward(self, X):
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
@@ -799,7 +799,7 @@ class RosenbrockRotated(BaseTestProblem):
         original_optimum = torch.ones(dim)
         self.rotated_optimum = self.rotation_matrix @ original_optimum
 
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         # Apply rotation to input
         X_rotated = X @ self.rotation_matrix.T
         
@@ -813,7 +813,7 @@ class RosenbrockRotated(BaseTestProblem):
         return result.reshape(-1)  # ensure output shape (N, 1)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
@@ -831,7 +831,7 @@ class AckleyCorrelated(BaseTestProblem):
     """
     
     def __init__(self, dim: int = 5, noise_std: float = 0.0, negate: bool = False, 
-                 correlation_strength: float = 0.3):
+                 correlation_strength: float = 0.2):
         self.dim = dim
         self._bounds = [(-32.768, 32.768) for _ in range(dim)]
         self.noise_std = noise_std
@@ -842,7 +842,7 @@ class AckleyCorrelated(BaseTestProblem):
         self.b = 0.2
         self.c = 2.0 * torch.pi
 
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         n = self.dim
         a, b, c = self.a, self.b, self.c
         alpha = self.correlation_strength
@@ -864,7 +864,7 @@ class AckleyCorrelated(BaseTestProblem):
         return result.reshape(-1)  # ensure output shape (N, 1)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
@@ -936,7 +936,7 @@ class GriewankRosenbrockHybrid(BaseTestProblem):
             
         return result.unsqueeze(-1)
 
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         # Split input into Ackley and Rosenbrock parts
         x_ackley = X[..., :self.ackley_dim]
         x_rosenbrock = X[..., self.ackley_dim:]
@@ -949,7 +949,7 @@ class GriewankRosenbrockHybrid(BaseTestProblem):
         return ackley_val + rosenbrock_val
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        Y = self.evaluate_true(X)
+        Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y

@@ -1,46 +1,24 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import scipy.io
-from matplotlib.gridspec import GridSpec
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib import cm
 import sys
 import os
-from pathlib import Path
 import torch
 import gpytorch
-import math
 import datetime
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from mpl_toolkits.mplot3d import Axes3D
-from gpytorch.mlls import ExactMarginalLogLikelihood
-from botorch.models import SingleTaskGP
-from functools import reduce
 import random
 import copy
-from sklearn.preprocessing import StandardScaler
-from gpytorch.kernels import AdditiveKernel
-from gpytorch.models.exact_gp import GPInputWarning
 
-from scipy.stats import qmc
+from gpytorch.models.exact_gp import GPInputWarning
 
 
 from botorch.acquisition import UpperConfidenceBound
 from botorch.optim import optimize_acqf
-from gpytorch.mlls import ExactMarginalLogLikelihood
-from torch.quasirandom import SobolEngine
 
 from SALib.analyze import sobol as salib_sobol
-
 from SALib.sample import saltelli
 from SALib.sample import sobol as sobol_sampler
-import matplotlib.cm as cm
-import matplotlib.colors as colors
-from matplotlib.colors import Normalize
 
 from concurrent.futures import ThreadPoolExecutor
-import concurrent.futures
 import warnings
 import traceback
 
@@ -49,7 +27,6 @@ import traceback
 from models.gaussians import AdditiveKernelGP, BaseGP, WrappedModel, ExactGPModel
 from utils.synthetic_datasets import *
 
-import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="SALib.util")
 
 
@@ -562,9 +539,9 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10,
 
         # Acquisition scoring
         UCB = UpperConfidenceBound(model=gp, beta=kappa**2, maximize=True)
-        
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
         new_x, _ = optimize_acqf(
-            acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=500)
+            acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512)
         new_y = f_obj.f.forward(new_x)
 
         '''
@@ -716,26 +693,16 @@ def run_bo(f_obj, model_cls, n_init=8, n_iter=200, kappa=1.0, save=False, verbos
     for i in range(n_iter - n_init):
 
         # Train model
-        gp.model.train()
-        gp.likelihood.train()
-        optimizer = torch.optim.Adam(gp.model.parameters(), lr=0.01)
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(gp.likelihood, gp.model)
-        epoch_losses = []
-        for _ in range(20):
-            optimizer.zero_grad()
-            out = gp.model(train_x)
-            loss = -mll(out, train_y).mean()
-            loss.backward()
-            optimizer.step()
-            epoch_losses.append(loss.item())
+        gp.model, gp.likelihood, epoch_losses = optimize(gp.model, train_x, train_y)
         loss_curve.append(np.mean(epoch_losses))
 
     
         # Acquisition scoring
         UCB = UpperConfidenceBound(model=gp, beta=kappa**2, maximize=True)
         # Next point
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
         new_x, _ = optimize_acqf(
-            acq_function=UCB, bounds=bounds, q=1, num_restarts=5, raw_samples=50)
+            acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512)
         new_y = f_obj.f.forward(new_x)
 
         #update dataset
@@ -872,7 +839,7 @@ def kappa_search(f_obj, kappa_list, model_cls=BaseGP, n_init=8, n_iter=100, n_re
     os.makedirs(output_dir, exist_ok=True)
     plot_path = os.path.join(
         output_dir,
-        f'kappa_search_{model_cls.__name__}_{f_obj.f.d}-dimensional_avg{n_reps}_{datetime.date.today().isoformat()}.svg'
+        f'kappa_search_{model_cls.__name__}_{f_obj.f.d}-dimensional_avg{n_reps}_budget{n_iter}.svg'
     )
     plt.savefig(plot_path, format="svg")
     plt.close()
@@ -988,9 +955,8 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
     # Save performance figure
     output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
     os.makedirs(output_dir, exist_ok=True)
-    date_str = datetime.date.today().isoformat()
     dim = f_obj.d
-    perf_filename = f'explr-explt_{f_obj.name}-{dim}_{date_str}.svg'
+    perf_filename = f'explr-explt_{f_obj.name}_{dim}-dimensional_avg{n_reps}_budget{n_iter}.svg'
     perf_path = os.path.join(output_dir, perf_filename)
     plt.savefig(perf_path, format='svg')
     plt.close(fig1)
@@ -1026,7 +992,7 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
     ax2.grid(True)
     ax2.legend(loc='upper right', fontsize='small')
 
-    regrets_filename = f'regrets_{f_obj.name}-{dim}_{date_str}.svg'
+    regrets_filename = f'regrets_{f_obj.name}_{dim}-dimensional_avg{n_reps}_budget{n_iter}.svg'
     regrets_path = os.path.join(output_dir, regrets_filename)
     plt.savefig(regrets_path, format='svg')
     plt.close(fig2)
@@ -1182,40 +1148,60 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
 if __name__ == '__main__':
 
     settings = [
-        ('twoblobs', 2),
-        ('michalewicz', 2),
-        ('hartmann', 6),
-        ('rosenbrock_rotated', 6),
+        #new functions
+        ('rosenbrock_rotated', 6), too easy
         ('ackley_correlated', 10),
         ('multprod', 4),
         ('dblobs', 4),
-        #('powell', 4),
-        #('goldstein-price', 2),
-        #('shekel', 4),
-        #('rosenbrock', 12)
+
+        # old functions
+        ('twoblobs', 2),
+        ('michalewicz', 2),
+        ('hartmann', 6),
+
+        #others?
+        ('powell', 4),
+        ('goldstein-price', 2),
+        ('shekel', 4),
+        ('rosenbrock', 12),
     ]
 
-    kappas = [0.5, 1, 3, 5, 7, 9, 11, 15]
-
-    # step 1: kappa search for all test functions
-    for name, dim in settings:
+    # kappa search results on additive, simple, sobolGP for old_functions
+    old_functions = [('twoblobs', 2),
+        ('michalewicz', 2),
+        ('hartmann', 6)]
     
-        f_obj = SyntheticTestFun(name=name, d=dim, noise=0.0, negate= False if name == 'twoblobs' else True)
+    twoblobs_kappas = [0.1, 0.25, 0.5, 1, 2]
+    normal_kappas = [1, 3, 5, 7, 9, 11, 15]
 
-        print(f'start of {name} experiments')
-        kappa_search(f_obj, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=10)
-        kappa_search(f_obj, kappas, model_cls=MHGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=10)
+    for name, dim in old_functions:
+        f_obj = SyntheticTestFun(name=name, d=dim, noise=0.0, negate= False if name in ['twoblobs', 'dblobs', 'multprod'] else True)
+        kappas = twoblobs_kappas if name == 'twoblobs' else normal_kappas
+        kappa_search(f_obj, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=15)
+        kappa_search(f_obj, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=15)
+        kappa_search(f_obj, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=15)
+        kappa_search(f_obj, kappas, model_cls=MHGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=15)
 
-        # kappa search on new functions as well
-        if name in ['rosenbrock_rotated', 'ackley_correlated', 'multprod', 'dblobs']:
-            kappa_search(f_obj, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=10)
-            kappa_search(f_obj, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=10)
+
+    #new functions
+    new_functions = [
+        #('rosenbrock_rotated', 6), too easy
+        ('ackley_correlated', 8),
+        ('multprod', 4),
+        ('dblobs', 4),
+        ]
+
+    # step 2 : kappa search for all test functions
+    for name, dim in new_functions:
+    
+        f_obj = SyntheticTestFun(name=name, d=dim, noise=0.0, negate= False if name in ['twoblobs', 'dblobs', 'multprod'] else True)
+        kappa_search(f_obj, normal_kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=15)
+        kappa_search(f_obj, normal_kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=15)
+        kappa_search(f_obj, normal_kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
+        
 
 
-    # step 2: plot_synthetic_results
-    f_evaluated = SyntheticTestFun(name='michalewicz', d=dim, noise=0.0, negate= False if name == 'twoblobs' else True)
-    kappas = [1.0, 1.0, 1.0, 1.0]
-    optimization_metrics(f_evaluated, kappas, n_init=8, n_iter=100*(dim // 2), n_reps=15, ci=95)
+    
     
 
 
