@@ -359,22 +359,29 @@ class DBlobs(BaseTestProblem):
         self.cov_matrices = []
         self.weights = []
         self.rhos = []  # Correlation parameters
+
+        jitter = 1e-8
         
         # Generate random blobs
         for i in range(self.n_blobs):
             # Random mean within [2, 8] to avoid edges
-            mean = torch.tensor(2.0 + 6.0 * torch.rand(d))
+            mean = torch.as_tensor(2.0 + 6.0 * torch.rand(d), dtype=torch.get_default_dtype())
             self.means.append(mean)
             
             # Random standard deviations between [0.5, 2.0]
-            stds = torch.tensor(0.5 + 1.5 * torch.rand(d))
-            
+            stds = torch.as_tensor(0.5 + 1.5 * torch.rand(d), dtype=torch.get_default_dtype())
+
             # Random correlation parameter rho for correlation structure
-            rho = torch.tensor(-0.8 + 1.6 * torch.rand(1).item())  # rho in [-0.8, 0.8]
+            rho_max = 0.4
+            rho_min = -1.0 / float(d - 1) + 1e-6  # safe lower bound for exchangeable corr
+            if rho_min >= rho_max:
+                rho_min = rho_max - 1e-6 
+            rho_val = float(rho_min + (rho_max - rho_min) * torch.rand(1).item())
+            rho = torch.as_tensor(rho_val, dtype=torch.get_default_dtype())
             self.rhos.append(rho)
             
             # Create covariance matrix with exchangeable correlation structure
-            cov_matrix = self._create_exchangeable_covariance(stds, rho)
+            cov_matrix = self._create_exchangeable_covariance(stds, rho, eps=jitter)
             self.cov_matrices.append(cov_matrix)
             
             # Weights: first blob gets weight 1.0, others get decreasing weights
@@ -398,18 +405,35 @@ class DBlobs(BaseTestProblem):
         self.optimal_point = self.means[0]
         self.optimal_value = self._evaluate_single_point(self.optimal_point.unsqueeze(0)).item()
 
-    def _create_exchangeable_covariance(self, stds: torch.Tensor, rho: float) -> torch.Tensor:
+    def _create_exchangeable_covariance(self, stds: torch.Tensor, rho: float, eps: float = 1e-8) -> torch.Tensor:
         """
         Create covariance matrix with exchangeable correlation structure.
         
         Sigma_ij = std_i * std_j * rho for i ≠ j
         Sigma_ii = std_i²
         """
-        d = len(stds)
-        cov_matrix = torch.outer(stds, stds)  # std_i * std_j
-        identity_mask = torch.eye(d)
-        cov_matrix = cov_matrix * (identity_mask + (1 - identity_mask) * rho)
-        return cov_matrix
+        d = stds.numel()
+        # basic construction
+        outer = torch.outer(stds, stds)  # std_i * std_j
+        eye = torch.eye(d, dtype=stds.dtype, device=stds.device)
+        cov = outer * (eye + (1.0 - eye) * rho)
+
+        # symmetrize for safety
+        cov = 0.5 * (cov + cov.T)
+
+        # attempt a Cholesky; if it fails, do eigen-decomposition and clamp eigenvalues
+        try:
+            torch.linalg.cholesky(cov)
+            # success => return
+            return cov
+        except RuntimeError:
+            # eigen-decompose, clamp eigenvalues to >= eps, rebuild
+            vals, vecs = torch.linalg.eigh(cov)
+            vals_clamped = torch.clamp(vals, min=eps)
+            cov_pd = (vecs @ torch.diag(vals_clamped) @ vecs.T)
+            # renormalize small numeric asymmetry and return
+            cov_pd = 0.5 * (cov_pd + cov_pd.T)
+            return cov_pd
 
     def _multivariate_gaussian_pdf(self, X: torch.Tensor, mean: torch.Tensor, 
                                  cov_inv: torch.Tensor, cov_det: torch.Tensor) -> torch.Tensor:
@@ -530,10 +554,19 @@ class MultiplicativeInteraction(BaseTestProblem):
                  # optimization knobs for computing optimum:
                  sub_n_restarts: int = 12, sub_steps: int = 300, sub_lr: float = 0.05,
                  full_n_restarts: int = 20, full_steps: int = 400, full_lr: float = 0.05):
-        self.d = int(d)
-        if self.d < 2:
-            raise ValueError("d must be >= 2 for multiplicative split")
+        
+        self.d = d
+        self.dim = d
+         # Mark all input indices as continuous (common for synthetic, real-valued benchmarks)
+        self.continuous_inds = list(range(self.d))
+        self.discrete_inds = []
+        self.categorical_inds = []
         self._bounds = [(0.0, 10.0)] * self.d
+        
+        
+        super().__init__() # IMPORTANT: initialize parent Module before attaching any submodules
+
+        
         self.noise_std = float(noise_std)
         self.negate = negate
         self.alpha = float(alpha)

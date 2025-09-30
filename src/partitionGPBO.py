@@ -1149,10 +1149,11 @@ if __name__ == '__main__':
 
     settings = [
         #new functions
-        ('rosenbrock_rotated', 6), too easy
+        ('dblobs', 4),
+        ('rosenbrock_rotated', 6), #too easy
         ('ackley_correlated', 10),
         ('multprod', 4),
-        ('dblobs', 4),
+        
 
         # old functions
         ('twoblobs', 2),
@@ -1177,17 +1178,16 @@ if __name__ == '__main__':
     for name, dim in old_functions:
         f_obj = SyntheticTestFun(name=name, d=dim, noise=0.0, negate= False if name in ['twoblobs', 'dblobs', 'multprod'] else True)
         kappas = twoblobs_kappas if name == 'twoblobs' else normal_kappas
-        kappa_search(f_obj, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=15)
-        kappa_search(f_obj, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=15)
-        kappa_search(f_obj, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=15)
-        kappa_search(f_obj, kappas, model_cls=MHGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=15)
-
+        kappa_search(f_obj, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=10)
+        kappa_search(f_obj, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=10)
+        kappa_search(f_obj, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=10)
+        #kappa_search(f_obj, kappas, model_cls=MHGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=10)
 
     #new functions
     new_functions = [
-        #('rosenbrock_rotated', 6), too easy
+        ('dblobs', 3),
+        ('multprod', 6),
         ('ackley_correlated', 8),
-        ('multprod', 4),
         ('dblobs', 4),
         ]
 
@@ -1195,8 +1195,8 @@ if __name__ == '__main__':
     for name, dim in new_functions:
     
         f_obj = SyntheticTestFun(name=name, d=dim, noise=0.0, negate= False if name in ['twoblobs', 'dblobs', 'multprod'] else True)
-        kappa_search(f_obj, normal_kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=15)
-        kappa_search(f_obj, normal_kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=15)
+        kappa_search(f_obj, normal_kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
+        kappa_search(f_obj, normal_kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
         kappa_search(f_obj, normal_kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
         
 
