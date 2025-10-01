@@ -177,6 +177,9 @@ class Schwefel(BaseTestProblem):
         self._offset = 418.9828872724339 * d # To turn into positive range, add + 1675.9305
         self.optimal_value = 0.0
 
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
 
     def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         """
@@ -202,6 +205,10 @@ class Powell(BaseTestProblem) :
         self._bounds = [(-4.0, 5.0)] * d  # per-dimension bounds
         self.optimal_value = 0.0
 
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
+    
     def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         """
         X: tensor of shape (n_samples, d*4)
@@ -242,7 +249,10 @@ class EggholderFunction(BaseTestProblem):
         self._true_min = -959.6407 # with offset, it would be self._offset = 1048.4714
         self.optimal_value = -self._true_min if self.negate else self._true_min
 
-
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
+    
     def _evaluate_true(self, X):
         # X is (n,2)
         x1 = X[:, [0]]
@@ -316,6 +326,10 @@ class TwoBlobs(BaseTestProblem):
         Ynorm = (y - my) / sy
         exp_term = ((Xnorm**2) - (2 * rho * Xnorm * Ynorm) + (Ynorm**2)) / (2 * (1 - rho**2))
         return torch.exp(-exp_term) / denom
+    
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
 
     def _evaluate_true(self, X):
         g1 = self.gaussian_pdf(X, self.mean1, self.std1, self.rho1) * self.weight1
@@ -470,6 +484,10 @@ class DBlobs(BaseTestProblem):
         
         return result.unsqueeze(-1)
 
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
+
     def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         return self._evaluate_single_point(X).reshape(-1)
 
@@ -530,6 +548,10 @@ class GoldsteinPrice(BaseTestProblem):
         )
         y = term1 * term2
         return y.reshape(-1)  # ensure output shape (N, 1)
+    
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         Y = self._evaluate_true(X)
@@ -794,7 +816,10 @@ class MultiplicativeInteraction(BaseTestProblem):
                 best_x = combo.detach().clone()
 
         return best_x, best_val
-
+    
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
     # -----------------------------
     def forward(self, X):
         Y = self._evaluate_true(X)
@@ -844,7 +869,11 @@ class RosenbrockRotated(BaseTestProblem):
             result += term1 + term2
             
         return result.reshape(-1)  # ensure output shape (N, 1)
-
+    
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
+    
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         Y = self._evaluate_true(X)
         if self.noise_std > 0:
@@ -895,7 +924,11 @@ class AckleyCorrelated(BaseTestProblem):
         result = term1 + term2 + a + torch.exp(torch.tensor(1.0))
         
         return result.reshape(-1)  # ensure output shape (N, 1)
-
+    
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
+    
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         Y = self._evaluate_true(X)
         if self.noise_std > 0:
@@ -968,6 +1001,10 @@ class GriewankRosenbrockHybrid(BaseTestProblem):
             result += term1 + term2
             
         return result.unsqueeze(-1)
+    
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
 
     def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         # Split input into Ackley and Rosenbrock parts
