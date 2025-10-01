@@ -871,7 +871,7 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
         (ExactGPModel, 'red',  'ExactGPModel',    kappas[0]),
         (AdditiveKernelGP, 'blue', 'AdditiveGP',   kappas[1]),
         (SobolGP, 'green', 'SobolGP',             kappas[2]),
-        (MHGP, 'orange', 'MHGP',                  kappas[3])
+       # (MHGP, 'orange', 'MHGP',                  kappas[3])
     ]
 
     # Containers for metrics
@@ -880,7 +880,7 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
 
      # Run experiments for each model
     for model_cls, color, label, kappa in model_specs:
-        all_r2, all_explore, all_exploit, all_regrets = [], [], [], []
+        all_regrets, all_explore, all_exploit, all_regrets = [], [], [], []
 
         for rep in range(n_reps):
             if label in ['SobolGP', 'MHGP']:
@@ -888,44 +888,32 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
             else:
                 exp_results = run_bo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, save=False)
 
-            r2 = np.asarray(exp_results.get('r2', []))
-            explore = np.asarray(exp_results.get('exploration', []))
-            exploit = np.asarray(exp_results.get('exploitation', []))
-            regrets = np.asarray(exp_results.get('regrets', []))
+            regrets, explore, exploit = exp_results['regrets'], exp_results['exploration'], exp_results['exploitation']
+            all_regrets.append(regrets)
+            all_explore.append(explore)
+            all_exploit.append(exploit)
 
-            if r2.size > 0:      all_r2.append(r2)
-            if explore.size > 0: all_explore.append(explore)
-            if exploit.size > 0: all_exploit.append(exploit)
-            if regrets.size > 0: all_regrets.append(regrets)
-
-        def safe_mean(list_of_arrays):
-            """Return (mean_array, stacked_array) truncated to shortest length across arrays."""
-            if len(list_of_arrays) == 0:
-                return np.array([]), None
-            min_len = min(a.shape[0] for a in list_of_arrays)
-            stacked = np.stack([a[:min_len] for a in list_of_arrays], axis=0)
-            return stacked.mean(axis=0), stacked
-
-        mean_r2, stacked_r2 = safe_mean(all_r2)
-        mean_explore, stacked_explore = safe_mean(all_explore)
-        mean_exploit, stacked_exploit = safe_mean(all_exploit)
-        mean_regrets, stacked_regrets = safe_mean(all_regrets)
+        # Convert to arrays and average across repetitions
+        all_regrets = np.array(all_regrets)  # shape (n_reps, n_iter)
+        all_explore = np.array(all_explore)
+        all_exploit = np.array(all_exploit)
+            
+        mean_explore = np.mean(all_explore, axis=0)
+        mean_exploit = np.mean(all_exploit, axis=0)
+        mean_regrets = np.mean(all_regrets, axis=0)
+        std_regrets = np.std(all_regrets, axis=0)
 
         metrics[label] = {
-            'r2': mean_r2,
             'explore': mean_explore,
             'exploit': mean_exploit,
             'color': color
         }
 
-        if stacked_regrets is not None:
-            mean_reg = np.mean(stacked_regrets, axis=0)
-            std_reg = np.std(stacked_regrets, axis=0)
-            ci_scale = 1.96 if ci == 95 else 1.0
-            ci_reg = ci_scale * std_reg / np.sqrt(stacked_regrets.shape[0])
-            regrets_results[label] = {'mean': mean_reg, 'ci': ci_reg, 'color': color}
-        else:
-            regrets_results[label] = {'mean': np.array([]), 'ci': np.array([]), 'color': color}
+        # Compute confidence interval (normal approx)
+        ci_scale = 1.96 if ci == 95 else 1.0  # crude but works
+        ci_regrets = ci_scale * std_regrets / np.sqrt(n_reps)
+        regrets_results[label] = {'mean': mean_regrets, 'ci': ci_regrets, 'color': color}
+
 
     # ----------------------
     # Figure 1: Performance (R², Exploration, Exploitation)
@@ -935,7 +923,6 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
     # For each model, determine a T (shortest available among metrics) and plot
     for label, vals in metrics.items():
         color = vals['color']
-        r2 = vals['r2']
         explore = vals['explore']
         exploit = vals['exploit']
         T = exploit.shape[0]
@@ -1167,7 +1154,8 @@ if __name__ == '__main__':
         ('rosenbrock', 12),
     ]
 
-    # kappa search results on additive, simple, sobolGP for old_functions
+    # kappa search results on additive, simple, sobolGP for old_function
+    '''
     old_functions = [('twoblobs', 2),
         ('michalewicz', 2),
         ('hartmann', 6)]
@@ -1182,15 +1170,51 @@ if __name__ == '__main__':
         kappa_search(f_obj, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=10)
         kappa_search(f_obj, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=10)
         #kappa_search(f_obj, kappas, model_cls=MHGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=10)
+    '''
+
+    # Run #1: optimization_metrics
+    kappas_michale = [11.0, 11.0, 11.0]
+    f_michale = SyntheticTestFun(name='michalewicz', d=2, noise=0.0, negate=True)
+    optimization_metrics(f_michale, kappas_michale, n_init=8, n_iter=100, n_reps=15, ci=95)
+    kappas_2blob = [1.0, 1.0, 1.0]
+    f_2blob = SyntheticTestFun(name='twoblobs', d=2, noise=0.0, negate=True)
+    optimization_metrics(f_2blob, kappas_2blob, n_init=8, n_iter=100, n_reps=15, ci=95)
+
+    kappas = [0.5, 1, 3, 5, 9, 12, 15]
+
+    # Run #2: dblobs 3D
+    f_3blob = SyntheticTestFun(name='dblobs', d=3, noise=0.0, negate=False)
+    kappa_search(f_3blob, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
+    kappa_search(f_3blob, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
+    kappa_search(f_3blob, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
+    
+    # Run #3: multprod 
+    f_multprod = SyntheticTestFun(name='multprod', d=6, noise=0.0, negate=False)
+    kappa_search(f_multprod, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
+    kappa_search(f_multprod, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
+    kappa_search(f_multprod, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
+
+    # Run # 4: ackley correlated
+    f_ackley = SyntheticTestFun(name='ackley_correlated', d=8, noise=0.0, negate=False)
+    kappa_search(f_ackley, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
+    kappa_search(f_ackley, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
+    kappa_search(f_ackley, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
+
+    # Run # 4: dblobs 4D
+    f_4blob = SyntheticTestFun(name='dblobs', d=4, noise=0.0, negate=False)
+    kappa_search(f_4blob, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
+    kappa_search(f_4blob, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
+    kappa_search(f_4blob, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
 
     #new functions
+    '''
     new_functions = [
         ('dblobs', 3),
         ('multprod', 6),
         ('ackley_correlated', 8),
         ('dblobs', 4),
         ]
-
+    
     # step 2 : kappa search for all test functions
     for name, dim in new_functions:
     
@@ -1198,7 +1222,7 @@ if __name__ == '__main__':
         kappa_search(f_obj, normal_kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
         kappa_search(f_obj, normal_kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
         kappa_search(f_obj, normal_kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
-        
+    '''    
 
 
     
