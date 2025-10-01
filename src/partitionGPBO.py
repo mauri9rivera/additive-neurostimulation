@@ -954,23 +954,15 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
     # ----------------------
     fig2, ax2 = plt.subplots(figsize=(12, 5))
 
+    iterations = np.arange(1, n_iter -n_init + 1)
     eps = 1e-12  # small positive to avoid log(0)
     for label, vals in regrets_results.items():
         mean_reg = vals['mean']
         ci_reg = vals['ci']
         color = vals['color']
 
-        if mean_reg.size == 0:
-            continue
-
-        T = mean_reg.shape[0]
-        it = np.arange(1, T + 1)
-        lower = np.maximum(mean_reg - ci_reg, eps)
-        upper = np.maximum(mean_reg + ci_reg, eps)
-        mean_clipped = np.maximum(mean_reg, eps)
-
-        ax2.plot(it, mean_clipped, color=color, label=f'{label} Mean Regret')
-        ax2.fill_between(it, lower, upper, color=color, alpha=0.2)
+        ax2.plot(it, mean_reg, color=color, label=f'{label} Mean Regret')
+        ax2.fill_between(it, mean_reg - ci_regrets, mean_reg + ci_regrets, color=color, alpha=0.2)
 
     ax2.set_xlabel('Iteration')
     ax2.set_ylabel('Regret (log scale)')
@@ -1176,35 +1168,24 @@ if __name__ == '__main__':
     kappas_michale = [11.0, 11.0, 11.0]
     f_michale = SyntheticTestFun(name='michalewicz', d=2, noise=0.0, negate=True)
     optimization_metrics(f_michale, kappas_michale, n_init=8, n_iter=100, n_reps=15, ci=95)
+
     kappas_2blob = [1.0, 1.0, 1.0]
-    f_2blob = SyntheticTestFun(name='twoblobs', d=2, noise=0.0, negate=True)
+    f_2blob = SyntheticTestFun(name='twoblobs', d=2, noise=0.0, negate=False)
     optimization_metrics(f_2blob, kappas_2blob, n_init=8, n_iter=100, n_reps=15, ci=95)
 
-    kappas = [0.5, 1, 3, 5, 9, 12, 15]
+    kappas_hartmann = [11.0, 11.0, 11.0]
+    f_hartmann = SyntheticTestFun(name='hartmann', d=6, noise=0.0, negate=True)
+    optimization_metrics(f_2blob, kappas_2blob, n_init=8, n_iter=200, n_reps=15, ci=95)
 
-    # Run #2: dblobs 3D
-    f_3blob = SyntheticTestFun(name='dblobs', d=3, noise=0.0, negate=False)
-    kappa_search(f_3blob, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
-    kappa_search(f_3blob, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
-    kappa_search(f_3blob, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
-    
-    # Run #3: multprod 
-    f_multprod = SyntheticTestFun(name='multprod', d=6, noise=0.0, negate=False)
-    kappa_search(f_multprod, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
-    kappa_search(f_multprod, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
-    kappa_search(f_multprod, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
+
+    kappas = [0.5, 1, 3, 5, 9, 12, 15, 25]
 
     # Run # 4: ackley correlated
-    f_ackley = SyntheticTestFun(name='ackley_correlated', d=8, noise=0.0, negate=False)
-    kappa_search(f_ackley, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
-    kappa_search(f_ackley, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
-    kappa_search(f_ackley, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
+    #f_ackley = SyntheticTestFun(name='ackley_correlated', d=8, noise=0.0, negate=False)
+    #kappa_search(f_ackley, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
+    #kappa_search(f_ackley, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
+    #kappa_search(f_ackley, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
 
-    # Run # 4: dblobs 4D
-    f_4blob = SyntheticTestFun(name='dblobs', d=4, noise=0.0, negate=False)
-    kappa_search(f_4blob, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
-    kappa_search(f_4blob, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
-    kappa_search(f_4blob, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
 
     #new functions
     '''

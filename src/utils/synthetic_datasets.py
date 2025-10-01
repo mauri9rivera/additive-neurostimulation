@@ -716,8 +716,8 @@ class MultiplicativeInteraction(BaseTestProblem):
         Xu = X[:, self.idx_u]
         Xv = X[:, self.idx_v]
 
-        u_raw = self.U._evaluate_true(Xu)
-        v_raw = self.V._evaluate_true(Xv)
+        u_raw = self.U.evaluate_true(Xu)
+        v_raw = self.V.evaluate_true(Xv)
 
         if self.rescale_positive:
             u = torch.exp(-u_raw / (1.0 + Xu.shape[-1]))
@@ -739,16 +739,16 @@ class MultiplicativeInteraction(BaseTestProblem):
         if self.rescale_positive:
             def eval_u_pos(Xsub):
                 # Xsub: (N,m)
-                val = self.U._evaluate_true(Xsub)
+                val = self.U.evaluate_true(Xsub)
                 return torch.exp(-val / (1.0 + Xsub.shape[-1]))
             def eval_v_pos(Xsub):
-                val = self.V._evaluate_true(Xsub)
+                val = self.V.evaluate_true(Xsub)
                 return torch.exp(-val / (1.0 + Xsub.shape[-1]))
             u_eval = eval_u_pos
             v_eval = eval_v_pos
         else:
-            u_eval = lambda Xsub: self.U._evaluate_true(Xsub)
-            v_eval = lambda Xsub: self.V._evaluate_true(Xsub)
+            u_eval = lambda Xsub: self.U.evaluate_true(Xsub)
+            v_eval = lambda Xsub: self.V.evaluate_true(Xsub)
 
         # maximize U on its subspace
         m_u = len(self.idx_u)
