@@ -12,3 +12,5 @@ __pycache__/
 # bash scripts
 *.sh
 
+#output files
+output/

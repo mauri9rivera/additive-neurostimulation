@@ -1,3 +1,7 @@
+# Refactored partitionGPBO.py
+# Adds CLI argument parsing to run specific experiments (run_bo, run_partitionbo, kappa_search, etc.)
+# Usage examples at bottom and via `--help`.
+
 import numpy as np
 import matplotlib.pyplot as plt
 import sys
@@ -7,9 +11,9 @@ import gpytorch
 import datetime
 import random
 import copy
-
+import argparse
+import ast
 from gpytorch.models.exact_gp import GPInputWarning
-
 
 from botorch.acquisition import UpperConfidenceBound
 from botorch.optim import optimize_acqf
@@ -23,7 +27,7 @@ import warnings
 import traceback
 
 ### MODULES HANDLING ###
-#sys.path.append(str(Path('./').resolve().parent.parent))
+# If the package structure differs you may need to adjust PYTHONPATH or the imports below
 from models.gaussians import AdditiveKernelGP, BaseGP, WrappedModel, ExactGPModel
 from utils.synthetic_datasets import *
 
@@ -33,7 +37,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="SALib.util")
 ### GLOBAL VARIABLES ###
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-### Partitioners classes ###
+# ---------- GP classes ----------
 
 class MHGP(gpytorch.models.ExactGP):
 
@@ -398,7 +402,6 @@ class Sobol:
                 P.append([e])
 
         return P
-
 
 ### Runners ###
 
@@ -775,7 +778,7 @@ def run_bo(f_obj, model_cls, n_init=8, n_iter=200, kappa=1.0, save=False, verbos
         'regrets': log_regrets
        }
 
-# Graph generation functions ###
+### Graph generation functions ###
 
 def kappa_search(f_obj, kappa_list, model_cls=BaseGP, n_init=8, n_iter=100, n_reps=15,
                 bo_method=run_bo):
@@ -1123,109 +1126,148 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
     return cc_list, cs_list, update_iters    
 
 
+### Parser handling
+
+def _parse_list_of_floats(text):
+    if text is None:
+        return None
+    try:
+        return [float(x) for x in text.split(',') if len(x.strip())]
+    except Exception:
+        raise argparse.ArgumentTypeError('Expected comma-separated list of numbers (e.g. 0.5,1,3)')
+
+
+def _parse_list_of_ints(text):
+    if text is None:
+        return None
+    try:
+        return [int(x) for x in text.split(',') if len(x.strip())]
+    except Exception:
+        raise argparse.ArgumentTypeError('Expected comma-separated list of ints (e.g. 1,2,3)')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Refactored partitionGPBO runner with CLI options')
+
+    # Function / problem selection
+    parser.add_argument('--f_ob', type=str, default='twoblobs', help='Name of synthetic function (e.g. ackley_correlated)')
+    parser.add_argument('--dim', type=int, default=2, help='Dimension d for the synthetic function')
+    parser.add_argument('--noise', type=float, default=0.0, help='Noise level for SyntheticTestFun')
+    parser.add_argument('--negate', choices=['auto','true','false'], default='auto', help='Negate objective? if auto will use default mapping in script')
+
+    # Method selection
+    parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, kappa_search, optimization_metrics, partition_reconstruction')
+    parser.add_argument('--model_cls', type=str, default='ExactGPModel', help='Model class name (ExactGPModel, AdditiveKernelGP, SobolGP, MHGP, BaseGP)')
+    parser.add_argument('--bo_method', type=str, default='run_bo', help='BO method used by higher-level routines (run_bo or run_partitionbo)')
+
+    # Method-specific params
+    parser.add_argument('--n_init', type=int, default=8)
+    parser.add_argument('--n_iter', type=int, default=200)
+    parser.add_argument('--n_reps', type=int, default=10)
+    parser.add_argument('--n_sobol', type=int, default=10)
+    parser.add_argument('--kappa', type=float, default=1.0)
+    parser.add_argument('--kappa_list', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for kappa_search')
+    parser.add_argument('--kappas', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for optimization_metrics (3 values expected)')
+
+    # Misc
+    parser.add_argument('--save', action='store_true')
+    parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--list_models', action='store_true')
+    parser.add_argument('--list_methods', action='store_true')
+
+    args = parser.parse_args(argv)
+
+    # Allowed mappings (whitelist)
+    model_map = {
+        'ExactGPModel': ExactGPModel,
+        'AdditiveKernelGP': AdditiveKernelGP,
+        'SobolGP': SobolGP,
+        'MHGP': MHGP,
+        'BaseGP': BaseGP,
+    }
+
+    method_map = {
+        'run_bo': run_bo,
+        'run_partitionbo': run_partitionbo,
+        'kappa_search': kappa_search,
+        'optimization_metrics': optimization_metrics,
+        'partition_reconstruction': partition_reconstruction,
+    }
+
+    if args.list_models:
+        print('Available model classes:')
+        for k in model_map.keys():
+            print(' -', k)
+        return
+
+    if args.list_methods:
+        print('Available methods:')
+        for k in method_map.keys():
+            print(' -', k)
+        return
+
+    if args.model_cls not in model_map:
+        raise ValueError(f"Unknown model_cls '{args.model_cls}'. Use --list_models to see options.")
+
+    if args.method not in method_map:
+        raise ValueError(f"Unknown method '{args.method}'. Use --list_methods to see options.")
+
+    if args.bo_method not in ['run_bo', 'run_partitionbo']:
+        raise ValueError("bo_method must be 'run_bo' or 'run_partitionbo'")
+
+    model_cls = model_map[args.model_cls]
+    method = method_map[args.method]
+    bo_method = method_map[args.bo_method]
+
+    # Construct SyntheticTestFun object
+    if args.dim is None:
+        raise ValueError('You must specify --dim for the function')
+
+    # Determine negate default if user passed auto
+    if args.negate == 'auto':
+        negate_default_names = ['twoblobs', 'dblobs', 'multprod']
+        negate = False if args.f_ob in negate_default_names else True
+    else:
+        negate = True if args.negate == 'true' else False
+
+    f_obj = SyntheticTestFun(name=args.f_ob, d=args.dim, noise=args.noise, negate=negate)
+
+    # Call the requested method with the right parameter signatures
+    print(f"Running method={args.method} model_cls={args.model_cls} on {args.f_ob} (d={args.dim})")
+
+    # dispatch
+    try:
+        if args.method == 'run_bo':
+            result = run_bo(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, kappa=args.kappa, save=args.save, verbose=args.verbose)
+        elif args.method == 'run_partitionbo':
+            result = run_partitionbo(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose)
+        elif args.method == 'kappa_search':
+            # Provide a default kappa list if none given
+            k_list = args.kappa_list or [0.5, 1.0, 3.0, 5.0, 7.0, 9.0, 15.0]
+            result = kappa_search(f_obj, k_list, model_cls=model_cls, n_init=args.n_init, n_iter=args.n_iter, n_reps=args.n_reps, bo_method=bo_method)
+        elif args.method == 'optimization_metrics':
+            if args.kappas is None:
+                raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 3 values)')
+            kappas = args.kappas
+            result = optimization_metrics(f_obj, kappas, n_init=args.n_init, n_iter=args.n_iter, n_reps=args.n_reps)
+        elif args.method == 'partition_reconstruction':
+            result = partition_reconstruction(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose)
+        else:
+            raise ValueError('Unsupported method')
+
+        print('Completed. Result summary:')
+        # print a short summary depending on result shape
+        if isinstance(result, dict):
+            keys = list(result.keys())
+            print('Keys in result:', keys)
+        else:
+            print(type(result))
+
+    except Exception as e:
+        print('ERROR during execution:', e)
+        traceback.print_exc()
+        sys.exit(1)
+
+
 if __name__ == '__main__':
-
-    settings = [
-        #new functions
-        ('dblobs', 4),
-        ('rosenbrock_rotated', 6), #too easy
-        ('ackley_correlated', 10),
-        ('multprod', 4),
-        
-
-        # old functions
-        ('twoblobs', 2),
-        ('michalewicz', 2),
-        ('hartmann', 6),
-
-        #others?
-        ('powell', 4),
-        ('goldstein-price', 2),
-        ('shekel', 4),
-        ('rosenbrock', 12),
-    ]
-
-    # kappa search results on additive, simple, sobolGP for old_function
-    '''
-    old_functions = [('twoblobs', 2),
-        ('michalewicz', 2),
-        ('hartmann', 6)]
-    
-    twoblobs_kappas = [0.1, 0.25, 0.5, 1, 2]
-    normal_kappas = [1, 3, 5, 7, 9, 11, 15]
-
-    for name, dim in old_functions:
-        f_obj = SyntheticTestFun(name=name, d=dim, noise=0.0, negate= False if name in ['twoblobs', 'dblobs', 'multprod'] else True)
-        kappas = twoblobs_kappas if name == 'twoblobs' else normal_kappas
-        kappa_search(f_obj, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=10)
-        kappa_search(f_obj, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=100*(dim // 2), n_reps=10)
-        kappa_search(f_obj, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=10)
-        #kappa_search(f_obj, kappas, model_cls=MHGP, bo_method=run_partitionbo, n_iter=100*(dim // 2), n_reps=10)
-    '''
-
-    # Run #1: optimization_metrics
-    kappas_michale = [11.0, 11.0, 11.0]
-    f_michale = SyntheticTestFun(name='michalewicz', d=2, noise=0.0, negate=True)
-    optimization_metrics(f_michale, kappas_michale, n_init=8, n_iter=100, n_reps=15, ci=95)
-
-    kappas_2blob = [1.0, 1.0, 1.0]
-    f_2blob = SyntheticTestFun(name='twoblobs', d=2, noise=0.0, negate=False)
-    optimization_metrics(f_2blob, kappas_2blob, n_init=8, n_iter=100, n_reps=15, ci=95)
-
-    kappas_hartmann = [11.0, 11.0, 11.0]
-    f_hartmann = SyntheticTestFun(name='hartmann', d=6, noise=0.0, negate=True)
-    optimization_metrics(f_2blob, kappas_2blob, n_init=8, n_iter=200, n_reps=15, ci=95)
-
-
-    kappas = [0.5, 1, 3, 5, 9, 12, 15, 25]
-
-    # Run # 4: ackley correlated
-    #f_ackley = SyntheticTestFun(name='ackley_correlated', d=8, noise=0.0, negate=False)
-    #kappa_search(f_ackley, kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
-    #kappa_search(f_ackley, kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
-    #kappa_search(f_ackley, kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
-
-
-    #new functions
-    '''
-    new_functions = [
-        ('dblobs', 3),
-        ('multprod', 6),
-        ('ackley_correlated', 8),
-        ('dblobs', 4),
-        ]
-    
-    # step 2 : kappa search for all test functions
-    for name, dim in new_functions:
-    
-        f_obj = SyntheticTestFun(name=name, d=dim, noise=0.0, negate= False if name in ['twoblobs', 'dblobs', 'multprod'] else True)
-        kappa_search(f_obj, normal_kappas, model_cls=ExactGPModel, bo_method=run_bo, n_iter=200, n_reps=10)
-        kappa_search(f_obj, normal_kappas, model_cls=AdditiveKernelGP, bo_method=run_bo, n_iter=200, n_reps=10)
-        kappa_search(f_obj, normal_kappas, model_cls=SobolGP, bo_method=run_partitionbo, n_iter=200, n_reps=10)
-    '''    
-
-
-    
-    
-
-
-
-
-
-        
-
-    
-    
-
-
-    
-
-
-
-
-    
-
-       
-
-    
-
+    main()
