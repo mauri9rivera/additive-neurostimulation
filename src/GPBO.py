@@ -874,7 +874,7 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
         (ExactGPModel, 'red',  'ExactGPModel',    kappas[0]),
         (AdditiveKernelGP, 'blue', 'AdditiveGP',   kappas[1]),
         (SobolGP, 'green', 'SobolGP',             kappas[2]),
-       # (MHGP, 'orange', 'MHGP',                  kappas[3])
+        (MHGP, 'orange', 'MHGP',                  kappas[3])
     ]
 
     # Containers for metrics
@@ -940,7 +940,7 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
     ax1.set_title(f'Average Performance over {n_reps} runs | {f_obj.d}-{f_obj.name} (kappas={kappas})')
     ax1.set_ylim(0, 1.1)
     ax1.grid(True)
-    ax1.legend(loc='upper right', fontsize='small')
+    ax1.legend(loc='lower right', fontsize='small')
 
     # Save performance figure
     output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
@@ -959,17 +959,29 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
 
     iterations = np.arange(1, n_iter -n_init + 1)
     eps = 1e-12  # small positive to avoid log(0)
+    global_min, global_max = float('inf'), 0.0
     for label, vals in regrets_results.items():
         mean_reg = vals['mean']
         ci_reg = vals['ci']
         color = vals['color']
 
+        lower = np.maximum(mean_reg - ci_reg, eps)
+        upper = np.maximum(mean_reg + ci_reg, eps)
+        global_min = min(global_min, lower.min())
+        global_max = max(global_max, upper.max())
+
         ax2.plot(it, mean_reg, color=color, label=f'{label} Mean Regret')
         ax2.fill_between(it, mean_reg - ci_regrets, mean_reg + ci_regrets, color=color, alpha=0.2)
+
+    # add padding
+    global_min = max(global_min * 0.8, eps)
+    global_max = global_max * 1.2
 
     ax2.set_xlabel('Iteration')
     ax2.set_ylabel('Regret (log scale)')
     ax2.set_title(f'Mean Regret across {n_reps} runs | {f_obj.d}-{f_obj.name} (kappas={kappas})')
+    ax2.set_yscale("log")
+    ax2.set_ylim(global_min, global_max) 
     ax2.grid(True)
     ax2.legend(loc='upper right', fontsize='small')
 
@@ -1247,7 +1259,7 @@ def main(argv=None):
             result = kappa_search(f_obj, k_list, model_cls=model_cls, n_init=args.n_init, n_iter=args.n_iter, n_reps=args.n_reps, bo_method=bo_method)
         elif args.method == 'optimization_metrics':
             if args.kappas is None:
-                raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 3 values)')
+                raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values)')
             kappas = args.kappas
             result = optimization_metrics(f_obj, kappas, n_init=args.n_init, n_iter=args.n_iter, n_reps=args.n_reps)
         elif args.method == 'partition_reconstruction':

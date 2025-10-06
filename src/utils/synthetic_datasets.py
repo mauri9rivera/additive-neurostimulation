@@ -33,10 +33,6 @@ class SyntheticTestFun:
             case 'michalewicz':
                 # Note: Need to negate to turn into maximization
                 self.f = Michalewicz(d, noise_std=noise, negate=negate)
-            case 'custom_add':
-                self.f = CustomAdditiveFunction(noise_std=noise, negate=negate)
-            case 'custom_nonadd':
-                self.f = CustomNonAdditiveFunction(noise_std=noise, negate=negate)
             case 'schwefel':
                 if d != 2:
                     raise ValueError("The Schewefel function needs to be a 2 dimensional")
@@ -75,15 +71,18 @@ class SyntheticTestFun:
                 self.f = RosenbrockRotated(dim=d, noise_std=noise, negate=negate, **kwargs)
                 
             case 'ackley_correlated':
-                # kwargs: correlation_strength (default 0.3)
+                # kwargs: correlation_strength (default 0.15)
                 self.f = AckleyCorrelated(dim=d, noise_std=noise, negate=negate, **kwargs)
                 
             case 'griewank_rosenbrock_hybrid':
-                # kwargs: rosenbrock_weight (default 0.1)
                 self.f = GriewankRosenbrockHybrid(dim=d, noise_std=noise, negate=negate, **kwargs)
 
+            case 'cyclical-fun':
+                # kwargs: poly_degree, poly_coeffs, trig, trig_freq, trig_amp, trig_phase, poly_scale, seed
+                self.f = CyclicalFunction(d=d, noise_std=noise, negate=negate, **kwargs)
+
         self.f.d = d
-        self.negate = False if name in ('twoblobs', 'dblobs', 'multprod') else negate
+        self.negate = False if name in ('twoblobs', 'dblobs', 'multprod', 'cyclical-fun') else negate
         self.lower_bounds = np.array(self.f._bounds)[:, 0]
         self.upper_bounds = np.array(self.f._bounds)[:, 1]
 
@@ -114,50 +113,6 @@ class SyntheticTestFun:
         Y = Y.reshape(-1)
 
         return X, Y
-
-class CustomAdditiveFunction(BaseTestProblem):
-    '''
-    f(x1, x2, x3) = sin(x1) + 0.5*x2^2
-    '''
-    def __init__(self, noise_std=0.0, negate=False):
-        self._bounds = [(0.0, 2*math.pi)] * 2
-        self.noise_std = noise_std
-        self.negate = negate
-        self.optimal_value = 1.0 + 2*math.pi**2
-        self.d = 2
-
-    def _evaluate_true(self, X):
-        return torch.sin(X[:, [0]]) + 0.5 * X[:, [1]]**2
-
-    def forward(self, X):
-        Y = self._evaluate_true(X)
-        if self.noise_std > 0:
-            Y += torch.randn_like(Y) * self.noise_std
-        return -Y if self.negate else Y
-
-class CustomNonAdditiveFunction(BaseTestProblem):
-    '''
-    f(x1, x2) = sin(x1)*x2^3 / (x1 + x2)^2
-    '''
-    def __init__(self, noise_std=0.0, negate=False):
-        self._bounds = [(0.0, 2*math.pi)] * 2
-        self.noise_std = noise_std
-        self.negate = negate
-        self.optimal_value = 4.15676
-        self.d = 2
-
-    def _evaluate_true(self, X):
-        x1 = X[:, [0]]
-        x2 = X[:, [1]]
-        numerator = torch.sin(x1) * (x2 ** 3)
-        denominator = (x1 + x2) ** 2
-        return numerator / (denominator + 1e-8)
-    
-    def forward(self, X):
-        Y = self._evaluate_true(X)
-        if self.noise_std > 0:
-            Y += torch.randn_like(Y) * self.noise_std
-        return -Y if self.negate else Y
 
 class Schwefel(BaseTestProblem):
     """
@@ -571,7 +526,7 @@ class MultiplicativeInteraction(BaseTestProblem):
     """
 
     def __init__(self, d=6, noise_std=0.0, negate=False, split='half',
-                 u_kind='ackley', v_kind='rosenbrock', alpha=0.0,
+                 u_kind='ackley', v_kind='rosenbrock', alpha=0.5,
                  rescale_positive=True, seed: int | None = None,
                  # optimization knobs for computing optimum:
                  sub_n_restarts: int = 12, sub_steps: int = 300, sub_lr: float = 0.05,
@@ -893,7 +848,7 @@ class AckleyCorrelated(BaseTestProblem):
     """
     
     def __init__(self, dim: int = 5, noise_std: float = 0.0, negate: bool = False, 
-                 correlation_strength: float = 0.2):
+                 correlation_strength: float = 0.15):
         self.dim = dim
         self._bounds = [(-32.768, 32.768) for _ in range(dim)]
         self.noise_std = noise_std
@@ -1019,6 +974,84 @@ class GriewankRosenbrockHybrid(BaseTestProblem):
         return ackley_val + rosenbrock_val
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
+        Y = self._evaluate_true(X)
+        if self.noise_std > 0:
+            Y = Y + torch.randn_like(Y) * self.noise_std
+        return -Y if self.negate else Y
+    
+class CyclicalFunction(BaseTestProblem):
+    """
+    Cyclical function:
+      f(x) = sum_{i=0}^{d-1} x_{(i+1) mod d} * exp(cos(x_i))
+
+    Args:
+        d: input dimension
+        noise_std: observation noise
+        negate: whether to negate outputs
+        seed: optional RNG seed
+    """
+
+    def __init__(self, d: int, noise_std: 0.0, negate: bool = False, seed: Optional[int] = None,):
+        
+        self.d = int(d)
+        self.dim = self.d
+        self._bounds = [(0.0, 10.0) for _ in range(self.d)]
+
+        # mark all inputs continuous (common for these synthetic problems)
+        self.continuous_inds = list(range(self.d))
+        self.discrete_inds = []
+        self.categorical_inds = []
+
+        # initialize Module / BaseTestProblem internals
+        super().__init__()
+
+        # now safe to attach other attributes
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        self.noise_std = float(noise_std)
+        self.negate = bool(negate)
+
+        self.optimal_value = 17.29225 * float(self.d)
+
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
+    
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Vectorized evaluation:
+          For batch X shape (N,d) -> returns (N,)
+          For single vector X shape (d,) -> returns (1,) (reshapeable to scalar)
+        Computes sum_i x_{i+1} * exp(cos(x_i)) with cyclic indexing.
+        """
+        if not isinstance(X, torch.Tensor):
+            X = torch.as_tensor(X)
+
+        # ensure batch dimension
+        squeezed = False
+        if X.dim() == 1:
+            X = X.unsqueeze(0)
+            squeezed = True
+
+        # X is (N, d)
+        if X.shape[1] != self.d:
+            raise ValueError(f"Input last-dimension must be {self.d}, got {X.shape[1]}")
+
+        # x_{i+1} with wrap-around: roll left by -1
+        X_next = torch.roll(X, shifts=-1, dims=1)  # (N, d)
+
+        # compute exp(cos(x_i)) elementwise
+        trig_factor = torch.exp(torch.cos(X))      # (N, d)
+
+        # element-wise product and sum across coordinates
+        terms = X_next * trig_factor               # (N, d)
+        fvals = torch.sum(terms, dim=1)            # (N,)
+
+        # return 1-D tensor of length N (if original input was 1-D, return a length-1 tensor)
+        return fvals.reshape(-1)
+
+    def forward(self, X):
         Y = self._evaluate_true(X)
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
