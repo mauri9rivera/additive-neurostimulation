@@ -981,7 +981,7 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
     ax2.set_ylabel('Regret (log scale)')
     ax2.set_title(f'Mean Regret across {n_reps} runs | {f_obj.d}-{f_obj.name} (kappas={kappas})')
     ax2.set_yscale("log")
-    ax2.set_ylim(global_min, global_max) 
+    ax2.autoscale(enable=True, axis='y', tight=True) 
     ax2.grid(True)
     ax2.legend(loc='upper right', fontsize='small')
 
@@ -1126,14 +1126,14 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
     plt.grid(True)
     plt.legend()
 
-    if save:
-        output_dir = os.path.join('output', 'breaking_additivity', 'partition_recon')
-        os.makedirs(output_dir, exist_ok=True)
-        fname = f'partition_recon_{f_obj.name}_{datetime.date.today().isoformat()}.png'
-        outpath = os.path.join(output_dir, fname)
-        plt.savefig(outpath, dpi=200)
-        if verbose:
-            print(f"Saved partition reconstruction plot to {outpath}")
+    
+    output_dir = os.path.join('output', 'synthetic_experiments', 'partition_recon')
+    os.makedirs(output_dir, exist_ok=True)
+    fname = f'partition_recon_{f_obj.name}_{datetime.date.today().isoformat()}.png'
+    outpath = os.path.join(output_dir, fname)
+    plt.savefig(outpath, dpi=200)
+    if verbose:
+        print(f"Saved partition reconstruction plot to {outpath}")
     
     return cc_list, cs_list, update_iters    
 
@@ -1237,7 +1237,7 @@ def main(argv=None):
 
     # Determine negate default if user passed auto
     if args.negate == 'auto':
-        negate_default_names = ['twoblobs', 'dblobs', 'multprod']
+        negate_default_names = ['twoblobs', 'dblobs', 'multprod', 'cyclical-fun']
         negate = False if args.f_ob in negate_default_names else True
     else:
         negate = True if args.negate == 'true' else False
@@ -1282,4 +1282,9 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    main()
+    #main()
+
+    st = SyntheticTestFun('rosenbrock_rotated', d=4, noise=0.0, negate=True)
+    X, Y = st.simulate(100000)  # 50 random samples
+    print("sample Y range:", Y.min().item(), Y.max().item())
+    print(f'Theoretical optimal: {st.f.optimal_value}')

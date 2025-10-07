@@ -4,7 +4,7 @@ from botorch.test_functions.synthetic import Hartmann, Ackley, Griewank, Michale
 from botorch.test_functions.base import BaseTestProblem
 import torch
 import math
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 
 class SyntheticTestFun:
@@ -80,6 +80,11 @@ class SyntheticTestFun:
             case 'cyclical-fun':
                 # kwargs: poly_degree, poly_coeffs, trig, trig_freq, trig_amp, trig_phase, poly_scale, seed
                 self.f = CyclicalFunction(d=d, noise_std=noise, negate=negate, **kwargs)
+
+            case _:
+
+                raise ValueError("Wrong synthetic function name.")
+
 
         self.f.d = d
         self.negate = False if name in ('twoblobs', 'dblobs', 'multprod', 'cyclical-fun') else negate
@@ -297,7 +302,7 @@ class TwoBlobs(BaseTestProblem):
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
 
-class DBlobs(BaseTestProblem):
+class DBlobs_old(BaseTestProblem):
     """
     D-dimensional generalization of TwoBlobs: weighted mixture of n Gaussian blobs.
     
@@ -462,6 +467,331 @@ class DBlobs(BaseTestProblem):
             'optimal_value': self.optimal_value
         }    
 
+class DBlobs(BaseTestProblem):
+    """
+    D-dimensional weighted mixture of multivariate Gaussian blobs (exchangeable corr).
+    Several robustness features and two normalization modes included.
+
+    Args:
+        d: input dimension
+        n_blobs: number of blobs (defaults to d)
+        noise_std: observation noise std (added in forward)
+        negate: whether to negate outputs (keeps shape semantics)
+        seed: RNG seed
+        rho_max: upper bound for exchangeable rho (default 0.4)
+        normalize_method: 'max' (scale by estimated global max -> outputs in [0,1] approx)
+                          or 'minmax' (map observed min->0 and max->1 from random sample)
+        normalize_search: whether to run numeric search to estimate extrema (default True)
+        n_random_samples: budget for random sampling when searching (default 5000)
+        refine_restarts, refine_steps, refine_lr: gradient-refine settings (used when normalize_search True & method='max')
+        jitter: tiny jitter to ensure PD
+    """
+
+    def __init__(
+        self,
+        d: int = 5,
+        n_blobs: Optional[int] = None,
+        noise_std: float = 0.0,
+        negate: bool = False,
+        seed: Optional[int] = None,
+        rho_max: float = 0.4,
+        normalize_method: Literal["max", "minmax"] = "max",
+        normalize_search: bool = True,
+        n_random_samples: int = 5000,
+        refine_restarts: int = 8,
+        refine_steps: int = 200,
+        refine_lr: float = 0.05,
+        jitter: float = 1e-8,
+    ):
+        # --- attributes BaseTestProblem expects BEFORE super().__init__() ---
+        self.d = int(d)
+        self.dim = self.d
+        # treat all inputs as continuous
+        self.continuous_inds = list(range(self.d))
+        self.discrete_inds = []
+        self.categorical_inds = []
+        # bounds on original domain
+        self._bounds = [(0.0, 10.0) for _ in range(self.d)]
+
+        # initialize BaseTestProblem / nn.Module internals
+        super().__init__()
+
+        # basic attributes
+        self.noise_std = float(noise_std)
+        self.negate = bool(negate)
+
+        # set number of blobs
+        self.n_blobs = n_blobs if n_blobs is not None else self.d
+
+        # RNG
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        # storage lists (will convert to tensors)
+        means_list = []
+        cov_list = []
+        weights_list = []
+        rhos_list = []
+
+        dtype = torch.get_default_dtype()
+        device = torch.device("cpu")
+
+        # safe rho sampling range for exchangeable corr
+        rho_upper = float(rho_max)
+        rho_lower_theory = -1.0 / float(self.d - 1)
+        eps = 1e-8
+        rho_lower = rho_lower_theory + 1e-6
+        if rho_lower >= rho_upper:
+            rho_lower = rho_upper - 1e-6
+
+        # build blobs
+        for i in range(self.n_blobs):
+            mean = torch.as_tensor(2.0 + 6.0 * torch.rand(self.d), dtype=dtype, device=device)
+            means_list.append(mean)
+
+            stds = torch.as_tensor(0.5 + 1.5 * torch.rand(self.d), dtype=dtype, device=device)
+
+            # sample rho in safe interval [rho_lower, rho_upper]
+            rho_val = float(rho_lower + (rho_upper - rho_lower) * torch.rand(1).item())
+            rhos_list.append(torch.as_tensor(rho_val, dtype=dtype, device=device))
+
+            # covariance via exchangeable / compound-symmetry + PD regularization
+            cov = self._create_exchangeable_covariance(stds, float(rho_val), eps=jitter)
+            cov_list.append(cov)
+
+            # initial weights (dominant first)
+            weight = 1.0 if i == 0 else 0.7 / (i + 1)
+            weights_list.append(float(weight))
+
+        # force first blob to be dominant weight if desired
+        weights_list[0] = float(max(weights_list[0], 1.0))
+
+        # convert to stacked tensors
+        self.means = torch.stack(means_list, dim=0)            # (n_blobs, d)
+        self.cov_matrices = torch.stack(cov_list, dim=0)       # (n_blobs, d, d)
+        self.weights = torch.as_tensor(weights_list, dtype=dtype, device=device)  # (n_blobs,)
+        self.rhos = torch.stack(rhos_list, dim=0)              # (n_blobs,)
+
+        # compute stable inverses and log-dets per blob using cholesky
+        cov_invs = []
+        cov_logdets = []
+        for k in range(self.n_blobs):
+            C = self.cov_matrices[k]
+            # add tiny jitter for numeric stability
+            Cj = C + torch.eye(self.d, dtype=C.dtype, device=C.device) * (1e-10)
+            # Cholesky (should succeed as we regularized earlier)
+            try:
+                L = torch.linalg.cholesky(Cj)
+            except RuntimeError:
+                # last resort: eigen-clamp
+                vals, vecs = torch.linalg.eigh(Cj)
+                vals_clamped = torch.clamp(vals, min=1e-12)
+                Cj = vecs @ torch.diag(vals_clamped) @ vecs.T
+                Cj = 0.5 * (Cj + Cj.T)
+                L = torch.linalg.cholesky(Cj)
+
+            # compute inverse via cholesky_inverse for stability
+            # torch.cholesky_inverse expects Cholesky factor from torch.cholesky; for modern torch use:
+            invC = torch.cholesky_inverse(L) if hasattr(torch, "cholesky_inverse") else torch.linalg.inv(Cj)
+            cov_invs.append(invC)
+
+            # compute logdet robustly
+            sign, slogdet = torch.linalg.slogdet(Cj)
+            if sign <= 0:
+                # fallback to eigen-clamp
+                vals, vecs = torch.linalg.eigh(Cj)
+                vals_clamped = torch.clamp(vals, min=1e-12)
+                Cj2 = vecs @ torch.diag(vals_clamped) @ vecs.T
+                sign, slogdet = torch.linalg.slogdet(Cj2)
+            cov_logdets.append(float(slogdet))
+
+        self.cov_invs = torch.stack(cov_invs, dim=0)          # (n_blobs, d, d)
+        self.cov_logdets = torch.as_tensor(cov_logdets, dtype=dtype, device=device)  # (n_blobs,)
+
+        # Analytical "value at dominant mean" (useful fallback)
+        self.optimal_point = self.means[0].clone()
+        analytic_val = float(self._evaluate_single_point(self.optimal_point.unsqueeze(0)).squeeze().item())
+        self.optimal_value = analytic_val
+
+        # ---------- Normalization logic ----------
+        self._normalize_method = normalize_method
+        self._scale = max(float(analytic_val), 1e-12)  # fallback scale
+        self._min_obs = 0.0
+        self._max_obs = float(analytic_val)
+
+        if normalize_search:
+            # random sampling budget; do in batches
+            best_val = analytic_val
+            worst_val = float("inf")
+            device = self.means.device
+            dtype = self.means.dtype
+            n_rem = max(0, int(n_random_samples))
+            batch = 4096
+            # simple random sampling
+            while n_rem > 0:
+                bs = min(batch, n_rem)
+                Xs = 10.0 * torch.rand(bs, self.d, dtype=dtype, device=device)
+                Ys = self._evaluate_single_point(Xs).reshape(-1)
+                max_Y = float(Ys.max().item())
+                min_Y = float(Ys.min().item())
+                if max_Y > best_val:
+                    best_val = max_Y
+                if min_Y < worst_val:
+                    worst_val = min_Y
+                n_rem -= bs
+
+            # optionally refine best point via gradient ascent (only for 'max' mode)
+            if normalize_method == "max":
+                # find a reasonable starting candidate: analytic mean and top random sample
+                # We'll pick the best-of-k random candidates for gradient starts
+                # Small set of restarts for refinement
+                best_ref_val = best_val
+                best_ref_x = self.optimal_point.clone()
+                # seed starts: use a few random points plus analytic mean
+                starts = [self.optimal_point.clone()]
+                for _ in range(refine_restarts - 1):
+                    starts.append(10.0 * torch.rand(self.d, dtype=dtype, device=device))
+
+                for s in starts:
+                    x = s.clone().detach().to(dtype).requires_grad_(True)
+                    opt = torch.optim.Adam([x], lr=refine_lr)
+                    for _ in range(refine_steps):
+                        opt.zero_grad()
+                        v = self._evaluate_single_point(x.unsqueeze(0)).squeeze()
+                        # maximize -> minimize negative
+                        (-v).backward()
+                        opt.step()
+                        with torch.no_grad():
+                            x.clamp_(0.0, 10.0)
+                    vfin = float(self._evaluate_single_point(x.unsqueeze(0)).squeeze().item())
+                    if vfin > best_ref_val:
+                        best_ref_val = vfin
+                        best_ref_x = x.detach().clone()
+
+                self._scale = float(max(best_ref_val, analytic_val, 1e-12))
+                self.optimal_point = best_ref_x.clone()
+                self._min_obs = float(min(worst_val, 0.0))
+                self._max_obs = float(self._scale)
+            else:
+                # 'minmax' mode: set observed range from sampling
+                # ensure sensible defaults if sampling was too small
+                if worst_val == float("inf"):
+                    worst_val = 0.0
+                self._min_obs = float(min(worst_val, 0.0))
+                self._max_obs = float(max(best_val, analytic_val, 1e-12))
+                # keep scale for backward compatibility, but main scheme will be min-max
+                self._scale = float(max(self._max_obs, 1e-12))
+
+        # finalize normalized optimal_value
+        if self._normalize_method == "max":
+            self.optimal_value = 1.0
+        else:
+            # minmax mapping yields observed max -> 1.0
+            self.optimal_value = 1.0
+
+    # ----------------- helpers -----------------
+    def _create_exchangeable_covariance(self, stds: torch.Tensor, rho: float, eps: float = 1e-8) -> torch.Tensor:
+        """
+        Compound-symmetry covariance:
+           Sigma_ij = std_i * std_j * rho   (i != j)
+           Sigma_ii = std_i^2
+        Ensures PD by eigenvalue clamping if necessary.
+        """
+        d = stds.numel()
+        outer = torch.outer(stds, stds)
+        eye = torch.eye(d, dtype=stds.dtype, device=stds.device)
+        cov = outer * (eye + (1.0 - eye) * float(rho))
+        cov = 0.5 * (cov + cov.T)
+
+        # quick PD check with cholesky
+        try:
+            torch.linalg.cholesky(cov)
+            return cov
+        except RuntimeError:
+            vals, vecs = torch.linalg.eigh(cov)
+            vals_clamped = torch.clamp(vals, min=eps)
+            cov_pd = vecs @ torch.diag(vals_clamped) @ vecs.T
+            cov_pd = 0.5 * (cov_pd + cov_pd.T)
+            # ensure tiny jitter so later cholesky succeeds
+            cov_pd = cov_pd + torch.eye(d, dtype=cov_pd.dtype, device=cov_pd.device) * (1e-12)
+            return cov_pd
+
+    def _multivariate_gaussian_pdf(self, X: torch.Tensor, mean: torch.Tensor, cov_inv: torch.Tensor, cov_logdet: float) -> torch.Tensor:
+        """
+        Evaluate multivariate Gaussian pdf at rows of X for given mean, precision (cov_inv) and logdet.
+        Returns (N,) for X shape (N,d) or scalar for (d,) inputs.
+        """
+        if X.dim() == 1:
+            Xc = X - mean
+            quad = float((Xc @ cov_inv @ Xc).item())
+            norm_log = -0.5 * (self.d * math.log(2.0 * math.pi) + float(cov_logdet))
+            return torch.tensor(math.exp(norm_log - 0.5 * quad), dtype=mean.dtype)
+        else:
+            Xc = X - mean.unsqueeze(0)  # (N,d)
+            quad = torch.einsum("ni,ij,nj->n", Xc, cov_inv, Xc)  # (N,)
+            norm_log = -0.5 * (self.d * math.log(2.0 * math.pi) + float(cov_logdet))
+            return torch.exp(norm_log - 0.5 * quad)  # (N,)
+
+    def _evaluate_single_point(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Un-normalized mixture evaluation. Returns (N,) for batch X (N,d).
+        """
+        is_vec = X.dim() == 1
+        if is_vec:
+            X = X.unsqueeze(0)
+
+        N = X.shape[0]
+        result = torch.zeros(N, dtype=self.means.dtype, device=self.means.device)
+
+        # sum weighted pdfs
+        for k in range(self.n_blobs):
+            pdf_vals = self._multivariate_gaussian_pdf(X, self.means[k], self.cov_invs[k], self.cov_logdets[k])
+            result = result + float(self.weights[k]) * pdf_vals
+
+        return result  # (N,)
+
+    # main evaluation wrapper (normalized to [0,1] depending on scheme)
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        vals = self._evaluate_single_point(X)  # (N,)
+        # normalization
+        if self._normalize_method == "max":
+            scaled = vals / float(max(self._scale, 1e-12))
+            scaled = torch.clamp(scaled, min=0.0, max=1.0)
+            return scaled.reshape(-1)
+        else:  # minmax
+            denom = float(self._max_obs - self._min_obs) if (self._max_obs - self._min_obs) > 1e-12 else 1.0
+            scaled = (vals - float(self._min_obs)) / denom
+            scaled = torch.clamp(scaled, min=0.0, max=1.0)
+            return scaled.reshape(-1)
+
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper expected by some BaseTestProblem versions
+        return self._evaluate_true(X)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        Y = self._evaluate_true(X)
+        if self.noise_std > 0:
+            Y = Y + torch.randn_like(Y) * self.noise_std
+        return -Y if self.negate else Y
+
+    def get_blob_info(self) -> dict:
+        """Return info about the blobs and normalization used."""
+        return {
+            "means": self.means,
+            "weights": self.weights,
+            "rhos": self.rhos,
+            "cov_matrices": self.cov_matrices,
+            "cov_invs": self.cov_invs,
+            "cov_logdets": self.cov_logdets,
+            "optimal_point": self.optimal_point,
+            "optimal_value": self.optimal_value,
+            "normalize_method": self._normalize_method,
+            "scale": self._scale,
+            "min_obs": self._min_obs,
+            "max_obs": self._max_obs,
+        }
+
 class GoldsteinPrice(BaseTestProblem):
     """
     Goldstein–Price function in standard minimization form:
@@ -513,6 +843,287 @@ class GoldsteinPrice(BaseTestProblem):
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
+ 
+class RosenbrockRotated(BaseTestProblem):
+    """
+    Rosenbrock function with rotated cross-terms for non-additive decomposition.
+    
+    f(x) = Σ[100*(x_{i+1} - x_i²)² + (1-x_i)²] applied to rotated coordinates
+    
+    - Domain: x_i ∈ [-5, 5] (extended from standard Rosenbrock bounds)
+    - Global MINIMUM value: 0.0 at x = [1, 1, ..., 1] (before rotation)
+    - After rotation, minimum shifts but value remains 0.0
+    """
+    
+    def __init__(self, dim: int = 5, noise_std: float = 0.0, negate: bool = False, 
+                 rotation_seed: Optional[int] = None):
+        self.dim = dim
+        self._bounds = [(-5.0, 5.0) for _ in range(dim)]
+        self.noise_std = noise_std
+        self.negate = negate
+        self.optimal_value = 0.0  # Known global minimum value
+        
+        # Generate random rotation matrix
+        if rotation_seed is not None:
+            torch.manual_seed(rotation_seed)
+        Q, _ = torch.linalg.qr(torch.randn(dim, dim))
+        self.rotation_matrix = Q
+        
+        # Precompute the inverse rotation to find optimal point in rotated space
+        # The optimum in original space is at [1, 1, ..., 1]
+        original_optimum = torch.ones(dim)
+        self.rotated_optimum = self.rotation_matrix @ original_optimum
+
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # Apply rotation to input
+        X_rotated = X @ self.rotation_matrix.T
+        
+        # Standard Rosenbrock function on rotated coordinates
+        result = torch.zeros(X.shape[0])
+        for i in range(self.dim - 1):
+            term1 = 100 * (X_rotated[..., i+1] - X_rotated[..., i]**2)**2
+            term2 = (1 - X_rotated[..., i])**2
+            result += term1 + term2
+            
+        return result.reshape(-1)  # ensure output shape (N, 1)
+    
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
+    
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        Y = self._evaluate_true(X)
+        if self.noise_std > 0:
+            Y = Y + torch.randn_like(Y) * self.noise_std
+        return -Y if self.negate else Y
+
+class AckleyCorrelated(BaseTestProblem):
+    """
+    Ackley function with dimension correlations for non-additive decomposition.
+    
+    Modified Ackley with neighbor correlations in the squared term:
+    f(x) = -a*exp(-b*sqrt(Σ(x_i + α*x_{i-1} + α*x_{i+1})²/n)) - exp(Σcos(c*x_i)/n) + a + exp(1)
+    
+    - Domain: x_i ∈ [-32.768, 32.768] (standard Ackley bounds)
+    - Global MINIMUM value: 0.0 at x = [0, 0, ..., 0]
+    - Correlation changes landscape but preserves minimum at origin
+    """
+    
+    def __init__(self, dim: int = 5, noise_std: float = 0.0, negate: bool = False, 
+                 correlation_strength: float = 0.15):
+        self.dim = dim
+        self._bounds = [(-32.768, 32.768) for _ in range(dim)]
+        self.noise_std = noise_std
+        self.negate = negate
+        self.optimal_value = 0.0
+        self.correlation_strength = correlation_strength
+        self.a = 20.0
+        self.b = 0.2
+        self.c = 2.0 * torch.pi
+
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        n = self.dim
+        a, b, c = self.a, self.b, self.c
+        alpha = self.correlation_strength
+        
+        # Compute correlated squared sum with neighborhood interactions
+        correlated_sum = torch.zeros(X.shape[0])
+        for i in range(n):
+            neighbor_contrib = torch.zeros(X.shape[0])
+            if i > 0:
+                neighbor_contrib += alpha * X[..., i-1]
+            if i < n-1:
+                neighbor_contrib += alpha * X[..., i+1]
+            correlated_sum += (X[..., i] + neighbor_contrib)**2
+        
+        term1 = -a * torch.exp(-b * torch.sqrt(correlated_sum / n))
+        term2 = -torch.exp(torch.sum(torch.cos(c * X), dim=-1) / n)
+        result = term1 + term2 + a + torch.exp(torch.tensor(1.0))
+        
+        return result.reshape(-1)  # ensure output shape (N, 1)
+    
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
+    
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        Y = self._evaluate_true(X)
+        if self.noise_std > 0:
+            Y = Y + torch.randn_like(Y) * self.noise_std
+        return -Y if self.negate else Y
+  
+class CyclicalFunction(BaseTestProblem):
+    """
+    Cyclical function:
+      f(x) = sum_{i=0}^{d-1} x_{(i+1) mod d} * exp(cos(x_i))
+
+    Args:
+        d: input dimension
+        noise_std: observation noise
+        negate: whether to negate outputs
+        seed: optional RNG seed
+    """
+
+    def __init__(self, d: int, noise_std: 0.0, negate: bool = False, seed: Optional[int] = None,):
+        
+        self.d = int(d)
+        self.dim = self.d
+        self._bounds = [(0.0, 10.0) for _ in range(self.d)]
+
+        # mark all inputs continuous (common for these synthetic problems)
+        self.continuous_inds = list(range(self.d))
+        self.discrete_inds = []
+        self.categorical_inds = []
+
+        # initialize Module / BaseTestProblem internals
+        super().__init__()
+
+        # now safe to attach other attributes
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        self.noise_std = float(noise_std)
+        self.negate = bool(negate)
+
+        self.optimal_value = 17.29225 * float(self.d)
+
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
+    
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Vectorized evaluation:
+          For batch X shape (N,d) -> returns (N,)
+          For single vector X shape (d,) -> returns (1,) (reshapeable to scalar)
+        Computes sum_i x_{i+1} * exp(cos(x_i)) with cyclic indexing.
+        """
+        if not isinstance(X, torch.Tensor):
+            X = torch.as_tensor(X)
+
+        # ensure batch dimension
+        squeezed = False
+        if X.dim() == 1:
+            X = X.unsqueeze(0)
+            squeezed = True
+
+        # X is (N, d)
+        if X.shape[1] != self.d:
+            raise ValueError(f"Input last-dimension must be {self.d}, got {X.shape[1]}")
+
+        # x_{i+1} with wrap-around: roll left by -1
+        X_next = torch.roll(X, shifts=-1, dims=1)  # (N, d)
+
+        # compute exp(cos(x_i)) elementwise
+        trig_factor = torch.exp(torch.cos(X))      # (N, d)
+
+        # element-wise product and sum across coordinates
+        terms = X_next * trig_factor               # (N, d)
+        fvals = torch.sum(terms, dim=1)            # (N,)
+
+        # return 1-D tensor of length N (if original input was 1-D, return a length-1 tensor)
+        return fvals.reshape(-1)
+
+    def forward(self, X):
+        Y = self._evaluate_true(X)
+        if self.noise_std > 0:
+            Y = Y + torch.randn_like(Y) * self.noise_std
+        return -Y if self.negate else Y
+    
+
+
+### Functions that need re-design
+
+
+class GriewankRosenbrockHybrid(BaseTestProblem):
+    """
+    Hybrid function with first half dimensions as Ackley and second half as Rosenbrock.
+    
+    For x = [x_ackley, x_rosenbrock] where:
+    - x_ackley: first ceil(d/2) dimensions evaluated with Ackley function
+    - x_rosenbrock: remaining dimensions evaluated with Rosenbrock function
+    
+    f(x) = Ackley(x[0:ceil(d/2)]) + Rosenbrock(x[ceil(d/2):])
+    
+    - Domain: x_i ∈ [-5, 5] (works well for both functions)
+    - Global MINIMUM value: 0.0 at x_ackley = [0,0,...,0] and x_rosenbrock = [1,1,...,1]
+    """
+
+    def __init__(self, dim: int = 5, noise_std: float = 0.0, negate: bool = False):
+        self.dim = dim
+        self._bounds = [(-5.0, 5.0) for _ in range(dim)]
+        self.noise_std = noise_std
+        self.negate = negate
+        
+        # Split dimensions: first half Ackley, second half Rosenbrock
+        self.ackley_dim = (dim + 1) // 2  # ceil(d/2)
+        self.rosenbrock_dim = dim - self.ackley_dim
+        
+        # Optimal point: zeros for Ackley part, ones for Rosenbrock part
+        self.optimal_point = torch.cat([
+            torch.zeros(self.ackley_dim),  # Ackley optimum at [0,0,...,0]
+            torch.ones(self.rosenbrock_dim)  # Rosenbrock optimum at [1,1,...,1]
+        ])
+        
+        # Calculate optimal value by evaluating both parts at their optima
+        ackley_opt = self._ackley_part(self.optimal_point[:self.ackley_dim].unsqueeze(0))
+        rosenbrock_opt = self._rosenbrock_part(self.optimal_point[self.ackley_dim:].unsqueeze(0))
+        self.optimal_value = (ackley_opt + rosenbrock_opt).item()
+
+    def _ackley_part(self, x_ackley: torch.Tensor) -> torch.Tensor:
+        """Ackley function applied to the first half of dimensions."""
+        if self.ackley_dim == 0:
+            return torch.zeros(x_ackley.shape[0], 1)
+            
+        a, b, c = 20.0, 0.2, 2.0 * torch.pi
+        n = self.ackley_dim
+        
+        sum_sq = torch.sum(x_ackley**2, dim=-1)
+        sum_cos = torch.sum(torch.cos(c * x_ackley), dim=-1)
+        
+        term1 = -a * torch.exp(-b * torch.sqrt(sum_sq / n))
+        term2 = -torch.exp(sum_cos / n)
+        
+        return term1 + term2 + a + torch.exp(torch.tensor(1.0)).unsqueeze(-1)
+
+    def _rosenbrock_part(self, x_rosenbrock: torch.Tensor) -> torch.Tensor:
+        """Rosenbrock function applied to the second half of dimensions."""
+        if self.rosenbrock_dim == 0:
+            return torch.zeros(x_rosenbrock.shape[0], 1)
+        elif self.rosenbrock_dim == 1:
+            # For single dimension Rosenbrock, use (1-x)^2
+            return ((1 - x_rosenbrock[..., 0])**2).unsqueeze(-1)
+            
+        result = torch.zeros(x_rosenbrock.shape[0])
+        for i in range(self.rosenbrock_dim - 1):
+            term1 = 100 * (x_rosenbrock[..., i+1] - x_rosenbrock[..., i]**2)**2
+            term2 = (1 - x_rosenbrock[..., i])**2
+            result += term1 + term2
+            
+        return result.unsqueeze(-1)
+    
+    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # compatibility wrapper
+        return self._evaluate_true(X)
+
+    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
+        # Split input into Ackley and Rosenbrock parts
+        x_ackley = X[..., :self.ackley_dim]
+        x_rosenbrock = X[..., self.ackley_dim:]
+        
+        # Evaluate each part separately
+        ackley_val = self._ackley_part(x_ackley)
+        rosenbrock_val = self._rosenbrock_part(x_rosenbrock)
+        
+        # Combine results
+        return ackley_val.reshape(-1) + rosenbrock_val.reshape(-1)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        Y = self._evaluate_true(X)
+        if self.noise_std > 0:
+            Y = Y + torch.randn_like(Y) * self.noise_std
+        return -Y if self.negate else Y
+
 
 class MultiplicativeInteraction(BaseTestProblem):
     """
@@ -781,278 +1392,4 @@ class MultiplicativeInteraction(BaseTestProblem):
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
-    
-class RosenbrockRotated(BaseTestProblem):
-    """
-    Rosenbrock function with rotated cross-terms for non-additive decomposition.
-    
-    f(x) = Σ[100*(x_{i+1} - x_i²)² + (1-x_i)²] applied to rotated coordinates
-    
-    - Domain: x_i ∈ [-5, 5] (extended from standard Rosenbrock bounds)
-    - Global MINIMUM value: 0.0 at x = [1, 1, ..., 1] (before rotation)
-    - After rotation, minimum shifts but value remains 0.0
-    """
-    
-    def __init__(self, dim: int = 5, noise_std: float = 0.0, negate: bool = False, 
-                 rotation_seed: Optional[int] = None):
-        self.dim = dim
-        self._bounds = [(-5.0, 5.0) for _ in range(dim)]
-        self.noise_std = noise_std
-        self.negate = negate
-        self.optimal_value = 0.0  # Known global minimum value
-        
-        # Generate random rotation matrix
-        if rotation_seed is not None:
-            torch.manual_seed(rotation_seed)
-        Q, _ = torch.linalg.qr(torch.randn(dim, dim))
-        self.rotation_matrix = Q
-        
-        # Precompute the inverse rotation to find optimal point in rotated space
-        # The optimum in original space is at [1, 1, ..., 1]
-        original_optimum = torch.ones(dim)
-        self.rotated_optimum = self.rotation_matrix @ original_optimum
-
-    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
-        # Apply rotation to input
-        X_rotated = X @ self.rotation_matrix.T
-        
-        # Standard Rosenbrock function on rotated coordinates
-        result = torch.zeros(X.shape[0])
-        for i in range(self.dim - 1):
-            term1 = 100 * (X_rotated[..., i+1] - X_rotated[..., i]**2)**2
-            term2 = (1 - X_rotated[..., i])**2
-            result += term1 + term2
-            
-        return result.reshape(-1)  # ensure output shape (N, 1)
-    
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
-        # compatibility wrapper
-        return self._evaluate_true(X)
-    
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        Y = self._evaluate_true(X)
-        if self.noise_std > 0:
-            Y = Y + torch.randn_like(Y) * self.noise_std
-        return -Y if self.negate else Y
-
-class AckleyCorrelated(BaseTestProblem):
-    """
-    Ackley function with dimension correlations for non-additive decomposition.
-    
-    Modified Ackley with neighbor correlations in the squared term:
-    f(x) = -a*exp(-b*sqrt(Σ(x_i + α*x_{i-1} + α*x_{i+1})²/n)) - exp(Σcos(c*x_i)/n) + a + exp(1)
-    
-    - Domain: x_i ∈ [-32.768, 32.768] (standard Ackley bounds)
-    - Global MINIMUM value: 0.0 at x = [0, 0, ..., 0]
-    - Correlation changes landscape but preserves minimum at origin
-    """
-    
-    def __init__(self, dim: int = 5, noise_std: float = 0.0, negate: bool = False, 
-                 correlation_strength: float = 0.15):
-        self.dim = dim
-        self._bounds = [(-32.768, 32.768) for _ in range(dim)]
-        self.noise_std = noise_std
-        self.negate = negate
-        self.optimal_value = 0.0
-        self.correlation_strength = correlation_strength
-        self.a = 20.0
-        self.b = 0.2
-        self.c = 2.0 * torch.pi
-
-    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
-        n = self.dim
-        a, b, c = self.a, self.b, self.c
-        alpha = self.correlation_strength
-        
-        # Compute correlated squared sum with neighborhood interactions
-        correlated_sum = torch.zeros(X.shape[0])
-        for i in range(n):
-            neighbor_contrib = torch.zeros(X.shape[0])
-            if i > 0:
-                neighbor_contrib += alpha * X[..., i-1]
-            if i < n-1:
-                neighbor_contrib += alpha * X[..., i+1]
-            correlated_sum += (X[..., i] + neighbor_contrib)**2
-        
-        term1 = -a * torch.exp(-b * torch.sqrt(correlated_sum / n))
-        term2 = -torch.exp(torch.sum(torch.cos(c * X), dim=-1) / n)
-        result = term1 + term2 + a + torch.exp(torch.tensor(1.0))
-        
-        return result.reshape(-1)  # ensure output shape (N, 1)
-    
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
-        # compatibility wrapper
-        return self._evaluate_true(X)
-    
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        Y = self._evaluate_true(X)
-        if self.noise_std > 0:
-            Y = Y + torch.randn_like(Y) * self.noise_std
-        return -Y if self.negate else Y
-
-class GriewankRosenbrockHybrid(BaseTestProblem):
-    """
-    Hybrid function with first half dimensions as Ackley and second half as Rosenbrock.
-    
-    For x = [x_ackley, x_rosenbrock] where:
-    - x_ackley: first ceil(d/2) dimensions evaluated with Ackley function
-    - x_rosenbrock: remaining dimensions evaluated with Rosenbrock function
-    
-    f(x) = Ackley(x[0:ceil(d/2)]) + Rosenbrock(x[ceil(d/2):])
-    
-    - Domain: x_i ∈ [-5, 5] (works well for both functions)
-    - Global MINIMUM value: 0.0 at x_ackley = [0,0,...,0] and x_rosenbrock = [1,1,...,1]
-    """
-
-    def __init__(self, dim: int = 5, noise_std: float = 0.0, negate: bool = False):
-        self.dim = dim
-        self._bounds = [(-5.0, 5.0) for _ in range(dim)]
-        self.noise_std = noise_std
-        self.negate = negate
-        
-        # Split dimensions: first half Ackley, second half Rosenbrock
-        self.ackley_dim = (dim + 1) // 2  # ceil(d/2)
-        self.rosenbrock_dim = dim - self.ackley_dim
-        
-        # Optimal point: zeros for Ackley part, ones for Rosenbrock part
-        self.optimal_point = torch.cat([
-            torch.zeros(self.ackley_dim),  # Ackley optimum at [0,0,...,0]
-            torch.ones(self.rosenbrock_dim)  # Rosenbrock optimum at [1,1,...,1]
-        ])
-        
-        # Calculate optimal value by evaluating both parts at their optima
-        ackley_opt = self._ackley_part(self.optimal_point[:self.ackley_dim].unsqueeze(0))
-        rosenbrock_opt = self._rosenbrock_part(self.optimal_point[self.ackley_dim:].unsqueeze(0))
-        self.optimal_value = (ackley_opt + rosenbrock_opt).item()
-
-    def _ackley_part(self, x_ackley: torch.Tensor) -> torch.Tensor:
-        """Ackley function applied to the first half of dimensions."""
-        if self.ackley_dim == 0:
-            return torch.zeros(x_ackley.shape[0], 1)
-            
-        a, b, c = 20.0, 0.2, 2.0 * torch.pi
-        n = self.ackley_dim
-        
-        sum_sq = torch.sum(x_ackley**2, dim=-1)
-        sum_cos = torch.sum(torch.cos(c * x_ackley), dim=-1)
-        
-        term1 = -a * torch.exp(-b * torch.sqrt(sum_sq / n))
-        term2 = -torch.exp(sum_cos / n)
-        
-        return term1 + term2 + a + torch.exp(torch.tensor(1.0)).unsqueeze(-1)
-
-    def _rosenbrock_part(self, x_rosenbrock: torch.Tensor) -> torch.Tensor:
-        """Rosenbrock function applied to the second half of dimensions."""
-        if self.rosenbrock_dim == 0:
-            return torch.zeros(x_rosenbrock.shape[0], 1)
-        elif self.rosenbrock_dim == 1:
-            # For single dimension Rosenbrock, use (1-x)^2
-            return ((1 - x_rosenbrock[..., 0])**2).unsqueeze(-1)
-            
-        result = torch.zeros(x_rosenbrock.shape[0])
-        for i in range(self.rosenbrock_dim - 1):
-            term1 = 100 * (x_rosenbrock[..., i+1] - x_rosenbrock[..., i]**2)**2
-            term2 = (1 - x_rosenbrock[..., i])**2
-            result += term1 + term2
-            
-        return result.unsqueeze(-1)
-    
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
-        # compatibility wrapper
-        return self._evaluate_true(X)
-
-    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
-        # Split input into Ackley and Rosenbrock parts
-        x_ackley = X[..., :self.ackley_dim]
-        x_rosenbrock = X[..., self.ackley_dim:]
-        
-        # Evaluate each part separately
-        ackley_val = self._ackley_part(x_ackley)
-        rosenbrock_val = self._rosenbrock_part(x_rosenbrock)
-        
-        # Combine results
-        return ackley_val + rosenbrock_val
-
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        Y = self._evaluate_true(X)
-        if self.noise_std > 0:
-            Y = Y + torch.randn_like(Y) * self.noise_std
-        return -Y if self.negate else Y
-    
-class CyclicalFunction(BaseTestProblem):
-    """
-    Cyclical function:
-      f(x) = sum_{i=0}^{d-1} x_{(i+1) mod d} * exp(cos(x_i))
-
-    Args:
-        d: input dimension
-        noise_std: observation noise
-        negate: whether to negate outputs
-        seed: optional RNG seed
-    """
-
-    def __init__(self, d: int, noise_std: 0.0, negate: bool = False, seed: Optional[int] = None,):
-        
-        self.d = int(d)
-        self.dim = self.d
-        self._bounds = [(0.0, 10.0) for _ in range(self.d)]
-
-        # mark all inputs continuous (common for these synthetic problems)
-        self.continuous_inds = list(range(self.d))
-        self.discrete_inds = []
-        self.categorical_inds = []
-
-        # initialize Module / BaseTestProblem internals
-        super().__init__()
-
-        # now safe to attach other attributes
-        if seed is not None:
-            torch.manual_seed(seed)
-
-        self.noise_std = float(noise_std)
-        self.negate = bool(negate)
-
-        self.optimal_value = 17.29225 * float(self.d)
-
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
-        # compatibility wrapper
-        return self._evaluate_true(X)
-    
-    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
-        """
-        Vectorized evaluation:
-          For batch X shape (N,d) -> returns (N,)
-          For single vector X shape (d,) -> returns (1,) (reshapeable to scalar)
-        Computes sum_i x_{i+1} * exp(cos(x_i)) with cyclic indexing.
-        """
-        if not isinstance(X, torch.Tensor):
-            X = torch.as_tensor(X)
-
-        # ensure batch dimension
-        squeezed = False
-        if X.dim() == 1:
-            X = X.unsqueeze(0)
-            squeezed = True
-
-        # X is (N, d)
-        if X.shape[1] != self.d:
-            raise ValueError(f"Input last-dimension must be {self.d}, got {X.shape[1]}")
-
-        # x_{i+1} with wrap-around: roll left by -1
-        X_next = torch.roll(X, shifts=-1, dims=1)  # (N, d)
-
-        # compute exp(cos(x_i)) elementwise
-        trig_factor = torch.exp(torch.cos(X))      # (N, d)
-
-        # element-wise product and sum across coordinates
-        terms = X_next * trig_factor               # (N, d)
-        fvals = torch.sum(terms, dim=1)            # (N,)
-
-        # return 1-D tensor of length N (if original input was 1-D, return a length-1 tensor)
-        return fvals.reshape(-1)
-
-    def forward(self, X):
-        Y = self._evaluate_true(X)
-        if self.noise_std > 0:
-            Y = Y + torch.randn_like(Y) * self.noise_std
-        return -Y if self.negate else Y
+     
