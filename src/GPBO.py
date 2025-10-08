@@ -1240,7 +1240,7 @@ def main(argv=None):
     parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, kappa_search, optimization_metrics, partition_reconstruction')
     parser.add_argument('--model_cls', type=str, default='ExactGPModel', help='Model class name (ExactGPModel, AdditiveKernelGP, SobolGP, MHGP, BaseGP)')
     parser.add_argument('--bo_method', type=str, default='run_bo', help='BO method used by higher-level routines (run_bo or run_partitionbo)')
-    parser.add_argument('acq_method', type=str, default='grid', help='Acquisition function scoring method (botorch or grid)')
+    parser.add_argument('--acq_method', type=str, default='grid', help='Acquisition function scoring method (botorch or grid)')
 
     # Method-specific params
     parser.add_argument('--n_init', type=int, default=8)
@@ -1297,10 +1297,12 @@ def main(argv=None):
     if args.bo_method not in ['run_bo', 'run_partitionbo']:
         raise ValueError("bo_method must be 'run_bo' or 'run_partitionbo'")
 
+    if args.acq_method not in ['grid', 'botorch']:
+        raise ValueError("bo_method must be 'grid' or 'botorch'")
+
     model_cls = model_map[args.model_cls]
     method = method_map[args.method]
     bo_method = method_map[args.bo_method]
-    acq_method = method_map[args.acq_method]
 
     # Construct SyntheticTestFun object
     if args.dim is None:
