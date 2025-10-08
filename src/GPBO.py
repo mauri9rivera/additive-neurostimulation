@@ -1,9 +1,6 @@
-# Refactored partitionGPBO.py
-# Adds CLI argument parsing to run specific experiments (run_bo, run_partitionbo, kappa_search, etc.)
-# Usage examples at bottom and via `--help`.
-
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import LogLocator, LogFormatterMathtext
 import sys
 import os
 import torch
@@ -484,7 +481,26 @@ def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
     mean_loss = float(np.mean(epoch_losses))
     return gp, gp.likelihood, mean_loss
 
-def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10, kappa=1.0, save=False, verbose=False):
+def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
+        """
+        Grid-search UCB maximizer.
+        Returns: new_x (1 x d tensor), ucb_value (float), idx (int)
+        UCB = mean + kappa * std
+        """
+        gp_model.eval()
+        gp_likelihood.eval()
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            post = gp_likelihood(gp_model(grid_points))
+            mean = post.mean           # shape (n_points,)
+            var = post.variance
+            std = var.clamp_min(0.0).sqrt()
+            ucb = mean + kappa_val * std
+
+        best_idx = torch.argmax(ucb).item()
+        best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
+        return best_x, ucb[best_idx].item(), best_idx
+
+def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10, kappa=1.0, acq_method = 'grid', save=False, verbose=False):
     """
     Returns the same metrics as run_bo, plus:
       - partition_updates: list of partition structures (list of lists) when updates occurred
@@ -496,7 +512,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10,
     # --------------------------------------------------------
 
     # Initiate n_init points, bounds
-    n_points = int(5000 * f_obj.d**2)
+    n_points = int(100 * f_obj.d**2)
     bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float()  # shape (2, d)
     lower, upper = bounds[0], bounds[1]
     grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d)
@@ -505,12 +521,12 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10,
     grid_min = grid_y.min().item()
 
     # Initiate training set
-    true_best = f_obj.f.optimal_value
+    true_best = grid_y.max().item() #f_obj.f.optimal_value
     train_x, train_y  = f_obj.simulate(n_init)
     best_observed = train_y.max().item()
 
     # initialize metrics (same as run_bo)
-    r_squared, loss_curve, expl_scores, exploit_scores, log_regrets = [], [], [], [], []
+    r_squared, loss_curve, expl_scores, exploit_scores, regrets = [], [], [], [], []
 
     # Additional metrics
     partition_updates = []
@@ -541,28 +557,25 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10,
         loss_curve.append(np.mean(epoch_losses))
 
         # Acquisition scoring
-        UCB = UpperConfidenceBound(model=gp, beta=kappa**2, maximize=True)
-        warnings.filterwarnings("ignore", category=RuntimeWarning)
-        new_x, _ = optimize_acqf(
-            acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512)
-        new_y = f_obj.f.forward(new_x)
+        if acq_method == 'botorch':
+            UCB = UpperConfidenceBound(model=gp, beta=kappa**2, maximize=True)
+            # Next point
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            new_x, _ = optimize_acqf(
+                acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512)
+            
+        else:
+            new_x, acq_val, acq_idx = maximize_acq(kappa, gp.model, gp.likelihood, grid_x)
 
-        '''
-        new_x, _ = optimize_acqf_torch(
-                    acq_function=UCB,
-                    bounds=bounds,
-                    q=1,
-                    num_restarts=20,
-                    raw_samples=512,
-                    options={"maxiter": 200},   # gradient descent iterations
-                )
-        '''
+        new_y = f_obj.f.forward(new_x)
 
         # update dataset
         train_x = torch.cat([train_x, new_x])
         train_y  = torch.cat([train_y, new_y])
         if train_y.min().item() < grid_min:
             grid_min = train_y.min().item()
+        if train_y.max().item() > true_best:
+            true_best = train_y.max().item()
 
         # Posterior predictions for R^2
         gp.model.eval(); gp.likelihood.eval()
@@ -588,34 +601,23 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10,
         expl_scores.append(explore)
 
         # Regret scores
-        regret = true_best - best_observed
-        log_regret = np.log(regret + 1e-9)
-        log_regrets.append(log_regret)
+        regret = true_best - best_observed + 1e-9
+        regrets.append(regret)
 
         # If there is a pending Sobol job finished, fetch it and update partition
         if sobol_future is not None and sobol_future.done():
-            #print("DEBUG: inside future-handling, sobol object:", type(sobol), " sobol.problem:", getattr(sobol, "problem", None))
 
             try:
-                #print(f'Is Sobol future none? {sobol_future is None}')
-                #print(f'future.done(): {sobol_future.done()}, future.cancelled(): {sobol_future.cancelled()}')
 
-                interactions = sobol_future.result()
-                #print('sobol_future.result() returned. type:', type(interactions))
-                
+                interactions = sobol_future.result()                
                 if interactions is None:
-                    #print('DEBUG: interactions is None — compute_interactions returned None or failed silently.')
                     raise ValueError('compute_interactions returned None')
 
                 partition = sobol.update_partition(interactions) # defining new partition here
-                #print('DEBUG: partition computed, top-level groups:', len(partition) if partition is not None else None)
-
-                partition_updates.append([grp[:] for grp in partition])
                 gp.model.update_partition(partition) # update partition happening here
                 
                 sobol_future = None
             except Exception as e:
-                # if background job failed just log and continue
                 sobol_future = None
                 print(f"[Sobol] background job failed: {e}")
 
@@ -623,8 +625,8 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10,
         gp = WrappedModel(train_x, train_y, model_cls)
         gp.model.sobol = sobol 
         sobol_interactions.append(interactions.copy() if isinstance(interactions, np.ndarray) else np.array(interactions)) # add previous sobol interactions
+        partition_updates.append(gp.model.partition) # add current partition
 
-        
         # Submit a new Sobol background job every n_sobol iterations (if none pending)
         if (i % n_sobol) == 0:
             if sobol_future is None or sobol_future.done():
@@ -634,10 +636,9 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10,
                     sobol_future = executor.submit(sobol.compute_interactions, train_x, train_y, surrogate, surrogate_likelihood)
                 except Exception as e:
                     sobol_future = None
-                    #print(f"[Sobol] submit failed: {e}")
+                    print(f"[Sobol] submit failed: {e}")
 
         if verbose:
-            # print last loss, exploit/explore, R^2 and optionally partition snapshot
             part_str = getattr(gp.model, 'partition', None)
             print(f"{getattr(gp.model,'name','GP')} | Iter {i+1:02d} Loss: {loss_curve:.4f} Exploit score: {exploit:.4f}, Explore score: {explore:.4f}, R^2: {r2_score:.4f} | partition: {part_str}")
             print(f'best observed: {best_observed:.4f} |  true best: {true_best:.4f} | current query: {new_y.item():.4f}')
@@ -656,7 +657,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10,
                  loss_curve=np.array(loss_curve),
                  exploration=np.array(expl_scores),
                  exploitation=np.array(exploit_scores),
-                 log_regrets=np.array(log_regrets),
+                 regrets=np.array(regrets),
                  partition_updates=np.array(partition_updates, dtype=object),
                  sobol_interactions=np.array(sobol_interactions, dtype=object))
 
@@ -666,13 +667,13 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=8, n_iter=200, n_sobol=10,
         'exploration': np.array(expl_scores),
         'exploitation': np.array(exploit_scores),
         'loss_curve': np.array(loss_curve),
-        'regrets': np.array(log_regrets),
+        'regrets': np.array(regrets),
         'partition_updates': partition_updates,
         'sobol_interactions': sobol_interactions
     }
     return result
 
-def run_bo(f_obj, model_cls, n_init=8, n_iter=200, kappa=1.0, save=False, verbose=False):
+def run_bo(f_obj, model_cls, n_init=8, n_iter=200, kappa=1.0, acq_method = 'grid', save=False, verbose=False):
 
     # Initiate n_init points, bounds
     n_points = int(100 * f_obj.d**2)
@@ -684,12 +685,12 @@ def run_bo(f_obj, model_cls, n_init=8, n_iter=200, kappa=1.0, save=False, verbos
     grid_min = grid_y.min().item()
     
     # Initiate training set
-    true_best = f_obj.f.optimal_value  # + np.finfo(float).eps
+    true_best = grid_y.max().item() #f_obj.f.optimal_value  
     train_x, train_y  = f_obj.simulate(n_init)
     best_observed = train_y.max().item()
 
     #initialize metrics
-    r_squared, loss_curve, expl_scores, exploit_scores, log_regrets = [], [], [], [], []
+    r_squared, loss_curve, expl_scores, exploit_scores, regrets = [], [], [], [], []
 
     gp = WrappedModel(train_x, train_y, model_cls)
 
@@ -699,13 +700,17 @@ def run_bo(f_obj, model_cls, n_init=8, n_iter=200, kappa=1.0, save=False, verbos
         gp.model, gp.likelihood, epoch_losses = optimize(gp.model, train_x, train_y)
         loss_curve.append(np.mean(epoch_losses))
 
-    
-        # Acquisition scoring
-        UCB = UpperConfidenceBound(model=gp, beta=kappa**2, maximize=True)
-        # Next point
-        warnings.filterwarnings("ignore", category=RuntimeWarning)
-        new_x, _ = optimize_acqf(
-            acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512)
+        if acq_method == 'botorch':
+            # Acquisition scoring
+            UCB = UpperConfidenceBound(model=gp, beta=kappa**2, maximize=True)
+            # Next point
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            new_x, _ = optimize_acqf(
+                acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512)
+            
+        else:
+            new_x, acq_val, acq_idx = maximize_acq(kappa, gp.model, gp.likelihood, grid_x)
+
         new_y = f_obj.f.forward(new_x)
 
         #update dataset
@@ -713,6 +718,8 @@ def run_bo(f_obj, model_cls, n_init=8, n_iter=200, kappa=1.0, save=False, verbos
         train_y  = torch.cat([train_y, new_y])
         if train_y.min().item() < grid_min:
             grid_min = train_y.min().item()
+        if train_y.max().item() > true_best:
+            true_best = train_y.max().item()
 
         # Posterior predictions for R^2
         gp.model.eval(); gp.likelihood.eval()
@@ -739,16 +746,15 @@ def run_bo(f_obj, model_cls, n_init=8, n_iter=200, kappa=1.0, save=False, verbos
         expl_scores.append(explore)
 
         # Regret scores
-        regret = true_best - best_observed
-        log_regret = np.log(regret + 1e-7)   # numerical stability
-        log_regrets.append(log_regret)
+        regret = true_best - best_observed + 1e-9
+        regrets.append(regret)
 
         
         gp = WrappedModel(train_x, train_y, model_cls)
 
 
         if verbose:
-            print(f"{gp.model.name} | Iter {i+1:02d} Loss: {loss:.2f} Exploit score: {exploit:.2f}, Explore score: {explore:.3f}, R^2: {r2_score}")
+            print(f"{gp.model.name} | Iter {i+1:02d} Exploit score: {exploit:.2f}, Explore score: {explore:.3f}, R^2: {r2_score}")
             print(f'best observed: {best_observed:.2f} |  true best: {true_best:.2f} | current query: {new_y.item():.2f}')
 
     if save:
@@ -762,79 +768,87 @@ def run_bo(f_obj, model_cls, n_init=8, n_iter=200, kappa=1.0, save=False, verbos
                 loss_curve=np.array(loss_curve),
                 exploration=np.array(expl_scores),
                 exploitation=np.array(exploit_scores),
-                log_regrets=np.array(log_regrets))
+                regrets=np.array(regrets))
         
     r_squared=np.array(r_squared)
     loss_curve=np.array(loss_curve)
     exploration=np.array(expl_scores)
     exploitation=np.array(exploit_scores)
-    log_regrets=np.array(log_regrets)
+    regrets=np.array(regrets)
 
     return {
         'r2': r_squared,
         'exploration': exploration,
         'exploitation': exploitation,
         'loss': loss_curve,
-        'regrets': log_regrets
+        'regrets': regrets
        }
 
 ### Graph generation functions ###
 
 def kappa_search(f_obj, kappa_list, model_cls=BaseGP, n_init=8, n_iter=100, n_reps=15,
-                bo_method=run_bo):
+                bo_method=run_bo, acq_method = 'grid'):
     """
-    For each kappa in kappa_list, run BO n_reps times and plot the average max R²,
-    average max exploration, and an exploitation summary metric.
+    For each kappa in kappa_list, run BO n_reps times and plot averaged exploration
+    (dashed line) and exploitation (filled area) traces. The x-axis begins with
+    `n_init` zeros (initialization period) followed by the BO iterations.
 
-    metric_type: 'last' -> plot the (averaged) final exploitation value (exploit[-1])
-                 'auc'  -> plot the (averaged) normalized AUC of the exploitation trace
+    - exploration: dashed line
+    - exploitation: filled area (solid edge + alpha fill)
+    - each kappa uses a distinct color
+
+    Returns:
+      dict with averaged traces per kappa and path to saved plot.
     """
 
-    avg_max_r2 = []
-    avg_max_explore = []
-    avg_exploit_last5  = []  
+    averaged = {}  
 
     for kappa in kappa_list:
-        max_r2_list = []
-        max_explore_list = []
-        exploit_metric_list = []
+        
+        explore_list, exploit_list = []
 
         print(f"\nRunning kappa={kappa} for {model_cls.__name__} ({f_obj.name})")
         for rep in range(n_reps):
 
-            results = bo_method(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, save=False)
-            r2, explore, exploit = results['r2'], results['exploration'], results['exploitation']
+            results = bo_method(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, acq_method=acq_method, save=False)
+            explore, exploit = results['exploration'], results['exploitation']
 
-            max_r2_list.append(float(r2[-1]))
-            max_explore_list.append(float(explore[-1]))
+            explore_list.append(explore)
+            exploit_list.append(exploit)
+          
+        stacked_explore = np.stack([explr for explr in explore_list], axis=0)
+        stacked_exploit = np.stack([explt for explt in exploit_list], axis=0)
 
-            last5 = exploit[-5:] if len(exploit) >= 5 else exploit
-            metric_value = float(np.mean(last5))
-            exploit_metric_list.append(metric_value)
+        averaged[kappa] = {'explore': stacked_explore.mean(axis=0), 'exploit': stacked_exploit.mean(axis=0)}
 
-            print(
-                f"  > Repetition {rep+1}/{n_reps} | "
-                f"R^2: {np.max(r2):.4f} "
-                f"Explore(max): {float(explore[-1]):.4f} "
-                f"Exploit_metric: {metric_value:.4f}"
-            )
-
-        avg_max_r2.append(np.mean(max_r2_list))
-        avg_max_explore.append(np.mean(max_explore_list))
-        avg_exploit_last5 .append(np.mean(exploit_metric_list))
 
     # Plotting
-    plt.figure(figsize=(8, 6))
-    plt.plot(kappa_list, avg_max_explore, marker='s', linestyle='--', label='Exploration', color='green')
+    plt.figure(figsize=(10, 6))
+    cmap = plt.get_cmap('tab10')
+    n_k = len(kappa_list)
+    x = np.arrange(0, n_iter)
 
-    exploit_label = 'Exploitation' 
-    plt.plot(kappa_list, avg_exploit_last5 , marker='^', linestyle='-.', label=exploit_label, color='orange')
+    for idx, kappa in enumerate(kappa_list):
 
-    plt.xlabel('Kappa')
+        vals = averaged.get(kappa, None)
+        color = cmap(idx % 10)
+
+        mean_explore = vals['explore']
+        mean_exploit = vals['exploit']
+
+        # prepend n_init zeros (initialization period)
+        explore_padded = np.concatenate([np.zeros(n_init), mean_explore])
+        exploit_padded = np.concatenate([np.zeros(n_init), mean_exploit])
+        # plot exploration as dashed line
+        plt.plot(x, explore_padded, linestyle='--', marker=None, label=f'k={kappa} Explore', color=color)
+        #plt.plot(x, exploit_padded, linestyle='-', marker=None, color=color, label=f'k={kappa} Exploit')
+
+
+    plt.xlabel('Iteration')
     plt.ylabel('Metric Value')
-    plt.title(f"{model_cls.__name__} Kappa Search on {f_obj.name} (averaged over {n_reps} runs)")
+    plt.title(f"{model_cls.__name__} on {f_obj.d}-{f_obj.name} | Exploration & Exploitation curves (averaged over {n_reps} runs)")
     plt.ylim(0, 1.1)
-    plt.legend()
+    plt.legend(loc='lower right')
     plt.grid(True)
 
     # Save plot
@@ -842,13 +856,13 @@ def kappa_search(f_obj, kappa_list, model_cls=BaseGP, n_init=8, n_iter=100, n_re
     os.makedirs(output_dir, exist_ok=True)
     plot_path = os.path.join(
         output_dir,
-        f'kappa_search_{model_cls.__name__}_{f_obj.f.d}-dimensional_avg{n_reps}_budget{n_iter}.svg'
+        f'kappa_search_{model_cls.__name__}_{f_obj.f.d}-d_budget{n_iter}.svg'
     )
     plt.savefig(plot_path, format="svg")
     plt.close()
     print(f"Saved kappa search plot to {plot_path}")
 
-def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
+def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95, acq_method = 'grid'):
     """
     Run BO variants for f_obj and plot:
       - Plot 1: Exploration (dashed), Exploitation (solid) averaged across n_reps
@@ -887,9 +901,9 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
 
         for rep in range(n_reps):
             if label in ['SobolGP', 'MHGP']:
-                exp_results = run_partitionbo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, save=False)
+                exp_results = run_partitionbo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, acq_method=acq_method)
             else:
-                exp_results = run_bo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, save=False)
+                exp_results = run_bo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, acq_method=acq_method)
 
             regrets, explore, exploit = exp_results['regrets'], exp_results['exploration'], exp_results['exploitation']
             all_regrets.append(regrets)
@@ -909,13 +923,14 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
         metrics[label] = {
             'explore': mean_explore,
             'exploit': mean_exploit,
-            'color': color
+            'color': color,
+            'kappa': kappa,
         }
 
         # Compute confidence interval (normal approx)
         ci_scale = 1.96 if ci == 95 else 1.0  # crude but works
         ci_regrets = ci_scale * std_regrets / np.sqrt(n_reps)
-        regrets_results[label] = {'mean': mean_regrets, 'ci': ci_regrets, 'color': color}
+        regrets_results[label] = {'mean': mean_regrets, 'ci': ci_regrets, 'color': color, 'kappa': kappa,}
 
 
     # ----------------------
@@ -946,7 +961,7 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
     output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
     os.makedirs(output_dir, exist_ok=True)
     dim = f_obj.d
-    perf_filename = f'explr-explt_{f_obj.name}_{dim}-dimensional_avg{n_reps}_budget{n_iter}.svg'
+    perf_filename = f'explr-explt_{dim}d-{f_obj.name}_budget{n_iter}.svg'
     perf_path = os.path.join(output_dir, perf_filename)
     plt.savefig(perf_path, format='svg')
     plt.close(fig1)
@@ -960,32 +975,46 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
     iterations = np.arange(1, n_iter -n_init + 1)
     eps = 1e-12  # small positive to avoid log(0)
     global_min, global_max = float('inf'), 0.0
+
     for label, vals in regrets_results.items():
         mean_reg = vals['mean']
         ci_reg = vals['ci']
         color = vals['color']
+        kappa = vals['kappa']
 
+        # lower/upper bounds (clip to eps so log plotting works)
         lower = np.maximum(mean_reg - ci_reg, eps)
         upper = np.maximum(mean_reg + ci_reg, eps)
-        global_min = min(global_min, lower.min())
-        global_max = max(global_max, upper.max())
+        mean_plot = np.maximum(mean_reg, eps)
 
-        ax2.plot(it, mean_reg, color=color, label=f'{label} Mean Regret')
+        # update global bounds so we can set y-limits to include all curves
+        global_min_lin = min(global_min_lin, lower.min())
+        global_max_lin = max(global_max_lin, upper.max())
+
+        ax2.plot(it, mean_reg, color=color, label=f'{label} kappa={kappa}')
         ax2.fill_between(it, mean_reg - ci_regrets, mean_reg + ci_regrets, color=color, alpha=0.2)
 
-    # add padding
-    global_min = max(global_min * 0.8, eps)
-    global_max = global_max * 1.2
+    
+    # Snap y-limits to full decades (powers of ten) so ticks are exactly 10^k
+    log10_min = np.floor(np.log10(global_min_lin))
+    log10_max = np.ceil(np.log10(global_max_lin))
+    log10_max = max(log10_max, 10)
+    ymin = 10.0 ** log10_min
+    ymax = 10.0 ** log10_max
 
     ax2.set_xlabel('Iteration')
+    ax2.set_yscale('log')
+    ax2.set_ylim(ymin, ymax)
+    ax2.yaxis.set_major_locator(LogLocator(base=10.0))
+    ax2.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
     ax2.set_ylabel('Regret (log scale)')
-    ax2.set_title(f'Mean Regret across {n_reps} runs | {f_obj.d}-{f_obj.name} (kappas={kappas})')
+    ax2.set_title(f'Mean Log-Regret across {n_reps} runs | {f_obj.d}-{f_obj.name}')
     ax2.set_yscale("log")
-    ax2.autoscale(enable=True, axis='y', tight=True) 
+    #ax2.autoscale(enable=True, axis='y', tight=True) 
     ax2.grid(True)
     ax2.legend(loc='upper right', fontsize='small')
 
-    regrets_filename = f'regrets_{f_obj.name}_{dim}-dimensional_avg{n_reps}_budget{n_iter}.svg'
+    regrets_filename = f'regrets_{dim}d-{f_obj.name}_budget{n_iter}.svg'
     regrets_path = os.path.join(output_dir, regrets_filename)
     plt.savefig(regrets_path, format='svg')
     plt.close(fig2)
@@ -999,7 +1028,7 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95):
         'regrets_path': regrets_path
     }
 
-def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10, kappa=1.0, save=False, verbose=False):
+def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10, kappa=1.0, acq_method='grid', save=False, verbose=False):
 
     """
     Compute and plot how well partition_updates reconstruct the true Sobol interaction graph.
@@ -1020,8 +1049,7 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
     sobols_sym = 0.5 * (sobols + sobols.T)
     np.fill_diagonal(sobols_sym, 0.0)
 
-    d = sobols_sym.shape[0]
-
+    d = f_obj.d
 
     # 2) Run the Sobol-guided BO experiment
     results = run_partitionbo(f_obj,
@@ -1030,112 +1058,153 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
                          n_iter=n_iter,
                          n_sobol=n_sobol,
                          kappa=kappa,
+                         acq_method=acq_method,
                          save=False,
                          verbose=verbose)
 
     partitions_all = results.get('partition_updates', [])
-    sobol_interactions_all = results.get('sobol_interactions', [])
+    sobol_interactions_all = results.get('sobol_interactions', [])  # expected: list length ~ n_iter of (d,d) arrays
 
     # 3) Build G_true adjacency matrix using threshold 0.05 (upper diagonal)
     threshold = 0.05
-    edges_true = sobols_sym > threshold  # boolean symmetric matrix, diagonal False
-    np.fill_diagonal(edges_true, False)
+    non_additive = sobols_sym > threshold  
+    additive = ~non_additive.copy()
+    np.fill_diagonal(non_additive, False)
 
     # Count unique undirected true edges (i<j)
     triu_idx = np.triu_indices(d, k=1)
-    true_edge_count = int(np.sum(edges_true[triu_idx])) - f_obj.d
-    true_nonedge_count = int(((d * (d - 1)) // 2) - true_edge_count - f_obj.d)
+    true_non_additive_count = int(np.sum(non_additive[triu_idx])) - f_obj.d
+    true_additive_count = int(((d * (d - 1)) // 2) - true_non_additive_count - f_obj.d)
 
-    # Helper to build experiment adjacency from one partition snapshot P (list of lists)
-    def build_experiment_adj_from_partition(P):
+    # Helper: build group_of array from partition P
+    def partition_to_group_of(P):
         """
-        P: list of lists, each sublist contains indices grouped together.
-        An edge exists between i and j iff they are NOT in the same sublist.
-        Returns a symmetric boolean adjacency matrix (d, d) with diag False.
+        Convert partition list-of-lists to group_of array of length d.
+        If some indices missing, they remain -1 (shouldn't happen).
         """
-        adj = np.zeros((d, d), dtype=bool)
-        # For every pair i<j, set adj[i,j] = True unless they belong to same sublist
-        # Build lookup mapping index -> group_id for fast membership test
         group_of = np.full(d, -1, dtype=int)
         for gid, grp in enumerate(P):
             for idx in grp:
                 group_of[int(idx)] = gid
+        return group_of
+
+   # Helper: build experiment adjacency matrix from partition snapshot P
+    def build_nonadditivity_graph(P):
+        """
+        P: list of lists (groups). Returns symmetric boolean adjacency matrix (d,d):
+           adj[i,j] = True iff i and j are in the same group (predicted non-additive / interaction).
+        """
+        adj = np.zeros((d, d), dtype=bool)
+        group_of = partition_to_group_of(P)
         for i in range(d):
             for j in range(i + 1, d):
-                adj_val = (group_of[i] == group_of[j])  # True when not same group
-                adj[i, j] = adj[j, i] = adj_val
+                adj[i, j] = (group_of[i] == group_of[j])
+                # adj[j,i] will be mirrored below
+        adj = adj | adj.T
         np.fill_diagonal(adj, False)
         return adj
-
+    
     # 4) For each partition snapshot compute CC and CS
     cc_list = []
     cs_list = []
-    update_iters = []  # BO iteration number corresponding to each sobol update
 
-    
+    prev_group_of = None
+    partition_changed_flags = []
+
     for t, P in enumerate(partitions_all):
-        # compute which BO iteration this corresponds to (1-based)
-        iter_num = t * n_sobol
-        update_iters.append(iter_num)
 
-        G_exp = build_experiment_adj_from_partition(P)
+        iter_num = n_init + t + 1
 
-        # compute counts for undirected unique edges (i<j)
-        edges_overlap = edges_true == G_exp
-        np.fill_diagonal(edges_overlap, False)
-        edges_both_count = int(np.sum(edges_overlap[triu_idx]))
+        # compute if partition changed since last iteration
+        current_group_of = partition_to_group_of(P)
+        if prev_group_of is None:
+            changed = True  # mark first snapshot as a change (so it can get markers if desired)
+        else:
+            changed = not np.array_equal(prev_group_of, current_group_of)
+        partition_changed_flags.append(bool(changed))
+        prev_group_of = current_group_of.copy()
 
-        #print(f'edges experiment: {G_exp} \n edges_true: {edges_true} \n edges_overlap: {edges_overlap}\n\n')
-        # CC = fraction of true edges that are also edges in experiment
-        if true_edge_count > 0:
-            CC = edges_both_count / true_edge_count
+        # predicted adjacency
+        G_exp = build_nonadditivity_graph(P)
+        non_additive_overlap = np.logical_and(non_additive, G_exp)
+        non_additive_overlap_count = int(np.sum(non_additive_overlap[triu_idx]))
+
+        # CC = fraction of true non-additive edges recovered
+        if true_non_additive_count > 0:
+            CC = non_additive_overlap_count / true_non_additive_count
         else:
             CC = np.nan
 
-        # Non-edges both
-        nonedges_true = ~edges_true.copy()
-        nonedges_exp = ~G_exp.copy()
-        nonedges_overlap = nonedges_true == nonedges_exp
-        #print(f'non_edges experiment: {nonedges_exp} \n nonedges_true: {nonedges_true} \n nonedges_overlap: {nonedges_overlap}\n\n')
-        np.fill_diagonal(nonedges_overlap, False)
-        nonedges_both_count = int(np.sum(nonedges_overlap[triu_idx]))
+        # Count true additive (non-edge) that are predicted non-edge
+        # predicted non-edge matrix:
+        nonedge_pred = ~G_exp
+        # true additive & predicted non-edge
+        additive_overlap = np.logical_and(additive, nonedge_pred)
+        additive_overlap_count = int(np.sum(additive_overlap[triu_idx]))
 
-        if true_nonedge_count > 0:
-            print(f'nonedges pred count: {nonedges_both_count} and real one: {true_nonedge_count}')
-            CS = nonedges_both_count / true_nonedge_count
+        if true_additive_count > 0:
+            CS = additive_overlap_count / true_additive_count
         else:
             CS = np.nan
 
         cc_list.append(CC)
         cs_list.append(CS)
 
-    # 5) Plot CC and CS vs updates (map to BO iteration numbers)
-    plt.figure(figsize=(8, 5))
+
+    # 5) Plot CC and CS vs iteration
+    plt.figure(figsize=(9, 5))
+    update_iters = list(range(n_iter))
     x = np.array(update_iters)
 
+    # n_init_padding
+    cc_list = [0.0] * n_init + cc_list[n_init:]
+    cs_list = [0.0] * n_init + cs_list[n_init:]
+    partition_changed_flags = [False] * n_init + partition_changed_flags[n_init:]
+
     # Plot CC (match of true edges)
-    plt.plot(x, cc_list, label='CC (true-edge overlap)', linestyle='-', marker='o')
+    plt.plot(x, cc_list, label='CC (true-edge overlap)', linestyle='-', color='C0')
+    change_x = x[np.array(partition_changed_flags, dtype=bool)]
+    change_cc = np.array(cc_list)[np.array(partition_changed_flags, dtype=bool)]
+    if change_x.size > 0:
+        plt.plot(change_x, change_cc, linestyle='None', marker='o', color='C0')
 
     # Plot CS (match of true non-edges)
-    plt.plot(x, cs_list, label='CS (true-nonedge overlap)', linestyle='--', marker='s')
+    plt.plot(x, cs_list, label='CS (true-nonedge overlap)', linestyle='-', color='C1')
+    change_cs = np.array(cs_list)[np.array(partition_changed_flags, dtype=bool)]
+    if change_x.size > 0:
+        plt.plot(change_x, change_cs, linestyle='None', marker='s', color='C1')
 
-    plt.xlabel('Partition update in BO')
+
+    plt.xlabel('Iteration')
     plt.ylabel('Reconstruction score')
     plt.ylim(0.0, 1.1)
-    plt.title(f'Partition reconstruction for {f_obj.name} (threshold=0.05)')
+    plt.title(f'Partition reconstruction for {f_obj}d-{f_obj.name}_kappa{kappa} | (Additivity threshold=0.05)')
     plt.grid(True)
     plt.legend()
 
     
     output_dir = os.path.join('output', 'synthetic_experiments', 'partition_recon')
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'partition_recon_{f_obj.name}_{datetime.date.today().isoformat()}.png'
+    fname = f'partition_recon_{f_obj}d={f_obj.name}_kappa{kappa}.png'
     outpath = os.path.join(output_dir, fname)
     plt.savefig(outpath, dpi=200)
     if verbose:
         print(f"Saved partition reconstruction plot to {outpath}")
+
+    '''
+    pairs = [(i, j) for i in range(d) for j in range(i+1, d)]
+    n_pairs = len(pairs)
+
+    nrows = int(n_pairs)
+
+    fig2, axes = plt.subplots(nrows, 1, figsize=(4, 2.5*nrows), squeeze=False)
+    color = 'green' if model_cls.__name__ == 'SobolGP' else 'orange'
+
+    # Prepare sobol_interactions_all as list of (d,d) arrays if available
+    sobol_est_list = []
+    '''
+
     
-    return cc_list, cs_list, update_iters    
 
 
 ### Parser handling
@@ -1171,6 +1240,7 @@ def main(argv=None):
     parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, kappa_search, optimization_metrics, partition_reconstruction')
     parser.add_argument('--model_cls', type=str, default='ExactGPModel', help='Model class name (ExactGPModel, AdditiveKernelGP, SobolGP, MHGP, BaseGP)')
     parser.add_argument('--bo_method', type=str, default='run_bo', help='BO method used by higher-level routines (run_bo or run_partitionbo)')
+    parser.add_argument('acq_method', type=str, default='grid', help='Acquisition function scoring method (botorch or grid)')
 
     # Method-specific params
     parser.add_argument('--n_init', type=int, default=8)
@@ -1230,6 +1300,7 @@ def main(argv=None):
     model_cls = model_map[args.model_cls]
     method = method_map[args.method]
     bo_method = method_map[args.bo_method]
+    acq_method = method_map[args.acq_method]
 
     # Construct SyntheticTestFun object
     if args.dim is None:
@@ -1250,20 +1321,20 @@ def main(argv=None):
     # dispatch
     try:
         if args.method == 'run_bo':
-            result = run_bo(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, kappa=args.kappa, save=args.save, verbose=args.verbose)
+            result = run_bo(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
         elif args.method == 'run_partitionbo':
-            result = run_partitionbo(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose)
+            result = run_partitionbo(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
         elif args.method == 'kappa_search':
             # Provide a default kappa list if none given
             k_list = args.kappa_list or [0.5, 1.0, 3.0, 5.0, 7.0, 9.0, 15.0]
-            result = kappa_search(f_obj, k_list, model_cls=model_cls, n_init=args.n_init, n_iter=args.n_iter, n_reps=args.n_reps, bo_method=bo_method)
+            result = kappa_search(f_obj, k_list, model_cls=model_cls, n_init=args.n_init, n_iter=args.n_iter, n_reps=args.n_reps, bo_method=bo_method, acq_method=args.acq_method)
         elif args.method == 'optimization_metrics':
             if args.kappas is None:
                 raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values)')
             kappas = args.kappas
-            result = optimization_metrics(f_obj, kappas, n_init=args.n_init, n_iter=args.n_iter, n_reps=args.n_reps)
+            result = optimization_metrics(f_obj, kappas, n_init=args.n_init, n_iter=args.n_iter, n_reps=args.n_reps, acq_method=args.acq_method)
         elif args.method == 'partition_reconstruction':
-            result = partition_reconstruction(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose)
+            result = partition_reconstruction(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
         else:
             raise ValueError('Unsupported method')
 
@@ -1282,9 +1353,6 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    #main()
+    main()
 
-    st = SyntheticTestFun('rosenbrock_rotated', d=4, noise=0.0, negate=True)
-    X, Y = st.simulate(100000)  # 50 random samples
-    print("sample Y range:", Y.min().item(), Y.max().item())
-    print(f'Theoretical optimal: {st.f.optimal_value}')
+    
