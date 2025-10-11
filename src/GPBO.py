@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, LogFormatterMathtext
+import textwrap
 import sys
 import os
 import torch
@@ -805,7 +806,7 @@ def kappa_search(f_obj, kappa_list, model_cls=BaseGP, n_init=8, n_iter=100, n_re
 
     for kappa in kappa_list:
         
-        explore_list, exploit_list = []
+        explore_list, exploit_list = [], []
 
         print(f"\nRunning kappa={kappa} for {model_cls.__name__} ({f_obj.name})")
         for rep in range(n_reps):
@@ -826,7 +827,7 @@ def kappa_search(f_obj, kappa_list, model_cls=BaseGP, n_init=8, n_iter=100, n_re
     plt.figure(figsize=(10, 6))
     cmap = plt.get_cmap('tab10')
     n_k = len(kappa_list)
-    x = np.arrange(0, n_iter)
+    x = np.arange(0, n_iter)
 
     for idx, kappa in enumerate(kappa_list):
 
@@ -840,8 +841,8 @@ def kappa_search(f_obj, kappa_list, model_cls=BaseGP, n_init=8, n_iter=100, n_re
         explore_padded = np.concatenate([np.zeros(n_init), mean_explore])
         exploit_padded = np.concatenate([np.zeros(n_init), mean_exploit])
         # plot exploration as dashed line
-        plt.plot(x, explore_padded, linestyle='--', marker=None, label=f'k={kappa} Explore', color=color)
-        #plt.plot(x, exploit_padded, linestyle='-', marker=None, color=color, label=f'k={kappa} Exploit')
+        plt.plot(x, explore_padded, linestyle='-', marker=None, label=f'k={kappa} Explore', color=color)
+        plt.plot(x, exploit_padded, linestyle='--', marker=None, color=color)
 
 
     plt.xlabel('Iteration')
@@ -988,29 +989,29 @@ def optimization_metrics(f_obj, kappas, n_init=8, n_iter=100, n_reps=15, ci=95, 
         mean_plot = np.maximum(mean_reg, eps)
 
         # update global bounds so we can set y-limits to include all curves
-        global_min_lin = min(global_min_lin, lower.min())
-        global_max_lin = max(global_max_lin, upper.max())
+        global_min = min(global_min, lower.min())
+        global_max = max(global_max, upper.max())
 
         ax2.plot(it, mean_reg, color=color, label=f'{label} kappa={kappa}')
         ax2.fill_between(it, mean_reg - ci_regrets, mean_reg + ci_regrets, color=color, alpha=0.2)
 
     
     # Snap y-limits to full decades (powers of ten) so ticks are exactly 10^k
-    log10_min = np.floor(np.log10(global_min_lin))
-    log10_max = np.ceil(np.log10(global_max_lin))
+    log10_min = np.floor(np.log10(global_min))
+    log10_max = np.ceil(np.log10(global_max))
     log10_max = max(log10_max, 10)
     ymin = 10.0 ** log10_min
     ymax = 10.0 ** log10_max
 
     ax2.set_xlabel('Iteration')
-    ax2.set_yscale('log')
-    ax2.set_ylim(ymin, ymax)
-    ax2.yaxis.set_major_locator(LogLocator(base=10.0))
-    ax2.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
+    #ax2.set_yscale('log')
+    #ax2.set_ylim(ymin, ymax)
+    #ax2.yaxis.set_major_locator(LogLocator(base=10.0))
+    #ax2.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
     ax2.set_ylabel('Regret (log scale)')
     ax2.set_title(f'Mean Log-Regret across {n_reps} runs | {f_obj.d}-{f_obj.name}')
     ax2.set_yscale("log")
-    #ax2.autoscale(enable=True, axis='y', tight=True) 
+    ax2.autoscale(enable=True, axis='y', tight=None) 
     ax2.grid(True)
     ax2.legend(loc='upper right', fontsize='small')
 
@@ -1040,7 +1041,7 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
     """
     # 1) Get true Sobol second-order matrix using provided helper
     sobols = sobol_sensitivity(f_obj, n_samples=100000)  # shape (d, d) expected
-    sobols = np.asarray(sobols, dtype=float)
+    sobols = np.nan_to_num(np.asarray(sobols, dtype=float))
 
     # make sure sobols is symmetric and zero-diagonal
     # if SALib returned upper triangular, symmetrize
@@ -1070,11 +1071,12 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
     non_additive = sobols_sym > threshold  
     additive = ~non_additive.copy()
     np.fill_diagonal(non_additive, False)
+    np.fill_diagonal(additive, False)
 
     # Count unique undirected true edges (i<j)
     triu_idx = np.triu_indices(d, k=1)
     true_non_additive_count = int(np.sum(non_additive[triu_idx])) - f_obj.d
-    true_additive_count = int(((d * (d - 1)) // 2) - true_non_additive_count - f_obj.d)
+    true_additive_count = int(((d * (d - 1)) // 2) - true_non_additive_count)
 
     # Helper: build group_of array from partition P
     def partition_to_group_of(P):
@@ -1092,13 +1094,13 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
     def build_nonadditivity_graph(P):
         """
         P: list of lists (groups). Returns symmetric boolean adjacency matrix (d,d):
-           adj[i,j] = True iff i and j are in the same group (predicted non-additive / interaction).
+           adj[i,j] = True iff i and j are not in the same group (predicted non-additive / interaction).
         """
         adj = np.zeros((d, d), dtype=bool)
         group_of = partition_to_group_of(P)
         for i in range(d):
             for j in range(i + 1, d):
-                adj[i, j] = (group_of[i] == group_of[j])
+                adj[i, j] = (group_of[i] != group_of[j])
                 # adj[j,i] will be mirrored below
         adj = adj | adj.T
         np.fill_diagonal(adj, False)
@@ -1133,19 +1135,20 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
         if true_non_additive_count > 0:
             CC = non_additive_overlap_count / true_non_additive_count
         else:
-            CC = np.nan
+            CC = 0.0
 
         # Count true additive (non-edge) that are predicted non-edge
         # predicted non-edge matrix:
         nonedge_pred = ~G_exp
         # true additive & predicted non-edge
         additive_overlap = np.logical_and(additive, nonedge_pred)
+        np.fill_diagonal(additive_overlap, False)
         additive_overlap_count = int(np.sum(additive_overlap[triu_idx]))
 
         if true_additive_count > 0:
             CS = additive_overlap_count / true_additive_count
         else:
-            CS = np.nan
+            CS = 0.0
 
         cc_list.append(CC)
         cs_list.append(CS)
@@ -1157,9 +1160,9 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
     x = np.array(update_iters)
 
     # n_init_padding
-    cc_list = [0.0] * n_init + cc_list[n_init:]
-    cs_list = [0.0] * n_init + cs_list[n_init:]
-    partition_changed_flags = [False] * n_init + partition_changed_flags[n_init:]
+    cc_list = [0.0] * n_init + cc_list
+    cs_list = [0.0] * n_init + cs_list
+    partition_changed_flags = [False] * n_init + partition_changed_flags
 
     # Plot CC (match of true edges)
     plt.plot(x, cc_list, label='CC (true-edge overlap)', linestyle='-', color='C0')
@@ -1174,38 +1177,77 @@ def partition_reconstruction(f_obj,  model_cls, n_init=8, n_iter=200, n_sobol=10
     if change_x.size > 0:
         plt.plot(change_x, change_cs, linestyle='None', marker='s', color='C1')
 
-
     plt.xlabel('Iteration')
     plt.ylabel('Reconstruction score')
     plt.ylim(0.0, 1.1)
-    plt.title(f'Partition reconstruction for {f_obj}d-{f_obj.name}_kappa{kappa} | (Additivity threshold=0.05)')
+    plt.title(f'Partition reconstruction for {f_obj.d}d-{f_obj.name}_kappa{kappa} | (Additivity threshold=0.05)')
     plt.grid(True)
     plt.legend()
-
     
-    output_dir = os.path.join('output', 'synthetic_experiments', 'partition_recon')
+    output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'partition_recon_{f_obj}d={f_obj.name}_kappa{kappa}.png'
+    fname = f'partition_recon_{model_cls.__name__}_{f_obj.d}d={f_obj.name}_kappa{kappa}.png'
     outpath = os.path.join(output_dir, fname)
     plt.savefig(outpath, dpi=200)
     if verbose:
         print(f"Saved partition reconstruction plot to {outpath}")
 
-    '''
+   
+
+    ### Figure 2: Sobol interaction traces
     pairs = [(i, j) for i in range(d) for j in range(i+1, d)]
     n_pairs = len(pairs)
 
     nrows = int(n_pairs)
 
-    fig2, axes = plt.subplots(nrows, 1, figsize=(4, 2.5*nrows), squeeze=False)
+    # Prepare sobol_est_list as list of (d,d) numpy arrays (one per iteration up to n_iter).
+    sobol_est_list = []
+    # Build list up to n_iter entries (pad with NaN matrices if missing)
+    for t in range(n_iter):
+        if t < len(sobol_interactions_all):
+            candidate = sobol_interactions_all[t]
+            if candidate.ndim == 0:
+                candidate = np.ones((d, d), dtype=float)
+            sobol_est_list.append(candidate)
+
+    fig2, axes = plt.subplots(nrows, 1, figsize=(8, 1.8*nrows), squeeze=False)
+    axes_flat = axes.flatten()
     color = 'green' if model_cls.__name__ == 'SobolGP' else 'orange'
 
-    # Prepare sobol_interactions_all as list of (d,d) arrays if available
-    sobol_est_list = []
-    '''
+    x_full = np.arange(1, n_iter + 1)
+    for idx, (i, j) in enumerate(pairs):
+        ax = axes_flat[idx]
+
+        # Plot true as horizontal black line
+        true_val = float(sobols_sym[i,j])
+        ax.plot(x_full, [true_val]*x_full.shape[0], color='black', linestyle='--', linewidth=1.2)
+
+        # Estimated sobol interaction curve
+        est_vals = [1.0]*n_init
+        for t in range(n_iter-n_init):
+            est_mat = sobol_est_list[t]
+            est_vals.append(float(est_mat[j][i]))
+        est_vals = np.asarray(est_vals, dtype=float)
+        ax.plot(x_full, est_vals, color=color, linestyle='-')
+
+        ax.set_ylim(-0.1, 1.1)
+        ax.set_xlim(1, n_iter)
+        ax.set_title(f'x{i}-x{j} interaction')
+        ax.grid(True, linestyle='--', linewidth=0.4)
+
+    # wrap long suptitle into multiple lines so it doesn't overflow
+    raw_title = f'Sobol reconstruction for {f_obj.d}d-{f_obj.name} (kappa={kappa}) | Additivity threshold={threshold}'
+    wrapped_title = textwrap.fill(raw_title, width=95)
+
+    fig2.suptitle(wrapped_title, fontsize=14)
+    plt.tight_layout(rect=[0, 0.02, 1, 0.96])
+
+    sobol_fname = f'sobol_recon_{model_cls.__name__}_{f_obj.d}d={f_obj.name}_kappa{kappa}.svg'
+    outpath = os.path.join(output_dir, sobol_fname)
+    fig2.savefig(outpath)
+    plt.close(fig2)
 
     
-
 
 ### Parser handling
 
