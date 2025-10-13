@@ -70,7 +70,7 @@ class SyntheticTestFun:
                 # kwargs: rotation_seed
                 self.f = RosenbrockRotated(dim=d, noise_std=noise, negate=negate, **kwargs)
                 
-            case 'ackley_correlated':
+            case 'ackley-correlated':
                 # kwargs: correlation_strength (default 0.15)
                 self.f = AckleyCorrelated(dim=d, noise_std=noise, negate=negate, **kwargs)
                 
@@ -910,7 +910,7 @@ class AckleyCorrelated(BaseTestProblem):
     """
     
     def __init__(self, dim: int = 5, noise_std: float = 0.0, negate: bool = False, 
-                 correlation_strength: float = 0.15):
+                 correlation_strength: float = 0.25):
         self.dim = dim
         self._bounds = [(-32.768, 32.768) for _ in range(dim)]
         self.noise_std = noise_std
