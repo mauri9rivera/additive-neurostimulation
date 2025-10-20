@@ -12,5 +12,6 @@ __pycache__/
 # bash scripts
 *.sh
 
-#output files
+#data and output files
 output/
+datasets/
