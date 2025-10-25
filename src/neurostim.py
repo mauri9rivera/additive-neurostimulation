@@ -35,7 +35,7 @@ from utils.synthetic_datasets import *
 warnings.filterwarnings("ignore", category=FutureWarning, module="SALib.util")
 
 # CUDA device?
-DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu") #?#
+DEVICE = torch.device('cpu') # torch.device("cuda:1" if torch.cuda.is_available() else "cpu") #?#
 
 
 ### --- neural GP classes --- ###
@@ -82,11 +82,13 @@ class Sobol:
             bounds = [[0, 9], [0, 9]]
         else:
             d = 2
-        self.problem = {
+        problem = {
             'num_vars': int(d),
             'names': np.array([f"x{i}" for i in range(d)]),
-            'bounds': np.asarray(bounds, type=np.float32)
+            'bounds': np.asarray(bounds)
         }
+
+        return problem
 
     def update_interactions(self, train_x, train_y, simulator, likelihood):
         """
@@ -144,6 +146,15 @@ class Sobol:
                     y_s_list.append(post.mean.cpu().numpy())
 
             y_s = np.concatenate(y_s_list, axis=0)
+
+            if np.var(y_s) < 1e-12 or np.unique(y_s).size <= 1:
+                # Option A: return zero interactions (no interactions found)
+                d = self.problem['num_vars']
+                S2_sym = np.zeros((d, d), dtype=float)
+                np.fill_diagonal(S2_sym, 0.0)
+                self.interactions = S2_sym
+                return S2_sym
+
 
             # Analyze with SALib
             Si = salib_sobol.analyze(
@@ -272,8 +283,8 @@ class neuralMHGP(gpytorch.models.ExactGP):
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.sobol = sobol
         self.name = 'neuralMHGP'
-        self.epsilon = epsilon
-        self.split_bias = 0.7
+        self.epsilon = 0.03 - 0.02*(np.min(1.0, (self.n_dims**2)/40))
+        self.split_bias = 0.5
 
         #build covar_module based on partition
         self.lengthscale_prior = lengthscale_prior
@@ -338,10 +349,10 @@ class neuralMHGP(gpytorch.models.ExactGP):
                     robbed_subset.remove(victim)
                     new_partition.append([victim.astype(int)]) 
                 
-                if self.are_additive(victim, robbed_subset, interactions):
+                    if self.are_additive(victim, robbed_subset, interactions):
 
-                    has_candidate = True
-                    return new_partition
+                        has_candidate = True
+                        return new_partition
 
             # Merge strategy
             else:
@@ -406,14 +417,14 @@ class neuralMHGP(gpytorch.models.ExactGP):
     def reconfigure_space(self, surrogate, surrogate_likelihood, device=DEVICE):
 
         # update sobol interactions from surrogate model training
-        self.sobol.update_interactions(surrogate.train_inputs, surrogate.train_targets, surrogate, surrogate_likelihood)
+        self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
         interactions = self.sobol.interactions
         new_partition = self.sobol_partitioning(interactions)
-        proposed_model = neuralMHGP(self.train_x, self.train_y, gpytorch.likelihoods.GaussianLikelihood(), 
+        proposed_model = neuralMHGP(self.train_inputs[0], self.train_targets, gpytorch.likelihoods.GaussianLikelihood(), 
                               partition=new_partition)
         proposed_model.to(device)
         proposed_model.likelihood.to(device)
-        proposed_model, proposed_model.likelihood, _ = optimize(proposed_model, proposed_model.train_x, proposed_model.train_y, n_iter=20, lr=0.01)
+        proposed_model, proposed_model.likelihood, _ = optimize(proposed_model, proposed_model.train_inputs[0], proposed_model.train_targets, n_iter=20, lr=0.01)
         
         acceptance_ratio = self.calculate_acceptance(proposed_model)
 
@@ -444,7 +455,7 @@ class neuralSobolGP(gpytorch.models.ExactGP):
         self.mean_module = gpytorch.means.ZeroMean()
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.sobol = sobol
-        self.epsilon = epsilon
+        self.epsilon = 0.03 - 0.02*(np.min(1.0, (self.n_dims**2)/40))
         self.name = 'neuralSobolGP'
         # build covar_module based on partition
         self.lengthscale_prior = lengthscale_prior
@@ -460,14 +471,14 @@ class neuralSobolGP(gpytorch.models.ExactGP):
 
             base_kernel = gpytorch.kernels.MaternKernel(
                 nu = 2.5,
-                batch_shape=torch.Size([self.n_dims]),
+                #?# batch_shape=torch.Size([self.n_dims]),
                 ard_num_dims = ard_dims,
                 active_dims = group,
                 lengthscale_prior = self.lengthscale_prior
             )
-            base_kernel.lengthscale = [1.0] * self.n_dims
+            base_kernel.lengthscale = torch.ones(ard_dims)
             scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel, outputscale_prior=self.outputscale_prior)
-            scaled_kernel.outputscale = [1.0]
+            scaled_kernel.outputscale = torch.tensor(1.0)
 
             kernels.append(scaled_kernel)
 
@@ -486,7 +497,7 @@ class neuralSobolGP(gpytorch.models.ExactGP):
     def reconfigure_space(self, surrogate, surrogate_likelihood):
     
         # update Sobol interactions based on new surrogate train data
-        self.sobol.update_interactions(surrogate.train_inputs, surrogate.train_targets, surrogate, surrogate_likelihood)
+        self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
         new_partition = self.sobol.update_partition()
         self.update_partition(new_partition)
 
@@ -587,7 +598,7 @@ def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
         output = gp(train_x)
         loss = -mll(output, train_y)
 
-        if loss.dim !=0:
+        if loss.dim() !=0:
             loss = loss.sum()
 
         loss.backward()
@@ -607,8 +618,10 @@ def set_experiment(dataset_type):
         options['rho_low']=0.1
         options['nrnd']=1 #has to be >= 1
         options['noise_max']=0.011
-        options['n_subject']=4
+        options['n_subjects']=4
         options['n_Chan']=96
+        options['n_emgs'] = 8
+        options['n_dims'] = 2
     elif dataset_type == 'rat':
         options['noise_min']=0.05
         options['kappa']=3.8
@@ -616,8 +629,10 @@ def set_experiment(dataset_type):
         options['rho_low']=0.001
         options['nrnd']=1 #has to be >= 1
         options['noise_max']=0.055
-        options['n_subject']=6
+        options['n_subjects']=6
         options['n_Chan']=32
+        options['n_emgs'] = 8
+        options['n_dims'] = 2
     elif dataset_type == '5d_rat':
         options['noise_min']=0.05
         options['kappa']=3.8
@@ -625,10 +640,14 @@ def set_experiment(dataset_type):
         options['rho_low']=0.001
         options['nrnd']=1 #has to be >= 1
         options['noise_max']=0.055
-        options['n_subject']=6
+        options['n_subjects']=6
         options['n_Chan']= 100
+        options['n_emgs'] = 1
+        options['n_dims'] = 5
     
     options['device'] = DEVICE
+    options['n_reps'] = 20
+    options['n_rnd'] = 1
 
     return options
 
@@ -637,6 +656,16 @@ def load_matlab_data(dataset_type, m_i):
     path_to_dataset = f'./datasets/{dataset_type}'
 
     if dataset_type == '5d_rat':
+
+        emg_map = {
+            0: np.array(['extensor carpi radialis']),
+            1: np.array(['flexor carpi ulnaris']),
+            2: np.array(['triceps']),
+            3: np.array(['biceps']),
+            4: np.array(['extensor carpi radialis']),
+            5: np.array(['flexor carpi ulnaris']),
+
+        }
         match m_i:
             case 0 | 1 | 2 | 3:
 
@@ -648,14 +677,14 @@ def load_matlab_data(dataset_type, m_i):
                 ch2xy = torch.from_numpy(ch2xy).float().to(DEVICE)
                 
                 subjet = {
-                    'emgs': 1,
+                    'emgs': emg_map[m_i],
                     'nChan': 32,
                     'sorted_respMean': peak_resp,
                     'ch2xy': ch2xy,
                     'dim_sizes': np.array([8, 4, 3, 4, 4]),
                     'DimSearchSpace' : np.prod([8, 4, 3, 4, 4])
                 }
-            case _:
+            case 4 | 5:
                 
                 data = scipy.io.loadmat(f'{path_to_dataset}\\5d_step4.mat')
                 resp = data['emg_response']
@@ -665,7 +694,7 @@ def load_matlab_data(dataset_type, m_i):
 
 
                 subjet = {
-                    'emgs': 1,
+                    'emgs': emg_map[m_i],
                     'nChan': 32,
                     'sorted_respMean': peak_resp,
                     'ch2xy': ch2xy,
@@ -684,7 +713,7 @@ def load_matlab_data(dataset_type, m_i):
            'sorted_respMean': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][10],
            'ch2xy': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][16],
            'DimSearchSpace': 96},
-            return Cebus1_M1_190221
+            SET=Cebus1_M1_190221[0]
         if m_i==1:
             Cebus2_M1_200123 = scipy.io.loadmat(path_to_dataset+'/Cebus2_M1_200123.mat')  
             Cebus2_M1_200123= {'emgs': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][0][0],
@@ -693,8 +722,8 @@ def load_matlab_data(dataset_type, m_i):
            'sorted_resp': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][9],
            'sorted_respMean': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][10],
            'ch2xy': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][16],
-           'DimSearchSpace': 32}
-            return Cebus2_M1_200123
+           'DimSearchSpace': 96}
+            SET=Cebus2_M1_200123
         if m_i==2:    
             Macaque1_M1_181212 = scipy.io.loadmat(path_to_dataset+'/Macaque1_M1_181212.mat')
             Macaque1_M1_181212= {'emgs': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][0][0],
@@ -704,7 +733,7 @@ def load_matlab_data(dataset_type, m_i):
            'sorted_respMean': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][15],
            'ch2xy': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][14],
            'DimSearchSpace': 96}            
-            return Macaque1_M1_181212
+            SET=Macaque1_M1_181212
         if m_i==3:    
             Macaque2_M1_190527 = scipy.io.loadmat(path_to_dataset+'/Macaque2_M1_190527.mat')
             Macaque2_M1_190527= {'emgs': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][0][0],
@@ -714,7 +743,8 @@ def load_matlab_data(dataset_type, m_i):
            'sorted_respMean': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][15],
            'ch2xy': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][14],
            'DimSearchSpace': 96}
-            return Macaque2_M1_190527
+            SET=Macaque2_M1_190527
+        return SET
     elif dataset_type=='rat':  # rat dataset has 6 subjects
         if m_i==0:
             rat1_M1_190716 = scipy.io.loadmat(path_to_dataset+'/rat1_M1_190716.mat')
@@ -763,7 +793,9 @@ def load_matlab_data(dataset_type, m_i):
            'sorted_isvalid': rat5_M1_191112['rat5_M1_191112'][0][0][8],
            'sorted_resp': rat5_M1_191112['rat5_M1_191112'][0][0][9],              
            'sorted_respMean': rat5_M1_191112['rat5_M1_191112'][0][0][15],
-           'ch2xy': rat5_M1_191112['rat5_M1_191112'][0][0][14]}           
+           'ch2xy': rat5_M1_191112['rat5_M1_191112'][0][0][14],
+           'DimSearchSpace': 32}
+                       
             return rat5_M1_191112                      
         if m_i==5:
             rat6_M1_200218 = scipy.io.loadmat(path_to_dataset+'/rat6_M1_200218.mat')        
@@ -877,7 +909,7 @@ def load_matlab_data(dataset_type, m_i):
 
 ### --- BO method --- ###   
 
-def neurostim_bo(dataset, model_cls, kappas, n_init=1, n_iter=200, save=True, verbose=False):
+def neurostim_bo(dataset, model_cls, kappas):
 
     np.random.seed(0)
 
@@ -887,29 +919,36 @@ def neurostim_bo(dataset, model_cls, kappas, n_init=1, n_iter=200, save=True, ve
     nRep = options['n_reps']
     nrnd = options['n_rnd']
     nSubjects = options['n_subjects']
+    nEmgs = options['n_emgs']
+    MaxQueries = options['n_Chan']
+    ndims = options['n_dims']
 
     #Metrics initialization
-    PP = torch.zeros((nSubjects,subject['emgs'],len(kappas),nRep, MaxQueries), device=DEVICE)
-    PP_t = torch.zeros((nSubjects,subject['emgs'], len(kappas),nRep, MaxQueries), device=DEVICE)
-    Q = torch.zeros((nSubjects,subject['emgs'],len(kappas),nRep, MaxQueries), device=DEVICE)
-    Train_time = torch.zeros((nSubjects,subject['emgs'], len(kappas),nRep, MaxQueries), device=DEVICE)
-    Cum_train =  torch.zeros((nSubjects,subject['emgs'], len(kappas),nRep, MaxQueries), device=DEVICE)
-    PARTITIONS = np.empty((nSubjects,subject['emgs'],len(kappas),nRep, MaxQueries), dtype=object)
-    RSQ = torch.zeros((nSubjects,subject['emgs'], len(kappas), nRep), device=DEVICE)
-    REGRETS = torch.zeros((nSubjects,subject['emgs'], len(kappas), nRep, MaxQueries), device=DEVICE)
-    SOBOLS = np.empty((nSubjects,subject['emgs'],len(kappas),nRep, MaxQueries), dtype=object)
+    PP = torch.zeros((nSubjects,nEmgs,len(kappas),nRep, MaxQueries), device=DEVICE)
+    PP_t = torch.zeros((nSubjects,nEmgs, len(kappas),nRep, MaxQueries), device=DEVICE)
+    Q = torch.zeros((nSubjects,nEmgs,len(kappas),nRep, MaxQueries), device=DEVICE)
+    Train_time = torch.zeros((nSubjects,nEmgs, len(kappas),nRep, MaxQueries), device=DEVICE)
+    Cum_train =  torch.zeros((nSubjects,nEmgs, len(kappas),nRep, MaxQueries), device=DEVICE)
+    PARTITIONS = np.empty((nSubjects,nEmgs,len(kappas),nRep, MaxQueries), dtype=object)
+    RSQ = torch.zeros((nSubjects,nEmgs, len(kappas), nRep), device=DEVICE)
+    REGRETS = torch.zeros((nSubjects,nEmgs, len(kappas), nRep, MaxQueries), device=DEVICE)
+    SOBOLS = np.empty((nSubjects,nEmgs,len(kappas),nRep, MaxQueries), dtype=object)
 
     for s_idx in range(nSubjects):
 
+        print(f'subject {s_idx + 1} \ {nSubjects}')
         subject = load_matlab_data(dataset, s_idx) 
-        subject['ch2xy'] = torch.tensor(subject['ch2xy'], device=device)
+        subject['ch2xy'] = subject['ch2xy'].to(device).clone().detach() if isinstance(subject['ch2xy'], torch.Tensor) else torch.tensor(subject['ch2xy'], device=device)
 
         for k_idx, kappa in enumerate(kappas):
 
             for e_i in range(len(subject['emgs'])):
 
                 # "Ground truth" map
-                MPm= torch.tensor(subject['sorted_respMean'][:,e_i]).float()  
+                if dataset == '5d_rat':
+                    MPm= torch.mean(subject['sorted_respMean'].clone().detach().to(DEVICE)[:, s_idx % 4], axis=0)
+                else:
+                    MPm= torch.tensor(subject['sorted_respMean'][:,e_i]).float()  
                 # Best known channel
                 mMPm= torch.max(MPm)
 
@@ -926,11 +965,11 @@ def neurostim_bo(dataset, model_cls, kappas, n_init=1, n_iter=200, save=True, ve
                 # Metrics initialization
                 # Then run the sequential optimization
                 DimSearchSpace = subject['DimSearchSpace'] 
-                MaxQueries = DimSearchSpace
-                perf_explore= torch.zeros((nRep, DimSearchSpace), device=device)
-                perf_exploit= torch.zeros((nRep, DimSearchSpace), device=device)
+                #MaxQueries = DimSearchSpace
+                perf_explore= torch.zeros((nRep, MaxQueries), device=device)
+                perf_exploit= torch.zeros((nRep, MaxQueries), device=device)
                 perf_rsq= torch.zeros((nRep), device=device)
-                P_test =  torch.zeros((nRep, DimSearchSpace, 2), device=device) #storing all queries
+                P_test =  torch.zeros((nRep, MaxQueries, 2), device=device) #storing all queries
                 train_time = torch.zeros((nRep, MaxQueries), device=DEVICE)
                 cum_time = torch.zeros((nRep, MaxQueries), device=DEVICE)
                 partitions = np.empty((nRep, MaxQueries), dtype=object)
@@ -966,9 +1005,13 @@ def neurostim_bo(dataset, model_cls, kappas, n_init=1, n_iter=200, save=True, ve
                         query_elec = P_test[rep_i][q][0]
 
                         # Read response
-                        valid_resp= torch.tensor(subject['sorted_resp'][int(query_elec)][e_i][subject['sorted_isvalid'][int(query_elec)][e_i]!=0])
+                        if dataset == '5d_rat':
+                            valid_resp = subject['sorted_respMean'][:, s_idx % 4, int(query_elec.item())]    
+                        else:
+                            valid_resp= torch.tensor(subject['sorted_resp'][int(query_elec)][e_i][subject['sorted_isvalid'][int(query_elec)][e_i]!=0])
                         r_i= np.random.randint(len(valid_resp))
                         test_respo= valid_resp[r_i]
+                        test_respo += torch.normal(0.0, 0.02*torch.mean(test_respo))
                         # done reading response
                         P_test[rep_i][q][1]= test_respo
 
@@ -976,7 +1019,7 @@ def neurostim_bo(dataset, model_cls, kappas, n_init=1, n_iter=200, save=True, ve
                             MaxSeenResp=test_respo
 
                         x= subject['ch2xy'][P_test[rep_i][:q+1,0].long(),:].float() # search space position
-                        x = x.reshape((len(x),2))
+                        x = x.reshape((len(x), ndims))
                         y= P_test[rep_i][:q+1,1]/MaxSeenResp # test result
 
 
@@ -986,13 +1029,16 @@ def neurostim_bo(dataset, model_cls, kappas, n_init=1, n_iter=200, save=True, ve
                             if model.name in ['neuralSobolGP', 'neuralMHGP']:
                                 sobol = Sobol(dataset)
                                 model.sobol = sobol #Initialize sobol
+                                surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_prior= prior_lik)
+                                surrogate = ExactGP(x, y, surrogate_likelihood, priorbox, outputscale_priorbox)
+                                interactions = model.sobol.update_interactions(x, y, surrogate, surrogate_likelihood)
                         else:
                             model.set_train_data(x, y, strict=False)
 
                         # Model training
                         model.train()
                         likf.train()
-                        model, likf = optimize(model, x, y)
+                        model, likf, _ = optimize(model, x, y)
 
 
                         # Model evaluation
@@ -1050,8 +1096,6 @@ def neurostim_bo(dataset, model_cls, kappas, n_init=1, n_iter=200, save=True, ve
                                         space_reconfiguration = None
                                         print(f"[Sobol] submit failed: {e}")
                             
-                        
-                        
 
                         # computation time calculations
                         t1 = time.time()
@@ -1075,25 +1119,25 @@ def neurostim_bo(dataset, model_cls, kappas, n_init=1, n_iter=200, save=True, ve
                     ss_tot = torch.sum((y_true - torch.mean(y_true)) ** 2)
                     r_squared = 1 - (ss_res / ss_tot)
                     perf_rsq[rep_i] = r_squared 
-
-                    # partition and sobol metrics
-
   
 
                 # store all performance metrics
                 PP[s_idx,e_i,k_idx]=perf_explore
                 Q[s_idx,e_i,k_idx] = P_test[:,:,0]
                 PP_t[s_idx,e_i,k_idx]= MPm[perf_exploit.long().cpu()]/mMPm
-                Train_time[s_idx,e_i,k_idx] = np.mean(train_time, axis=0)
-                Cum_train[s_idx, e_i, k_idx] = np.mean(cum_time, axis=0)
+                Train_time[s_idx,e_i,k_idx] = train_time.mean(dim=0).detach().cpu()
+                Cum_train[s_idx, e_i, k_idx] = cum_time.mean(dim=0).detach().cpu()
                 PARTITIONS[s_idx,e_i,k_idx] = partitions
                 RSQ[s_idx,e_i,k_idx]=perf_rsq
                 REGRETS[s_idx,e_i,k_idx, :] = torch.log(torch.tensor(regret, dtype=torch.float32, device=DEVICE) + 1e-8) 
-                SOBOLS[s_idx, e_i, k_idx] = sobol_interactions #?# some mean operation
+                SOBOLS[s_idx, e_i, k_idx] = sobol_interactions # mean_mats.mean(axis=0) #?# some mean operation
 
     # Saving variables
+    output_dir = os.path.join('output', 'neurostim_experiments', dataset)
+    os.makedirs(output_dir, exist_ok=True)
     fname = f'{dataset}_{model.name}_budget{MaxQueries}_{nRep}reps.npz'
-    np.savez_compressed(fname,
+    results_path = os.path.join(output_dir,fname)
+    np.savez_compressed(results_path,
             RSQ=RSQ.cpu(), PP=PP.cpu(), PP_t=PP_t.cpu(), 
             kappas=np.array(kappas),
             PARTITIONS = PARTITIONS,
@@ -1102,6 +1146,8 @@ def neurostim_bo(dataset, model_cls, kappas, n_init=1, n_iter=200, save=True, ve
             Train_time = Train_time.cpu(),
             Cum_train = Cum_train.cpu()
             )
+    print(f'saved results to {results_path}')
+
     
 ### --- Parser handling
 
@@ -1131,13 +1177,9 @@ def main(argv=None):
     parser.add_argument('--model_cls', type=str, default='ExactGPModel', help='Model class name (ExactGP, AdditiveGP, SobolGP, MHGP)')
    
     # Method-specific params
-    parser.add_argument('--n_init', type=int, default=1)
-    parser.add_argument('--n_iter', type=int, default=200)
     parser.add_argument('--kappas', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for kappa_search')
 
     # Misc
-    parser.add_argument('--save', action='store_true')
-    parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--list_models', action='store_true')
     parser.add_argument('--list_methods', action='store_true')
 
@@ -1164,7 +1206,7 @@ def main(argv=None):
 
     # dispatch
     try:
-        result = neurostim_bo(args.dataset, model_cls, n_init=args.n_init, n_iter=args.n_iter, kappas=args.kappas, save=args.save, verboses=args.verbose)
+        result = neurostim_bo(args.dataset, model_cls, kappas=args.kappas)
         
         print('Completed')
 
@@ -1176,4 +1218,7 @@ def main(argv=None):
 
 if __name__ == '__main__':
     
+    #neurostim_bo('rat', neuralSobolGP, kappas=[3.0, 5.0, 7.0, 9.0])
+    #neurostim_bo('nhp', neuralSobolGP, kappas=[3.0, 5.0, 7.0, 9.0])
+    #neurostim_bo('5d_rat', neuralSobolGP, kappas=[3.0, 5.0, 7.0, 9.0])
     main()
