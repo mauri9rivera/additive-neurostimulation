@@ -61,7 +61,6 @@ class Sobol:
         n_sobol_samples: number of base samples N used by SALib's Saltelli sampler.
             If None, some default (e.g. 1024) will be chosen.
         """
-        self.epsilon = float(epsilon)
         self.n_sobol_samples = n_sobol_samples
         self.problem = self._build_problem(dataset_type)  # to be set up when know input bounds and d
         self.interactions = None
@@ -87,6 +86,8 @@ class Sobol:
             'names': np.array([f"x{i}" for i in range(d)]),
             'bounds': np.asarray(bounds)
         }
+
+        self.epsilon = 0.03 - 0.02 * min(1.0, (d**2) / 40.0)
 
         return problem
 
@@ -283,7 +284,7 @@ class neuralMHGP(gpytorch.models.ExactGP):
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.sobol = sobol
         self.name = 'neuralMHGP'
-        self.epsilon = 0.03 - 0.02*(np.min(1.0, (self.n_dims**2)/40))
+        self.epsilon = 0.03 - 0.02 * min(1.0, (self.n_dims**2) / 40.0)
         self.split_bias = 0.5
 
         #build covar_module based on partition
@@ -455,7 +456,7 @@ class neuralSobolGP(gpytorch.models.ExactGP):
         self.mean_module = gpytorch.means.ZeroMean()
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.sobol = sobol
-        self.epsilon = 0.03 - 0.02*(np.min(1.0, (self.n_dims**2)/40))
+        self.epsilon = 0.03 - 0.02 * min(1.0, (self.n_dims**2) / 40.0)
         self.name = 'neuralSobolGP'
         # build covar_module based on partition
         self.lengthscale_prior = lengthscale_prior

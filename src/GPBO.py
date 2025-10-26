@@ -48,7 +48,7 @@ class MHGP(gpytorch.models.ExactGP):
         self.sobol = sobol
         self.name = 'MetropolisHastingsGP'
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.03 - 0.02*(np.min(1.0, (self.n_dims**2)/40))
+        self.epsilon = 0.03 - 0.02 * min(1.0, (self.n_dims**2) / 40.0)
         self.split_bias = 0.5
 
         #build covar_module based on partition
@@ -214,7 +214,7 @@ class SobolGP(gpytorch.models.ExactGP):
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.sobol = sobol
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.03 - 0.02*(np.min(1.0, (self.n_dims**2)/40))
+        self.epsilon = 0.03 - 0.02 * min(1.0, (self.n_dims**2) / 40.0)
         self.name = 'SobolGP'
         # build covar_module based on partition
         self._build_covar()
@@ -283,7 +283,8 @@ class Sobol:
         n_sobol_samples: number of base samples N used by SALib's Saltelli sampler.
             If None, some default (e.g. 1024) will be chosen.
         """
-        self.epsilon = float(epsilon)
+        d = f_obj.d
+        self.epsilon = 0.03 - 0.02 * min(1.0, (d**2) / 40.0)
         self.n_sobol_samples = n_sobol_samples
         self.problem = self._build_problem(f_obj)  # to be set up when know input bounds and d
         self.interactions = None
@@ -1447,10 +1448,8 @@ def main(argv=None):
 
 if __name__ == '__main__':
     
-    #main()
-    f = SyntheticTestFun('dblobs', 7, noise=False, negate=False)
-    print(sobol_sensitivity(f, n_samples=100000))
-    #run_partitionbo(f, MHGP)
+    main()
+
    
       
     
