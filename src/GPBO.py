@@ -214,7 +214,7 @@ class SobolGP(gpytorch.models.ExactGP):
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.sobol = sobol
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.03 - 0.02 * min(1.0, (self.n_dims**2) / 40.0)
+        self.epsilon = 0.04 - 0.01 * min(1.0, (self.n_dims**2) / 40.0)
         self.name = 'SobolGP'
         # build covar_module based on partition
         self._build_covar()
@@ -284,7 +284,7 @@ class Sobol:
             If None, some default (e.g. 1024) will be chosen.
         """
         d = f_obj.d
-        self.epsilon = 0.03 - 0.02 * min(1.0, (d**2) / 40.0)
+        self.epsilon = 0.04 - 0.01 * min(1.0, (self.n_dims**2) / 40.0)
         self.n_sobol_samples = n_sobol_samples
         self.problem = self._build_problem(f_obj)  # to be set up when know input bounds and d
         self.interactions = None
@@ -938,7 +938,7 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
         (ExactGPModel, 'red',  'ExactGPModel',    kappas[0]),
         (AdditiveKernelGP, 'blue', 'AdditiveGP',   kappas[1]),
         (SobolGP, 'green', 'SobolGP',             kappas[2]),
-        (MHGP, 'orange', 'MHGP',                  kappas[3])
+        #(MHGP, 'orange', 'MHGP',                  kappas[3])
     ]
 
     # Containers for metrics

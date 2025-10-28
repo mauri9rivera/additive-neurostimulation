@@ -266,7 +266,7 @@ class ExactGP(gpytorch.models.ExactGP):
         kernel.base_kernel.lengthscale = [1.0] * self.n_dims
         kernel.outputscale = [1.0]
         self.covar_module = kernel
-        self.name = 'neuralMHGP'
+        self.name = 'ExactGP'
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -670,7 +670,7 @@ def load_matlab_data(dataset_type, m_i):
         match m_i:
             case 0 | 1 | 2 | 3:
 
-                data = scipy.io.loadmat(f'{path_to_dataset}\\rData03_230724_4x4x3x32x8_ar.mat')['Data']
+                data = scipy.io.loadmat(f'{path_to_dataset}/rData03_230724_4x4x3x32x8_ar.mat')['Data']
                 resp =  data[0][0][0]
                 param = data[0][0][1]
                 ch2xy = param[:, [0,1,2,5,6]]
@@ -687,7 +687,7 @@ def load_matlab_data(dataset_type, m_i):
                 }
             case 4 | 5:
                 
-                data = scipy.io.loadmat(f'{path_to_dataset}\\5d_step4.mat')
+                data = scipy.io.loadmat(f'{path_to_dataset}/5D_step4.mat')
                 resp = data['emg_response']
                 param = data['stim_combinations']
                 ch2xy = torch.from_numpy(param[:, [0,1,2,5,6]])
@@ -1188,8 +1188,8 @@ def main(argv=None):
 
     # Allowed mappings (whitelist)
     model_map = {
-        'ExactGPModel': ExactGPModel,
-        'AdditiveKernelGP': AdditiveKernelGP,
+        'ExactGP': ExactGP,
+        'AdditiveGP': AdditiveKernelGP,
         'SobolGP': neuralSobolGP,
         'MHGP': neuralMHGP,
     }
