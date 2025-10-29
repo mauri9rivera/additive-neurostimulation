@@ -48,7 +48,7 @@ class MHGP(gpytorch.models.ExactGP):
         self.sobol = sobol
         self.name = 'MetropolisHastingsGP'
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.03 - 0.02 * min(1.0, (self.n_dims**2) / 40.0)
+        self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
         self.split_bias = 0.5
 
         #build covar_module based on partition
@@ -214,7 +214,7 @@ class SobolGP(gpytorch.models.ExactGP):
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.sobol = sobol
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.04 - 0.01 * min(1.0, (self.n_dims**2) / 40.0)
+        self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
         self.name = 'SobolGP'
         # build covar_module based on partition
         self._build_covar()
@@ -284,7 +284,7 @@ class Sobol:
             If None, some default (e.g. 1024) will be chosen.
         """
         d = f_obj.d
-        self.epsilon = 0.04 - 0.01 * min(1.0, (self.n_dims**2) / 40.0)
+        self.epsilon = 0.05 #- 0.02 * min(1.0, (d**2 / 40.0))
         self.n_sobol_samples = n_sobol_samples
         self.problem = self._build_problem(f_obj)  # to be set up when know input bounds and d
         self.interactions = None
@@ -890,8 +890,8 @@ def kappa_search(f_obj, kappa_list, model_cls=BaseGP, n_init=1, n_iter=100, n_re
         explore_padded = np.concatenate([np.zeros(n_init), mean_explore])
         exploit_padded = np.concatenate([np.zeros(n_init), mean_exploit])
         # plot exploration as dashed line
-        plt.plot(x, explore_padded, linestyle='-', marker=None, label=f'k={kappa} Explore', color=color)
-        plt.plot(x, exploit_padded, linestyle='--', marker=None, color=color)
+        plt.plot(x, explore_padded, linestyle='--', marker=None, label=f'k={kappa} Explore', color=color)
+        plt.plot(x, exploit_padded, linestyle='-', marker=None, color=color)
 
 
     plt.xlabel('Iteration')
@@ -997,9 +997,9 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
         T = exploit.shape[0]
         it = np.arange(1, T + 1)
         if explore.size >= T:
-            ax1.plot(it, explore[:T], linestyle='--', color=color, label=f'{label} kappa {kappa}')
+            ax1.plot(it, explore[:T], linestyle='-', color=color, label=f'{label} kappa {kappa}')
         if exploit.size >= T:
-            ax1.plot(it, exploit[:T], linestyle='-', color=color)
+            ax1.plot(it, exploit[:T], linestyle='--', color=color)
 
     ax1.set_xlabel('Iteration')
     ax1.set_ylabel('Metric')
@@ -1353,8 +1353,8 @@ def main(argv=None):
 
     # Allowed mappings (whitelist)
     model_map = {
-        'ExactGPModel': ExactGPModel,
-        'AdditiveKernelGP': AdditiveKernelGP,
+        'ExactGP': ExactGPModel,
+        'AdditiveGP': AdditiveKernelGP,
         'SobolGP': SobolGP,
         'MHGP': MHGP,
         'BaseGP': BaseGP,

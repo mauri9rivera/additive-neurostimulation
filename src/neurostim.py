@@ -29,7 +29,7 @@ import traceback
 
 ### MODULES HANDLING ###
 # If the package structure differs you may need to adjust PYTHONPATH or the imports below
-from models.gaussians import AdditiveKernelGP, BaseGP, WrappedModel, ExactGPModel
+#from models.gaussians import AdditiveKernelGP, BaseGP, WrappedModel, ExactGPModel
 from utils.synthetic_datasets import *
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="SALib.util")
@@ -87,7 +87,7 @@ class Sobol:
             'bounds': np.asarray(bounds)
         }
 
-        self.epsilon = 0.03 - 0.02 * min(1.0, (d**2) / 40.0)
+        self.epsilon = 0.05 #- 0.02 * min(1.0, (d**2 / 40.0))
 
         return problem
 
@@ -225,7 +225,7 @@ class Sobol:
 
         return P
 
-class AdditiveKernelGP(gpytorch.models.ExactGP):
+class AdditiveGP(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, lengthscale_prior, outputscale_prior):
         super().__init__(train_x, train_y, likelihood)
         self.n_dims = train_x.shape[-1]
@@ -284,7 +284,7 @@ class neuralMHGP(gpytorch.models.ExactGP):
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.sobol = sobol
         self.name = 'neuralMHGP'
-        self.epsilon = 0.03 - 0.02 * min(1.0, (self.n_dims**2) / 40.0)
+        self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
         self.split_bias = 0.5
 
         #build covar_module based on partition
@@ -456,7 +456,7 @@ class neuralSobolGP(gpytorch.models.ExactGP):
         self.mean_module = gpytorch.means.ZeroMean()
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.sobol = sobol
-        self.epsilon = 0.03 - 0.02 * min(1.0, (self.n_dims**2) / 40.0)
+        self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
         self.name = 'neuralSobolGP'
         # build covar_module based on partition
         self.lengthscale_prior = lengthscale_prior
@@ -568,7 +568,7 @@ def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
         best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
         return best_x, ucb[best_idx].item(), best_idx
 
-def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
+def optimize(gp, train_x, train_y, n_iter=10, lr=0.1):
     """
     Train an ExactGP + Likelihood model.
 
@@ -1189,7 +1189,7 @@ def main(argv=None):
     # Allowed mappings (whitelist)
     model_map = {
         'ExactGP': ExactGP,
-        'AdditiveGP': AdditiveKernelGP,
+        'AdditiveGP': AdditiveGP,
         'SobolGP': neuralSobolGP,
         'MHGP': neuralMHGP,
     }
