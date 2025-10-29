@@ -93,25 +93,29 @@ class MHGP(gpytorch.models.ExactGP):
         has_candidate = False
         attempts = 0
 
-        while not has_candidate and attempts < 50:
+        while not has_candidate and attempts < 20:
 
             new_partition = copy.deepcopy(self.partition)
             
             # Split strategy
             if random.random() < self.split_bias:
 
-                robbed_subset = list(new_partition[random.randint(0, len(new_partition) - 1)])
+                robbed_idx = random.randint(0, len(new_partition) - 1)
+                robbed_subset = new_partition[robbed_idx]
 
                 if len(robbed_subset) > 1:
 
                     victim = np.random.choice(robbed_subset) #, random.randint(1, len(splitted_subset) - 1))
                     robbed_subset.remove(victim)
+                    new_partition[robbed_idx] = robbed_subset # to fix split duplicate singletons issue
                     new_partition.append([victim.astype(int)]) 
                 
                     if self.are_additive(victim, robbed_subset, interactions):
 
                         has_candidate = True
                         return new_partition
+                else:
+                    attempts+=1
 
             # Merge strategy
             else:
@@ -938,7 +942,7 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
         (ExactGPModel, 'red',  'ExactGPModel',    kappas[0]),
         (AdditiveKernelGP, 'blue', 'AdditiveGP',   kappas[1]),
         (SobolGP, 'green', 'SobolGP',             kappas[2]),
-        #(MHGP, 'orange', 'MHGP',                  kappas[3])
+        (MHGP, 'orange', 'MHGP',                  kappas[3])
     ]
 
     # Containers for metrics
@@ -1353,8 +1357,8 @@ def main(argv=None):
 
     # Allowed mappings (whitelist)
     model_map = {
-        'ExactGP': ExactGPModel,
-        'AdditiveGP': AdditiveKernelGP,
+        'ExactGPModel': ExactGPModel,
+        'AdditiveKernelGP': AdditiveKernelGP,
         'SobolGP': SobolGP,
         'MHGP': MHGP,
         'BaseGP': BaseGP,
