@@ -161,19 +161,19 @@ class MHGP(gpytorch.models.ExactGP):
         
     def calculate_acceptance(self, proposed_model):
 
-        self.eval()
-        self.likelihood.eval()
-        proposed_model.eval()
-        proposed_model.likelihood.eval()
+        self.train()
+        self.likelihood.train()
+        proposed_model.train()
+        proposed_model.likelihood.train()
 
         mll_curr = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
         mll_proposed = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, proposed_model)
         train_inputs = tuple(t.to(DEVICE) for t in self.train_inputs)
 
-        curr_evidence = -mll_curr(self(*train_inputs), self.train_targets)
-        proposed_evidence = -mll_proposed(proposed_model(proposed_model.train_inputs[0]), proposed_model.train_targets)
+        curr_evidence = mll_curr(self(*train_inputs), self.train_targets)
+        proposed_evidence = mll_proposed(proposed_model(proposed_model.train_inputs[0]), proposed_model.train_targets)
 
-        acceptance = min(1, (proposed_evidence / curr_evidence))
+        acceptance = min(1.0, float(torch.exp(proposed_evidence - curr_evidence)))
 
         return acceptance
     
@@ -580,6 +580,9 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
 
     # initialize model 
     likelihood = gpytorch.likelihoods.GaussianLikelihood()
+    if model_cls.__name__ == 'MHGP':
+        with torch.no_grad():
+            likelihood.noise = torch.tensor(1e-3)
     model = model_cls(train_x, train_y, likelihood)
     sobol = Sobol(f_obj)
     model.sobol = sobol
