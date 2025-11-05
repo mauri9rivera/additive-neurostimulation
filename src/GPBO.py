@@ -180,8 +180,7 @@ class MHGP(gpytorch.models.ExactGP):
     def reconfigure_space(self, surrogate, surrogate_likelihood, device=DEVICE):
 
         # update sobol interactions from surrogate model training
-        self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
-        interactions = self.sobol.interactions
+        interactions = self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
         new_partition = self.sobol_partitioning(interactions)
         proposed_model = MHGP(self.train_inputs[0], self.train_targets, gpytorch.likelihoods.GaussianLikelihood(), 
                               partition=new_partition)
@@ -255,8 +254,8 @@ class SobolGP(gpytorch.models.ExactGP):
     def reconfigure_space(self, surrogate, surrogate_likelihood):
     
         # update Sobol interactions based on new surrogate train data
-        self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
-        new_partition = self.sobol.update_partition()
+        interactions = self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
+        new_partition = self.sobol.update_partition(interactions)
         self.update_partition(new_partition)
 
         return self.sobol.interactions
@@ -291,7 +290,6 @@ class Sobol:
         self.epsilon = 0.05 #- 0.02 * min(1.0, (d**2 / 40.0))
         self.n_sobol_samples = n_sobol_samples
         self.problem = self._build_problem(f_obj)  # to be set up when know input bounds and d
-        self.interactions = None
 
     def _build_problem(self, f_obj):
         """
@@ -392,7 +390,6 @@ class Sobol:
             #S2_sym = 0.5 * (S2 + S2.T)
             np.fill_diagonal(S2, 1.0)
 
-            self.interactions = S2
             return S2
 
 
@@ -402,7 +399,7 @@ class Sobol:
             # re-raise so the Future contains the exception (better than returning None)
             raise
 
-    def update_partition(self):
+    def update_partition(self, interactions):
         """
         Partition dimensions using a greedy algorithm based on 2nd-order interactions.
 
@@ -433,7 +430,7 @@ class Sobol:
                 for x in sub:
                     if modif:
                         break
-                    if self.interactions[x, e] > self.epsilon:
+                    if interactions[x, e] > self.epsilon:
                         additive = False
                         sub.append(e)
                         modif = True
@@ -652,7 +649,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
         if space_reconfiguration is not None and space_reconfiguration.done():
 
             try:
-                interactions = space_reconfiguration.result()                
+                interactions = space_reconfiguration.result()   
                 space_reconfiguration = None
 
             except Exception as e:
@@ -669,7 +666,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
         partition_updates.append(model.partition)
 
         # Submit a new Sobol background job every n_sobol iterations (if none pending)
-        if (i % n_sobol) == 0:
+        if ((i + 1) % n_sobol) == 0:
             if space_reconfiguration is None or space_reconfiguration.done():
                 try:
                     surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood()

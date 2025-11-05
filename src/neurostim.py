@@ -242,7 +242,6 @@ class AdditiveGP(gpytorch.models.ExactGP):
         self.covar_module = kernel       
 
         self.mean_module = gpytorch.means.ZeroMean()
-        self.likelihood = likelihood
         self.name = 'AdditiveGP'
 
     def forward(self, X):
@@ -307,10 +306,10 @@ class neuralMHGP(gpytorch.models.ExactGP):
                 active_dims = group,
                 lengthscale_prior = self.lengthscale_prior
             )
-            base_kernel.lengthscale = [1.0] * self.n_dims
-            scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel, outputscale_prior=self.outputscale_prior)
-            scaled_kernel.outputscale = [1.0]
 
+            base_kernel.lengthscale = torch.ones(ard_dims)
+            scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel, outputscale_prior=self.outputscale_prior)
+            scaled_kernel.outputscale = torch.tensor(1.0)
             kernels.append(scaled_kernel)
 
         self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)
@@ -509,6 +508,29 @@ class neuralSobolGP(gpytorch.models.ExactGP):
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
+### Method to speed up additiveGP cases with different partition sizes
+
+### batched full-D + per-batch lengthscale masking
+def method_C(X, groups, D):
+    G = len(groups)
+    base = gpytorch.kernels.MaternKernel(nu=2.5, batch_shape=torch.Size([G]), ard_num_dims=D).to(DEVICE)
+    # initialize lengthscale: for dims not in group, set large value
+    ls = torch.ones(G, D, device=DEVICE) * 0.5
+    for i,g in enumerate(groups):
+        mask = torch.ones(D, device=DEVICE) * 1e6  # very large for unused dims
+        mask[g] = 1.0
+        ls[i] = mask
+    base.lengthscale = ls
+    cov = gpytorch.kernels.ScaleKernel(base).to(DEVICE)
+    cov.outputscale = torch.ones(G, device=DEVICE)
+
+    #then you'd need to modify the forward method more or less like this
+    Xbat = X.unsqueeze(0).repeat(G, 1, 1)  # (G, n, D)
+    Kbat = cov(Xbat).evaluate()  # (G, n, n)
+    Ksum = Kbat.sum(dim=0)
+    return Ksum
+
+
 ### --- Runners --- ### 
 
 def sobol_sensitivity(f_obj, n_samples=1000):
@@ -620,8 +642,8 @@ def set_experiment(dataset_type):
         options['nrnd']=1 #has to be >= 1
         options['noise_max']=0.011
         options['n_subjects']=4
-        options['n_Chan']=96
-        options['n_emgs'] = 8
+        options['n_queries']=96
+        options['n_emgs'] = [6, 8, 4, 4]
         options['n_dims'] = 2
     elif dataset_type == 'rat':
         options['noise_min']=0.05
@@ -631,8 +653,8 @@ def set_experiment(dataset_type):
         options['nrnd']=1 #has to be >= 1
         options['noise_max']=0.055
         options['n_subjects']=6
-        options['n_Chan']=32
-        options['n_emgs'] = 8
+        options['n_queries']=32
+        options['n_emgs'] = [6, 7, 8, 6, 5, 8]
         options['n_dims'] = 2
     elif dataset_type == '5d_rat':
         options['noise_min']=0.05
@@ -641,10 +663,21 @@ def set_experiment(dataset_type):
         options['rho_low']=0.001
         options['nrnd']=1 #has to be >= 1
         options['noise_max']=0.055
-        options['n_subjects']=6
-        options['n_Chan']= 100
-        options['n_emgs'] = 1
+        options['n_subjects']=3
+        options['n_queries']= 100
+        options['n_emgs'] = [5, 4, 4]
         options['n_dims'] = 5
+    elif dataset_type == 'spinal':
+        options['noise_min']=0.05
+        options['kappa']=3.8
+        options['rho_high']=8
+        options['rho_low']=0.001
+        options['nrnd']=1 #has to be >= 1
+        options['noise_max']=0.055
+        options['n_subjects']=11
+        options['n_queries']=64
+        options['n_emgs'] = [8, 10, 10, 10, 10, 10, 10, 8, 8, 8, 8]
+        options['n_dims'] = 2
     
     options['device'] = DEVICE
     options['n_reps'] = 20
@@ -652,7 +685,7 @@ def set_experiment(dataset_type):
 
     return options
 
-def load_matlab_data(dataset_type, m_i):
+def load_data(dataset_type, m_i):
 
     path_to_dataset = f'./datasets/{dataset_type}'
 
@@ -908,6 +941,291 @@ def load_matlab_data(dataset_type, m_i):
     else:
         raise ValueError('The dataset type should be 5d_rat, nhp or rat' )
 
+def load_data2(dataset_type, m_i):
+    '''
+    Input: 
+        - dataset_type: str characterizing the modality of the experiment
+        - m_i: int of subject
+
+    Output:
+        - dictionary of neurostimulation data
+    
+        Important: sorted response shape: (nChan, nEmgs, nReps)
+    '''
+    path_to_dataset = f'./datasets/{dataset_type}'
+    if dataset_type == '5d_rat':
+        
+        match m_i:
+            case 0:
+                data = scipy.io.loadmat(f'{path_to_dataset}/BCI00_5D.mat')
+                emgs = np.array(['left extensor carpi radialis', 'biceps', 'triceps',
+                                 'left flexor carpi ulnaris', 'unknown']),
+                dim_sizes = np.array([8, 4, 4, 4, 4])
+            case 1:
+                data = scipy.io.loadmat(f'{path_to_dataset}/rCer1.5_5D.mat')
+                emgs = np.array(['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
+                                 'left biceps']),
+                dim_sizes = np.array([8, 4, 4, 4, 4])
+            case 2:
+                data = scipy.io.loadmat(f'{path_to_dataset}/rCer1.5_5D.mat')
+                emgs = np.array(['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
+                                    'left pectoralis']),
+                dim_sizes = np.array([8, 4, 3, 4, 4])
+
+        resp = data['emg_response']
+        param = data['stim_combinations']
+        ch2xy = param[:, [0,1,2,5,6]]
+        peak_resp = resp[:, :, :, 2].transpose((2, 1, 0))# 0 for unormalized response
+        resp_mean = np.mean(resp[:, :, :, 2], axis=0).transpose((1, 0))
+
+        subject = {
+            'emgs': emgs,
+            'nChan': 32,
+            'sorted_resp': peak_resp,
+            'sorted_respMean': resp_mean,
+            'sorted_isvalid': peak_resp, 
+            'ch2xy': ch2xy,
+            'dim_sizes': dim_sizes,
+            'DimSearchSpace' : np.prod(dim_sizes)
+        }                
+        return subject  
+    elif dataset_type=='nhp':
+        if m_i==0:
+            data = scipy.io.loadmat(path_to_dataset+'/Cebus1_M1_190221.mat')['Cebus1_M1_190221'][0][0]
+        elif m_i==1:
+            data = scipy.io.loadmat(path_to_dataset+'/Cebus2_M1_200123.mat')['Cebus2_M1_200123'][0][0]
+        elif m_i==2:    
+            data = scipy.io.loadmat(path_to_dataset+'/Macaque1_M1_181212.mat')['Macaque1_M1_181212'][0][0]
+        elif m_i==3:
+            data  = scipy.io.loadmat(path_to_dataset+'/Macaque2_M1_190527.mat')['Macaque2_M1_190527'][0][0]
+
+        if m_i >= 2:
+            #macaques
+            mapping = {
+                'emgs': 0, 'emgsabr': 1, 'nChan': 2, 'stimProfile': 3, 'stim_channel': 4, 
+                'evoked_emg': 5, 'response': 6, 'isvalid': 7, 'sorted_isvalid': 8, 'sorted_resp': 9, 
+                'sorted_evoked': 10, 'sampFreqEMG': 11, 'resp_region': 12, 'map': 13, 'ch2xy': 14, 
+                'sorted_respMean': 15, 'sorted_respSD': 16
+            }
+        else:
+            # cebus
+            mapping = {
+                'emgs': 0, 'emgsabr': 1, 'nChan': 2, 'stimProfile': 3, 'stim_channel': 4, 
+                'evoked_emg': 5, 'response': 6, 'isvalid': 7, 'sorted_isvalid': 8, 'sorted_resp': 9, 
+                'sorted_respMean': 10, 'sorted_respSD': 11, 'sorted_evoked': 12, 'sampFreqEMG': 13, 
+                'resp_region': 14, 'map': 15, 'ch2xy': 16
+            }
+
+        nChan = data[mapping['nChan']][0][0]
+
+        rN = data[mapping['sorted_isvalid']]
+        j1, j2, j3 = rN.shape[0], rN.shape[1], rN[0][0].shape[0]
+        sorted_isvalid = np.stack([np.squeeze(rN[i, j]) for i in range(j1) for j in range(j2)], axis=0)
+        sorted_isvalid = sorted_isvalid.reshape(j1, j2, j3)
+
+        ch2xy = data[mapping['ch2xy']] - 1
+        se = data[mapping['sorted_evoked']]
+        i1, i2, i3, i4 = se.shape[0], se.shape[1], se[0][0].shape[0], se[0][0].shape[1]
+        sorted_evoked = np.stack([np.squeeze(se[i, j]) for i in range(i1) for j in range(i2)], axis=0)
+        sorted_evoked = sorted_evoked.reshape(i1, i2, i3, i4)
+        sorted_filtered = sorted_evoked
+
+        stim_channel = data[mapping['stim_channel']]
+        if stim_channel.shape[0] == 1:
+            stim_channel = stim_channel[0]
+
+        fs = data[mapping['sampFreqEMG']][0][0]
+        resp_region = data[mapping['resp_region']][0]
+
+        stimProfile = data[mapping['stimProfile']][0]
+        
+        # compute baseline
+        where_zero = np.where(abs(stimProfile) > 10**(-50))[0][0]
+        window_size = int(fs * 30 * 10**(-3))
+        baseline = []
+        for iChan in range(nChan):
+            reps = np.where(stim_channel == iChan + 1)[0]
+            n_rep = len(reps)
+            # Compute mean over the last dimension (time), across those repetitions
+            mean_baseline = np.mean(sorted_filtered[iChan, :, :n_rep, where_zero - window_size : where_zero], axis=-1)
+            baseline.append(mean_baseline)
+        
+        baseline = np.stack(baseline, axis=0)  # shape: (nChan, nSamples)
+        
+        sorted_filtered = sorted_filtered - baseline[..., np.newaxis]
+        sorted_resp = np.max(sorted_filtered[:,:,:n_rep,resp_region[0]:resp_region[1]], axis=-1)
+
+        # Create a masked array where invalid points are masked
+        masked_resp = np.ma.masked_where(sorted_isvalid == 0, sorted_resp)
+        
+        # Compute the mean over the last axis, ignoring masked (invalid) values
+        sorted_respMean = masked_resp.mean(axis=-1)
+
+        return {
+        'nChan': nChan, 
+        'sorted_isvalid': sorted_isvalid,
+        'sorted_resp': sorted_resp,
+        'sorted_respMean': sorted_respMean,
+        'ch2xy': ch2xy,
+        'DimSearchSpace': 96
+        }
+    elif dataset_type=='rat':  # rat dataset has 6 subjects
+        if m_i==0:
+            data = scipy.io.loadmat(path_to_dataset+'/rat1_M1_190716.mat')['rat1_M1_190716'][0][0]
+        elif m_i==1:
+            data = scipy.io.loadmat(path_to_dataset+'/rat2_M1_190617.mat')['rat2_M1_190617'][0][0]     
+        elif m_i==2:
+            data = scipy.io.loadmat(path_to_dataset+'/rat3_M1_190728.mat')['rat3_M1_190728'][0][0]                  
+        elif m_i==3:
+            data = scipy.io.loadmat(path_to_dataset+'/rat4_M1_191109.mat')['rat4_M1_191109'][0][0]                  
+        elif m_i==4:
+            data = scipy.io.loadmat(path_to_dataset+'/rat5_M1_191112.mat')['rat5_M1_191112'][0][0]                  
+        elif m_i==5:
+            data = scipy.io.loadmat(path_to_dataset+'/rat6_M1_200218.mat')['rat6_M1_200218'][0][0]   
+
+        mapping = {
+                'emgs': 0, 'emgsabr': 1, 'nChan': 2, 'stimProfile': 3, 'stim_channel': 4, 
+                'evoked_emg': 5, 'response': 6, 'isvalid': 7, 'sorted_isvalid': 8, 'sorted_resp': 9, 
+                'sorted_evoked': 10, 'sampFreqEMG': 11, 'resp_region': 12, 'map': 13, 'ch2xy': 14, 
+                'sorted_respMean': 15, 'sorted_respSD': 16
+            }
+        
+        nChan = data[mapping['nChan']][0][0]
+
+        rN = data[mapping['sorted_isvalid']]
+        j1, j2, j3 = rN.shape[0], rN.shape[1], rN[0][0].shape[0]
+        sorted_isvalid = np.stack([np.squeeze(rN[i, j]) for i in range(j1) for j in range(j2)], axis=0)
+        sorted_isvalid = sorted_isvalid.reshape(j1, j2, j3)
+
+        ch2xy = data[mapping['ch2xy']] - 1
+        se = data[mapping['sorted_evoked']]
+        i1, i2, i3, i4 = se.shape[0], se.shape[1], se[0][0].shape[0], se[0][0].shape[1]
+        sorted_evoked = np.stack([np.squeeze(se[i, j]) for i in range(i1) for j in range(i2)], axis=0)
+        sorted_evoked = sorted_evoked.reshape(i1, i2, i3, i4)
+        sorted_filtered = sorted_evoked
+
+        stim_channel = data[mapping['stim_channel']]
+        if stim_channel.shape[0] == 1:
+            stim_channel = stim_channel[0]
+
+        fs = data[mapping['sampFreqEMG']][0][0]
+        resp_region = data[mapping['resp_region']][0]
+
+        stimProfile = data[mapping['stimProfile']][0]
+        
+        # compute baseline
+        where_zero = np.where(abs(stimProfile) > 10**(-50))[0][0]
+        window_size = int(fs * 30 * 10**(-3))
+        baseline = []
+        for iChan in range(nChan):
+            reps = np.where(stim_channel == iChan + 1)[0]
+            n_rep = len(reps)
+            # Compute mean over the last dimension (time), across those repetitions
+            mean_baseline = np.mean(sorted_filtered[iChan, :, :n_rep, where_zero - window_size : where_zero], axis=-1)
+            baseline.append(mean_baseline)
+        
+        baseline = np.stack(baseline, axis=0)  # shape: (nChan, nSamples)
+        
+        sorted_filtered = sorted_filtered - baseline[..., np.newaxis]
+        sorted_resp = np.max(sorted_filtered[:,:,:n_rep,resp_region[0]:resp_region[1]], axis=-1)
+        # Create a masked array where invalid points are masked
+        masked_resp = np.ma.masked_where(sorted_isvalid == 0, sorted_resp)
+        
+        # Compute the mean over the last axis, ignoring masked (invalid) values
+        sorted_respMean = masked_resp.mean(axis=-1)
+
+        return {
+        'nChan': nChan, 
+        'sorted_isvalid': sorted_isvalid,
+        'sorted_resp': sorted_resp,
+        'sorted_respMean': sorted_respMean,
+        'ch2xy': ch2xy,
+        'DimSearchSpace': 32
+        } 
+    elif dataset_type =='spinal':
+
+        subject_map = {
+            0: 'rat0_C5_500uA.pkl', 1: 'rat1_C5_500uA.pkl', 2: 'rat1_C5_700uA.pkl', 3: 'rat1_midC4_500uA.pkl',
+            4: 'rat2_C4_300uA.pkl', 5: 'rat2_C5_300uA.pkl', 6: 'rat2_C6_300uA.pkl', 7: 'rat3_C4_300uA.pkl',
+            8: 'rat3_C5_200uA.pkl', 9: 'rat3_C5_350uA.pkl', 10: 'rat3_C6_300uA.pkl' 
+        }
+        
+        #load data
+        with open(f'{path_to_dataset}/{subject_map[m_i]}', "rb") as f:
+            data = pickle.load(f)
+        
+        ch2xy, emgs = data['ch2xy'], data['emgs']
+        evoked_emg, filtered_emg = data['evoked_emg'], data['filtered_emg']
+        maps = data['map']
+        parameters = data['parameters']
+        resp_region = data['resp_region']
+        fs = data['sampFreqEMG']
+        sorted_evoked = data['sorted_evoked']
+        sorted_filtered = data['sorted_filtered']
+        sorted_resp = data['sorted_resp']
+        sorted_isvalid = data['sorted_isvalid']
+        sorted_respMean = data['sorted_respMean']
+        sorted_respSD = data['sorted_respSD']
+        stim_channel = data['stim_channel']
+        stimProfile=data['stimProfile']
+        n_muscles = emgs.shape[0]
+
+        #?# We are removing lots of reps here print(f'sorted response: {sorted_resp.shape}') 
+        #Computing baseline for filtered signal
+        nChan = parameters['nChan'][0]
+        where_zero = np.where(abs(stimProfile) > 10**(-50))[0][0]
+        window_size = int(fs * 35 * 10**(-3))
+        baseline = []
+        n_rep = 10000 # First, determine n_reps global
+        for iChan in range(nChan):
+            reps= np.where(stim_channel == iChan + 1)[0]
+            if len(reps) < n_rep:
+                n_rep = len(reps)
+        for iChan in range(nChan):
+            mean_baseline = np.mean(sorted_filtered[iChan, :, :n_rep, 0 : where_zero], axis=-1)
+            baseline.append(mean_baseline)
+        
+        baseline = np.stack(baseline, axis=0)
+
+        #remove baseline from filtered signal
+        sorted_filtered[:, :, :n_rep, :] = sorted_filtered[:, :, :n_rep, :] - baseline[..., np.newaxis]
+        sorted_resp = np.nanmax(sorted_filtered[:, :, :n_rep, int(resp_region[0]): int(resp_region[1])], axis=-1)
+        masked_resp = np.ma.masked_where(sorted_isvalid[:, :, :n_rep] == 0, sorted_resp)
+        sorted_respMean = masked_resp.mean(axis=-1)
+
+         # compute baseline for evoked signal
+        baseline = []
+        for iChan in range(nChan):
+            # Compute mean over the last dimension (time), across those repetitions
+            mean_baseline = np.mean(sorted_evoked[iChan, :, :n_rep, 0 : where_zero], axis=-1)
+            baseline.append(mean_baseline)
+        baseline = np.stack(baseline, axis=0)  # shape: (nChan, nSamples)
+        
+        #remove baseline from evoked signal
+        sorted_evoked[:, :, :n_rep, :] = sorted_evoked[:, :, :n_rep, :] - baseline[..., np.newaxis]
+        sorted_resp = np.nanmax(sorted_evoked[:,:,:n_rep,int(resp_region[0]) :int(resp_region[1])], axis=-1)
+        masked_resp = np.ma.masked_where(sorted_isvalid[:,:,:n_rep] == 0, sorted_resp)
+
+        #mask sorted_isvalid by n_rep
+        sorted_isvalid = sorted_isvalid[:, :, :n_rep]
+
+        subject = {
+            'emgs': emgs,
+            'nChan': 64,
+            'DimSearchSpace': 64,
+            'sorted_respMean': sorted_respMean,
+            'ch2xy': ch2xy,
+            'evoked_emg': evoked_emg, 'filtered_emg':filtered_emg, 'sorted_resp': sorted_resp,  
+            'sorted_isvalid': sorted_isvalid, 'sorted_respSD': sorted_respSD,
+            'sorted_filtered': sorted_filtered, 'stim_channel': stim_channel, 'fs': fs,
+        'parameters': parameters, 'n_muscles': n_muscles, 'maps': maps,
+        'resp_region': resp_region, 'stimProfile': stimProfile,  'baseline' : baseline    
+        }
+        
+        return subject   
+    else:
+        raise ValueError('The dataset type should be 5d_rat, nhp, rat or spinal' )
+        
 ### --- BO method --- ###   
 
 def neurostim_bo(dataset, model_cls, kappas):
@@ -921,35 +1239,32 @@ def neurostim_bo(dataset, model_cls, kappas):
     nrnd = options['n_rnd']
     nSubjects = options['n_subjects']
     nEmgs = options['n_emgs']
-    MaxQueries = options['n_Chan']
+    MaxQueries = options['n_queries']
     ndims = options['n_dims']
 
     #Metrics initialization
-    PP = torch.zeros((nSubjects,nEmgs,len(kappas),nRep, MaxQueries), device=DEVICE)
-    PP_t = torch.zeros((nSubjects,nEmgs, len(kappas),nRep, MaxQueries), device=DEVICE)
-    Q = torch.zeros((nSubjects,nEmgs,len(kappas),nRep, MaxQueries), device=DEVICE)
-    Train_time = torch.zeros((nSubjects,nEmgs, len(kappas),nRep, MaxQueries), device=DEVICE)
-    Cum_train =  torch.zeros((nSubjects,nEmgs, len(kappas),nRep, MaxQueries), device=DEVICE)
-    PARTITIONS = np.empty((nSubjects,nEmgs,len(kappas),nRep, MaxQueries), dtype=object)
-    RSQ = torch.zeros((nSubjects,nEmgs, len(kappas), nRep), device=DEVICE)
-    REGRETS = torch.zeros((nSubjects,nEmgs, len(kappas), nRep, MaxQueries), device=DEVICE)
-    SOBOLS = np.empty((nSubjects,nEmgs,len(kappas),nRep, MaxQueries), dtype=object)
+    PP = torch.zeros((nSubjects,max(nEmgs),len(kappas),nRep, MaxQueries), device=device)
+    PP_t = torch.zeros((nSubjects,max(nEmgs), len(kappas),nRep, MaxQueries), device=device)
+    Q = torch.zeros((nSubjects,max(nEmgs),len(kappas),nRep, MaxQueries), device=device)
+    Train_time = torch.zeros((nSubjects,max(nEmgs), len(kappas),nRep, MaxQueries), device=device)
+    Cum_train =  torch.zeros((nSubjects,max(nEmgs), len(kappas),nRep, MaxQueries), device=device)
+    PARTITIONS = np.empty((nSubjects,max(nEmgs),len(kappas),nRep, MaxQueries), dtype=object)
+    RSQ = torch.zeros((nSubjects,max(nEmgs), len(kappas), nRep), device=device)
+    REGRETS = torch.zeros((nSubjects,max(nEmgs), len(kappas), nRep, MaxQueries), device=device)
+    SOBOLS = np.empty((nSubjects,max(nEmgs),len(kappas),nRep, MaxQueries), dtype=object)
 
     for s_idx in range(nSubjects):
 
         print(f'subject {s_idx + 1} \ {nSubjects}')
-        subject = load_matlab_data(dataset, s_idx) 
-        subject['ch2xy'] = subject['ch2xy'].to(device).clone().detach() if isinstance(subject['ch2xy'], torch.Tensor) else torch.tensor(subject['ch2xy'], device=device)
+        subject = load_data2(dataset, s_idx) 
+        subject['ch2xy'] = torch.tensor(subject['ch2xy'], device=device)
 
         for k_idx, kappa in enumerate(kappas):
 
             for e_i in range(len(subject['emgs'])):
 
                 # "Ground truth" map
-                if dataset == '5d_rat':
-                    MPm= torch.mean(subject['sorted_respMean'].clone().detach().to(DEVICE)[:, s_idx % 4], axis=0)
-                else:
-                    MPm= torch.tensor(subject['sorted_respMean'][:,e_i]).float()  
+                MPm= torch.tensor(subject['sorted_respMean'][:,e_i]).float()  
                 # Best known channel
                 mMPm= torch.max(MPm)
 
@@ -959,20 +1274,20 @@ def neurostim_bo(dataset, model_cls, kappas):
 
                 prior_lik= gpytorch.priors.SmoothedBoxPrior(a=options['noise_min']**2,b= options['noise_max']**2, sigma=0.01) # gaussian noise variance
                 likf= gpytorch.likelihoods.GaussianLikelihood(noise_prior= prior_lik)
-                likf.noise= [1.0]
-                if device=='cuda':
+                likf.initialize(noise=torch.tensor(1.0, device=DEVICE, dtype=torch.get_default_dtype()))
+
+                if device =='cuda':
                     likf=likf.cuda()
 
                 # Metrics initialization
                 # Then run the sequential optimization
                 DimSearchSpace = subject['DimSearchSpace'] 
-                #MaxQueries = DimSearchSpace
                 perf_explore= torch.zeros((nRep, MaxQueries), device=device)
                 perf_exploit= torch.zeros((nRep, MaxQueries), device=device)
                 perf_rsq= torch.zeros((nRep), device=device)
                 P_test =  torch.zeros((nRep, MaxQueries, 2), device=device) #storing all queries
-                train_time = torch.zeros((nRep, MaxQueries), device=DEVICE)
-                cum_time = torch.zeros((nRep, MaxQueries), device=DEVICE)
+                train_time = torch.zeros((nRep, MaxQueries), device=device)
+                cum_time = torch.zeros((nRep, MaxQueries), device=device)
                 partitions = np.empty((nRep, MaxQueries), dtype=object)
                 regret = np.empty((nRep, MaxQueries), dtype=np.float32)
                 sobol_interactions = np.empty((nRep, MaxQueries), dtype=object)
@@ -1006,13 +1321,12 @@ def neurostim_bo(dataset, model_cls, kappas):
                         query_elec = P_test[rep_i][q][0]
 
                         # Read response
-                        if dataset == '5d_rat':
-                            valid_resp = subject['sorted_respMean'][:, s_idx % 4, int(query_elec.item())]    
-                        else:
-                            valid_resp= torch.tensor(subject['sorted_resp'][int(query_elec)][e_i][subject['sorted_isvalid'][int(query_elec)][e_i]!=0])
+                        valid_resp= torch.tensor(subject['sorted_resp'][int(query_elec)][e_i][subject['sorted_isvalid'][int(query_elec)][e_i]!=0])
                         r_i= np.random.randint(len(valid_resp))
                         test_respo= valid_resp[r_i]
-                        test_respo += torch.normal(0.0, 0.02*torch.mean(test_respo))
+                        std = (0.02 * torch.mean(test_respo)).clamp(min=0.0)   
+                        noise = torch.randn((), device=test_respo.device, dtype=test_respo.dtype) * std
+                        test_respo = test_respo + noise
                         # done reading response
                         P_test[rep_i][q][1]= test_respo
 
@@ -1031,6 +1345,7 @@ def neurostim_bo(dataset, model_cls, kappas):
                                 sobol = Sobol(dataset)
                                 model.sobol = sobol #Initialize sobol
                                 surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_prior= prior_lik)
+                                surrogate_likelihood.initialize(noise=torch.tensor(1.0, device=device, dtype=torch.get_default_dtype()))
                                 surrogate = ExactGP(x, y, surrogate_likelihood, priorbox, outputscale_priorbox)
                                 interactions = model.sobol.update_interactions(x, y, surrogate, surrogate_likelihood)
                         else:
@@ -1136,7 +1451,7 @@ def neurostim_bo(dataset, model_cls, kappas):
     # Saving variables
     output_dir = os.path.join('output', 'neurostim_experiments', dataset)
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'{dataset}_{model.name}_budget{MaxQueries}_{nRep}reps.npz'
+    fname = f'{dataset}_{model.name}_budget{MaxQueries}_{nRep}reps_wbaseline.npz'
     results_path = os.path.join(output_dir,fname)
     np.savez_compressed(results_path,
             RSQ=RSQ.cpu(), PP=PP.cpu(), PP_t=PP_t.cpu(), 
@@ -1218,8 +1533,12 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    
-    #neurostim_bo('rat', neuralSobolGP, kappas=[3.0, 5.0, 7.0, 9.0])
+        
+    #neurostim_bo('5d_rat', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
+    #neurostim_bo('5d_rat', neuralSobolGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
+    neurostim_bo('spinal', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
+    neurostim_bo('spinal', neuralSobolGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
+    #neurostim_bo('rat', ExactGP, kappas=[1.0, 2.0, 2.9, 3.2, 3.5, 3.8, 4.1, 5.0, 6.0, 7.0, 8.0, 10.0])
     #neurostim_bo('nhp', neuralSobolGP, kappas=[3.0, 5.0, 7.0, 9.0])
     #neurostim_bo('5d_rat', neuralSobolGP, kappas=[3.0, 5.0, 7.0, 9.0])
-    main()
+    #main()
