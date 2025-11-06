@@ -967,7 +967,7 @@ def load_data2(dataset_type, m_i):
                                  'left biceps']),
                 dim_sizes = np.array([8, 4, 4, 4, 4])
             case 2:
-                data = scipy.io.loadmat(f'{path_to_dataset}/rCer1.5_5D.mat')
+                data = scipy.io.loadmat(f'{path_to_dataset}/rData03_5D.mat')
                 emgs = np.array(['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
                                     'left pectoralis']),
                 dim_sizes = np.array([8, 4, 3, 4, 4])
@@ -975,15 +975,17 @@ def load_data2(dataset_type, m_i):
         resp = data['emg_response']
         param = data['stim_combinations']
         ch2xy = param[:, [0,1,2,5,6]]
-        peak_resp = resp[:, :, :, 2].transpose((2, 1, 0))# 0 for unormalized response
+        peak_resp = resp[:, :, :, 2].transpose((2, 1, 0)) # resp[:, :, :, 0] for unormalized response
         resp_mean = np.mean(resp[:, :, :, 2], axis=0).transpose((1, 0))
+
+        sorted_isvalid = peak_resp + 1e-7
 
         subject = {
             'emgs': emgs,
             'nChan': 32,
             'sorted_resp': peak_resp,
             'sorted_respMean': resp_mean,
-            'sorted_isvalid': peak_resp, 
+            'sorted_isvalid': sorted_isvalid, 
             'ch2xy': ch2xy,
             'dim_sizes': dim_sizes,
             'DimSearchSpace' : np.prod(dim_sizes)
@@ -1061,7 +1063,10 @@ def load_data2(dataset_type, m_i):
         # Compute the mean over the last axis, ignoring masked (invalid) values
         sorted_respMean = masked_resp.mean(axis=-1)
 
+        emgs = data[0][0]
+
         return {
+        'emgs': emgs,
         'nChan': nChan, 
         'sorted_isvalid': sorted_isvalid,
         'sorted_resp': sorted_resp,
@@ -1134,7 +1139,10 @@ def load_data2(dataset_type, m_i):
         # Compute the mean over the last axis, ignoring masked (invalid) values
         sorted_respMean = masked_resp.mean(axis=-1)
 
+        emgs = data[0][0]
+
         return {
+        'emgs': emgs,
         'nChan': nChan, 
         'sorted_isvalid': sorted_isvalid,
         'sorted_resp': sorted_resp,
@@ -1321,8 +1329,13 @@ def neurostim_bo(dataset, model_cls, kappas):
                         query_elec = P_test[rep_i][q][0]
 
                         # Read response
-                        valid_resp= torch.tensor(subject['sorted_resp'][int(query_elec)][e_i][subject['sorted_isvalid'][int(query_elec)][e_i]!=0])
-                        r_i= np.random.randint(len(valid_resp))
+                        try:
+                            valid_resp= torch.tensor(subject['sorted_resp'][int(query_elec)][e_i][subject['sorted_isvalid'][int(query_elec)][e_i]!=0])
+                            r_i= np.random.randint(len(valid_resp))
+                        except:
+                            print(f'This is valid response: {valid_resp} queried at {q} | emg = {e_i} | nrep {rep_i} | k = {k_idx}')
+                            print(f'Redo strategy to handle 5d_rat')
+                            exit(1)
                         test_respo= valid_resp[r_i]
                         std = (0.02 * torch.mean(test_respo)).clamp(min=0.0)   
                         noise = torch.randn((), device=test_respo.device, dtype=test_respo.dtype) * std
@@ -1536,9 +1549,9 @@ if __name__ == '__main__':
         
     #neurostim_bo('5d_rat', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
     #neurostim_bo('5d_rat', neuralSobolGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
-    neurostim_bo('spinal', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
-    neurostim_bo('spinal', neuralSobolGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
+    #neurostim_bo('spinal', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
+    #neurostim_bo('spinal', neuralSobolGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
     #neurostim_bo('rat', ExactGP, kappas=[1.0, 2.0, 2.9, 3.2, 3.5, 3.8, 4.1, 5.0, 6.0, 7.0, 8.0, 10.0])
     #neurostim_bo('nhp', neuralSobolGP, kappas=[3.0, 5.0, 7.0, 9.0])
     #neurostim_bo('5d_rat', neuralSobolGP, kappas=[3.0, 5.0, 7.0, 9.0])
-    #main()
+    main()

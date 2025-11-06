@@ -106,7 +106,7 @@ def plot_kappas(npz_files, dataset, show=True):
         ax.legend(fontsize='small', loc='lower right', ncol=1)
 
     plt.tight_layout()
-    #fig.savefig(out_path, bbox_inches='tight', dpi=200)
+    fig.savefig(out_path, bbox_inches='tight', dpi=200)
     if show:
         plt.show()
     plt.close(fig)
@@ -427,4 +427,4 @@ if __name__ == '__main__':
 
     #optimization_metrics(d_simple, d_additive, d_sobol, [4, -1, -2], dataset='rat')
 
-    plot_kappas(files_5d_rat, '5d_rat', show=True)
+    plot_kappas(files_rat, 'rat')

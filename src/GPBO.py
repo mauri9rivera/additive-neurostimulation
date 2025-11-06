@@ -258,7 +258,7 @@ class SobolGP(gpytorch.models.ExactGP):
         new_partition = self.sobol.update_partition(interactions)
         self.update_partition(new_partition)
 
-        return self.sobol.interactions
+        return interactions
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -617,6 +617,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
             grid_min = train_y.min().item()
         if train_y.max().item() > true_best:
             true_best = train_y.max().item()
+        model.set_train_data(inputs=train_x, targets=train_y, strict=False)
 
         # Posterior predictions for R^2
         model.eval(); likelihood.eval()
@@ -657,22 +658,21 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
                 print(f"[Sobol] background job failed: {e}")
 
 
-        model = model_cls(train_x, train_y, likelihood, model.partition)
+        #model = model_cls(train_x, train_y, likelihood, model.partition)
         t1 = time.time()
         elapsed_train = t1 - t0
         train_times.append(elapsed_train)
-        model.sobol = sobol 
+        #model.sobol = sobol 
         sobol_interactions.append(interactions.copy())
         partition_updates.append(model.partition)
 
         # Submit a new Sobol background job every n_sobol iterations (if none pending)
-        if ((i + 1) % n_sobol) == 0:
+        if (i % n_sobol) == 0:
             if space_reconfiguration is None or space_reconfiguration.done():
                 try:
                     surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood()
                     surrogate = ExactGPModel(train_x, train_y, surrogate_likelihood)
                     space_reconfiguration = executor.submit(model.reconfigure_space, surrogate, surrogate_likelihood)
-                    #sobol_future = executor.submit(sobol.compute_interactions, train_x, train_y, surrogate, surrogate_likelihood)
                 except Exception as e:
                     space_reconfiguration = None
                     print(f"[Sobol] submit failed: {e}")
