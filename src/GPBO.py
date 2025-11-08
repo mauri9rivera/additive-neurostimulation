@@ -22,6 +22,7 @@ from SALib.sample import saltelli
 from SALib.sample import sobol as sobol_sampler
 
 from concurrent.futures import ThreadPoolExecutor
+import threading
 import warnings
 import traceback
 
@@ -167,13 +168,13 @@ class MHGP(gpytorch.models.ExactGP):
         proposed_model.likelihood.train()
 
         mll_curr = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
-        mll_proposed = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, proposed_model)
+        mll_proposed = gpytorch.mlls.ExactMarginalLogLikelihood(proposed_model.likelihood, proposed_model)
         train_inputs = tuple(t.to(DEVICE) for t in self.train_inputs)
 
         curr_evidence = mll_curr(self(*train_inputs), self.train_targets)
         proposed_evidence = mll_proposed(proposed_model(proposed_model.train_inputs[0]), proposed_model.train_targets)
 
-        acceptance = min(1.0, float(torch.exp(proposed_evidence - curr_evidence)))
+        acceptance = float(torch.exp(proposed_evidence - curr_evidence))
 
         return acceptance
     
@@ -190,13 +191,15 @@ class MHGP(gpytorch.models.ExactGP):
         
         acceptance_ratio = self.calculate_acceptance(proposed_model)
 
-        if acceptance_ratio >= 0.9:
+        if acceptance_ratio >= 1.0:
             print(f'Update for model accepted! Genetics propose to partition {new_partition} from {self.partition} with acceptance {acceptance_ratio}')
-            self.update_partition(new_partition)
-            print(f'new partition: {self.partition}')
+            #self.update_partition(new_partition)
             #partition_key, self.history()
         
-        return interactions
+            return interactions, new_partition
+
+        else: 
+            return interactions, None 
         
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -256,9 +259,9 @@ class SobolGP(gpytorch.models.ExactGP):
         # update Sobol interactions based on new surrogate train data
         interactions = self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
         new_partition = self.sobol.update_partition(interactions)
-        self.update_partition(new_partition)
+        #self.update_partition(new_partition)
 
-        return interactions
+        return interactions, new_partition
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -522,23 +525,23 @@ def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
     return gp, gp.likelihood, mean_loss
 
 def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
-        """
-        Grid-search UCB maximizer.
-        Returns: new_x (1 x d tensor), ucb_value (float), idx (int)
-        UCB = mean + kappa * std
-        """
-        gp_model.eval()
-        gp_likelihood.eval()
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            post = gp_likelihood(gp_model(grid_points))
-            mean = post.mean           # shape (n_points,)
-            var = post.variance
-            std = var.clamp_min(0.0).sqrt()
-            ucb = mean + kappa_val * std
+    """
+    Grid-search UCB maximizer.
+    Returns: new_x (1 x d tensor), ucb_value (float), idx (int)
+    UCB = mean + kappa * std
+    """
+    gp_model.eval()
+    gp_likelihood.eval()
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        post = gp_likelihood(gp_model(grid_points))
+        mean = post.mean           # shape (n_points,)
+        var = post.variance
+        std = var.clamp_min(0.0).sqrt()
+        ucb = mean + kappa_val * std
 
-        best_idx = torch.argmax(ucb).item()
-        best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
-        return best_x, ucb[best_idx].item(), best_idx
+    best_idx = torch.argmax(ucb).item()
+    best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
+    return best_x, ucb[best_idx].item(), best_idx
 
 def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10, kappa=1.0, acq_method = 'grid', save=False, verbose=False):
     """
@@ -617,16 +620,15 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
             grid_min = train_y.min().item()
         if train_y.max().item() > true_best:
             true_best = train_y.max().item()
-        model.set_train_data(inputs=train_x, targets=train_y, strict=False)
 
         # Posterior predictions for R^2
         model.eval(); likelihood.eval()
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=gpytorch.utils.warnings.GPInputWarning if hasattr(gpytorch.utils, "warnings") else Warning)
             with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                post = likelihood(model(train_x))
+                post = likelihood(model(grid_x))
 
-            y_true = train_y.squeeze(-1)
+            y_true = grid_y.squeeze(-1)
             y_pred = post.mean
             ss_res = torch.sum((y_true - y_pred) ** 2)
             ss_tot = torch.sum((y_true - y_true.mean()) ** 2)
@@ -650,15 +652,14 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
         if space_reconfiguration is not None and space_reconfiguration.done():
 
             try:
-                interactions = space_reconfiguration.result()   
+                interactions, proposed_partition = space_reconfiguration.result()
                 space_reconfiguration = None
 
+                if proposed_partition is not None:
+                    model.update_partition(proposed_partition)
             except Exception as e:
                 space_reconfiguration = None
                 print(f"[Sobol] background job failed: {e}")
-
-
-        #model = model_cls(train_x, train_y, likelihood, model.partition)
         t1 = time.time()
         elapsed_train = t1 - t0
         train_times.append(elapsed_train)
@@ -672,14 +673,14 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
                 try:
                     surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood()
                     surrogate = ExactGPModel(train_x, train_y, surrogate_likelihood)
-                    space_reconfiguration = executor.submit(model.reconfigure_space, surrogate, surrogate_likelihood)
+                    parallel_model = copy.deepcopy(model)
+                    space_reconfiguration = executor.submit(parallel_model.reconfigure_space, surrogate, surrogate_likelihood)
                 except Exception as e:
                     space_reconfiguration = None
                     print(f"[Sobol] submit failed: {e}")
 
         if verbose:
-            part_str = getattr(model, 'partition', None)
-            print(f"Iter {i+1:02d} Loss: {loss_curve:.4f} Exploit score: {exploit:.4f}, Explore score: {explore:.4f}, R^2: {r2_score:.4f} | partition: {part_str}")
+            print(f"Iter {i+1:02d} Loss: {epoch_losses:.4f} Exploit score: {exploit:.4f}, Explore score: {explore:.4f}, R^2: {r2_score:.4f} | partition: {model.partition}")
             print(f'best observed: {best_observed:.4f} |  true best: {true_best:.4f} | current query: {new_y.item():.4f}')
 
     executor.shutdown(wait=False)
@@ -1453,6 +1454,7 @@ def main(argv=None):
 if __name__ == '__main__':
     
     main()
+    
 
    
       

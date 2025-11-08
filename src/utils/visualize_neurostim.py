@@ -39,7 +39,8 @@ def plot_kappas(npz_files, dataset, show=True):
     emg_map = {
         'nhp': [6, 8, 4, 4],
         'rat': [6, 7, 8, 6, 5, 8],
-        '5d_rat': [1, 1, 1, 1]
+        '5d_rat': [1, 1, 1, 1],
+        'spinal': [8, 10, 10, 10, 10, 10, 10, 8, 8, 8, 8]
     }
 
     n = np.sum(emg_map[dataset])
@@ -127,7 +128,9 @@ def optimization_metrics(data_exactgp, data_additivegp, data_sobolgp, kappas, da
     colors = ['red', 'blue', 'green']
     labels = ['ExactGP', 'AdditiveGP', 'SobolGP']
     
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    global_min = 1.0
     
     # ---------- Figure 1: Exploration & Exploitation ----------
     for idx, data in enumerate(datafiles):
@@ -149,19 +152,25 @@ def optimization_metrics(data_exactgp, data_additivegp, data_sobolgp, kappas, da
         conf_interval_PP = 1.96 * std_PP / np.sqrt(n_samples)
         
         x_values = np.arange(mean_PP_t.shape[0])
+
+        k = data['kappas'][kappas[idx]]
         
         # Plot exploration as dotted line
-        ax.plot(x_values, mean_PP, color=colors[idx], linestyle='-', label=f'Exploration ({labels[idx]})')
+        ax.plot(x_values, mean_PP, color=colors[idx], linestyle='-', label=f'Exploration ({labels[idx]}) | kappa {k}')
         ax.fill_between(x_values, mean_PP - conf_interval_PP, mean_PP + conf_interval_PP, color=colors[idx], alpha=0.15)
         
         # Plot exploitation as filled area
-        ax.plot(x_values, mean_PP_t, color=colors[idx], linestyle='--', label=f'Exploitation ({labels[idx]})')
+        ax.plot(x_values, mean_PP_t, color=colors[idx], linestyle='--')
         #ax.fill_between(x_values, mean_PP_t - conf_interval_PP_t, mean_PP_t + conf_interval_PP_t, color=colors[idx], alpha=0.3)
+
+        #update global min exploration
+        if mean_PP[0] < global_min:
+            global_min = mean_PP[0]
     
     ax.set_title(f"Exploration vs. Exploitation", fontsize=14, fontweight="bold")
     ax.set_xlabel("Iterations")
     ax.set_ylabel("Scores")
-    ax.set_ylim(0, 1.1)
+    ax.set_ylim(global_min, 1.1)
     ax.legend(loc="lower right")
     
     output_dir = os.path.join('output', 'neurostim_experiments', dataset)
@@ -174,7 +183,7 @@ def optimization_metrics(data_exactgp, data_additivegp, data_sobolgp, kappas, da
 
 
     # ---------- Figure 2: Regrets ----------
-    fig2, ax2 = plt.subplots(figsize=(9, 5))
+    fig2, ax2 = plt.subplots(figsize=(10, 5))
     
     for idx, data in enumerate(datafiles):
 
@@ -194,9 +203,9 @@ def optimization_metrics(data_exactgp, data_additivegp, data_sobolgp, kappas, da
         ax2.plot(x_values, mean_regret, color=colors[idx], linestyle='-', label=f'Regret ({labels[idx]})')
         ax2.fill_between(x_values, mean_regret - conf_interval_regret, mean_regret + conf_interval_regret, color=colors[idx], alpha=0.3)
         
-    ax2.set_title("Log-Regret across runs", fontsize=14, fontweight="bold")
+    ax2.set_title("Regret across runs", fontsize=14, fontweight="bold")
     ax2.set_xlabel("Iterations")
-    ax2.set_ylabel("Regret")
+    ax2.set_ylabel(" Log Regret")
     #ax2.set_yscale("log")
     ax.set_ylim(-10, 10)
     ax2.grid(True, which='both', linestyle='--', linewidth=0.4)
@@ -421,10 +430,15 @@ if __name__ == '__main__':
             './output/neurostim_experiments/5d_rat/5d_rat_neuralSobolGP_budget100_20reps.npz',
     ]
 
-    d_simple = load_results(files_rat[0])
-    d_additive = load_results(files_rat[1])
-    d_sobol = load_results(files_rat[2])
+    files_spinal = ['./output/neurostim_experiments/spinal/spinal_ExactGP_budget64_20reps_wbaseline.npz',
+            './output/neurostim_experiments/spinal/spinal_AdditiveGP_budget64_20reps_wbaseline.npz',
+            './output/neurostim_experiments/spinal/spinal_neuralSobolGP_budget64_20reps_wbaseline.npz',
+            ]
 
-    #optimization_metrics(d_simple, d_additive, d_sobol, [4, -1, -2], dataset='rat')
+    d_simple = load_results(files_5d_rat[0])
+    d_additive = load_results(files_5d_rat[1])
+    d_sobol = load_results(files_5d_rat[2])
 
-    plot_kappas(files_rat, 'rat')
+    optimization_metrics(d_simple, d_additive, d_sobol, [-2, 3, -2], dataset='5d_rat')
+
+    #plot_kappas(files_spinal, 'spinal')

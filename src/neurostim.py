@@ -1548,10 +1548,4 @@ def main(argv=None):
 if __name__ == '__main__':
         
     #neurostim_bo('5d_rat', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
-    #neurostim_bo('5d_rat', neuralSobolGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
-    #neurostim_bo('spinal', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
-    #neurostim_bo('spinal', neuralSobolGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
-    #neurostim_bo('rat', ExactGP, kappas=[1.0, 2.0, 2.9, 3.2, 3.5, 3.8, 4.1, 5.0, 6.0, 7.0, 8.0, 10.0])
-    #neurostim_bo('nhp', neuralSobolGP, kappas=[3.0, 5.0, 7.0, 9.0])
-    #neurostim_bo('5d_rat', neuralSobolGP, kappas=[3.0, 5.0, 7.0, 9.0])
     main()
