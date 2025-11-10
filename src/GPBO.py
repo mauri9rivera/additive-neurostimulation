@@ -45,12 +45,13 @@ class MHGP(gpytorch.models.ExactGP):
 
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean() 
-        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
+        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
+        self.history = [self.partition_to_key(self.partition)]
         self.sobol = sobol
-        self.name = 'MetropolisHastingsGP'
+        self.name = 'MHGP'
         self.n_dims = train_x.shape[-1]
         self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
-        self.split_bias = 0.5
+        self.split_bias = 0.7
 
         #build covar_module based on partition
         self._build_covar()
@@ -75,17 +76,41 @@ class MHGP(gpytorch.models.ExactGP):
         self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)
 
     def partition_to_key(self, partition):
-        # Convert to a hashable, sorted tuple of tuples
-        return [list(map(int, grp)) for grp in partition if len(grp) > 0] #tuple(sorted(tuple(sorted(sub)) for sub in partition))
+        """
+        Return a canonical, hashable key for `partition`.
+        Canonicalization:
+          - convert each subgroup elements to int and sort within subgroup
+          - drop empty groups
+          - sort the list of groups lexicographically
+        Result: tuple(tuple(...), tuple(...), ...)
+        """
+        groups = []
+        for grp in partition:
+            if len(grp) == 0:
+                continue
+            # ensure ints and sorted within group
+            sorted_grp = tuple(sorted(int(x) for x in grp))
+            groups.append(sorted_grp)
+        # sort the groups lexicographically to make partition order-insensitive
+        key = tuple(sorted(groups))
+        return key
 
+    def check_history(self, new_partition):
+        """
+        Return True if the canonical key for new_partition is already in history.
+        """
+        key = self.partition_to_key(new_partition)
+        return key in self.history
+    
     def update_partition(self, new_partition):
 
         # normalize indices to ints
-        new_partition = self.partition_to_key(new_partition)
+        new_key = self.partition_to_key(new_partition)
+        current_key = self.partition_to_key(self.partition)
         # avoid unnecessary rebuilds:
-        if new_partition == self.partition:
+        if new_partition == current_key:
             return
-        self.partition = new_partition
+        self.partition = [list(grp) for grp in new_key]
         self._build_covar()
     
     def sobol_partitioning(self, interactions):
@@ -94,7 +119,7 @@ class MHGP(gpytorch.models.ExactGP):
         has_candidate = False
         attempts = 0
 
-        while not has_candidate and attempts < 20:
+        while not has_candidate and attempts < 100:
 
             new_partition = copy.deepcopy(self.partition)
             
@@ -111,7 +136,7 @@ class MHGP(gpytorch.models.ExactGP):
                     new_partition[robbed_idx] = robbed_subset # to fix split duplicate singletons issue
                     new_partition.append([victim.astype(int)]) 
                 
-                    if self.are_additive(victim, robbed_subset, interactions):
+                    if (not self.check_history(new_partition)) and self.are_additive(victim, robbed_subset, interactions):
 
                         has_candidate = True
                         return new_partition
@@ -140,7 +165,7 @@ class MHGP(gpytorch.models.ExactGP):
                                 break
                     
                     has_candidate = all_additive
-                    if has_candidate:
+                    if has_candidate and (not self.check_history(new_partition)):
                         return new_partition
  
             attempts +=1
@@ -174,32 +199,29 @@ class MHGP(gpytorch.models.ExactGP):
         curr_evidence = mll_curr(self(*train_inputs), self.train_targets)
         proposed_evidence = mll_proposed(proposed_model(proposed_model.train_inputs[0]), proposed_model.train_targets)
 
-        acceptance = float(torch.exp(proposed_evidence - curr_evidence))
+        acceptance = min(1.0, proposed_evidence / (curr_evidence + 1e-9))
 
         return acceptance
     
-    def reconfigure_space(self, surrogate, surrogate_likelihood, device=DEVICE):
+    def metropolis_hastings(self, interactions, device=DEVICE):
 
         # update sobol interactions from surrogate model training
-        interactions = self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
         new_partition = self.sobol_partitioning(interactions)
         proposed_model = MHGP(self.train_inputs[0], self.train_targets, gpytorch.likelihoods.GaussianLikelihood(), 
                               partition=new_partition)
         proposed_model.to(device)
         proposed_model.likelihood.to(device)
-        proposed_model, proposed_model.likelihood, _ = optimize(proposed_model, proposed_model.train_inputs[0], proposed_model.train_targets, n_iter=20, lr=0.01)
+        proposed_model, proposed_model.likelihood, _ = optimize(proposed_model, proposed_model.train_inputs[0], proposed_model.train_targets)
         
         acceptance_ratio = self.calculate_acceptance(proposed_model)
 
         if acceptance_ratio >= 1.0:
-            print(f'Update for model accepted! Genetics propose to partition {new_partition} from {self.partition} with acceptance {acceptance_ratio}')
-            #self.update_partition(new_partition)
-            #partition_key, self.history()
-        
-            return interactions, new_partition
+            #print(f'Update for model accepted! Genetics propose to partition {new_partition} from {self.partition} with acceptance {acceptance_ratio}')
+            self.history.append(self.partition_to_key(new_partition))
+            return new_partition
 
         else: 
-            return interactions, None 
+            return self.partition 
         
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -217,7 +239,7 @@ class SobolGP(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, partition=None, sobol=None, epsilon=5e-2):
         super(SobolGP, self).__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean()
-        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
+        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
         self.sobol = sobol
         self.n_dims = train_x.shape[-1]
         self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
@@ -483,7 +505,7 @@ def sobol_sensitivity(f_obj, n_samples=1000):
     #print("Second-order indices: \n", Si['S2'])
     return Si['S2']
 
-def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
+def optimize(gp, train_x, train_y, n_iter=20, lr=0.1):
     """
     Train an ExactGP + Likelihood model.
 
@@ -590,6 +612,8 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
     # Pre-train a surrogate (ExactGP) on initial data to seed the first sobol job
     surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood()
     surrogate = ExactGPModel(train_x, train_y, surrogate_likelihood)
+    surrogate, surrogate_likelihood, _ = optimize(surrogate, train_x, train_y)
+    interactions = None
     interactions = model.sobol.update_interactions(train_x, train_y, surrogate, surrogate_likelihood)
     
     # main optimization loop
@@ -650,20 +674,22 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
 
         # If there is a pending Sobol job finished, fetch it and update partition
         if space_reconfiguration is not None and space_reconfiguration.done():
-
             try:
-                interactions, proposed_partition = space_reconfiguration.result()
+                interactions = space_reconfiguration.result()
+                if model.name == 'MHGP':
+                    new_partition = model.metropolis_hastings(interactions)
+                else:
+                    new_partition = sobol.update_partition(interactions)
+                model.update_partition(new_partition)
                 space_reconfiguration = None
 
-                if proposed_partition is not None:
-                    model.update_partition(proposed_partition)
             except Exception as e:
                 space_reconfiguration = None
                 print(f"[Sobol] background job failed: {e}")
         t1 = time.time()
         elapsed_train = t1 - t0
         train_times.append(elapsed_train)
-        #model.sobol = sobol 
+        model.sobol = sobol 
         sobol_interactions.append(interactions.copy())
         partition_updates.append(model.partition)
 
@@ -673,8 +699,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
                 try:
                     surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood()
                     surrogate = ExactGPModel(train_x, train_y, surrogate_likelihood)
-                    parallel_model = copy.deepcopy(model)
-                    space_reconfiguration = executor.submit(parallel_model.reconfigure_space, surrogate, surrogate_likelihood)
+                    space_reconfiguration = executor.submit(sobol.update_interactions, train_x, train_y, surrogate, surrogate_likelihood)
                 except Exception as e:
                     space_reconfiguration = None
                     print(f"[Sobol] submit failed: {e}")
@@ -1453,7 +1478,9 @@ def main(argv=None):
 
 if __name__ == '__main__':
     
-    main()
+    f_hart = SyntheticTestFun('hartmann', 6, False, True)
+    run_partitionbo(f_hart, MHGP, kappa=5.0, verbose=True)
+    #main()
     
 
    

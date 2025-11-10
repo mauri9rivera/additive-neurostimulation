@@ -26,6 +26,13 @@ from SALib.sample import sobol as sobol_sampler
 from concurrent.futures import ThreadPoolExecutor
 import warnings
 import traceback
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import train_test_split
+
 
 ### MODULES HANDLING ###
 # If the package structure differs you may need to adjust PYTHONPATH or the imports below
@@ -531,105 +538,7 @@ def method_C(X, groups, D):
     return Ksum
 
 
-### --- Runners --- ### 
-
-def sobol_sensitivity(f_obj, n_samples=1000):
-    """
-    Compute 1st- and 2nd-order Sobol sensitivity indices for a given SyntheticTestFun object.
-
-    Parameters
-    ----------
-    f_obj : SyntheticTestFun
-        The synthetic test function wrapper.
-    n_samples : int
-        Base sample size for Saltelli sampling. Total model evaluations will be larger.
-
-    Returns
-    -------
-    Si : dict
-        Dictionary with 'S1', 'S1_conf', 'S2', 'S2_conf', 'ST', 'ST_conf'
-    """
-    # Define the problem for SALib
-    problem = {
-        'num_vars': f_obj.d,
-        'names': [f"x{i+1}" for i in range(f_obj.d)],
-        'bounds': list(zip(f_obj.lower_bounds, f_obj.upper_bounds))
-    }
-
-    # Generate Saltelli samples
-    param_values = saltelli.sample(problem, n_samples, calc_second_order=True)
-
-    # Evaluate the function
-    X_torch = torch.tensor(param_values, dtype=torch.float32)
-    Y_torch = f_obj.f.forward(X_torch).detach().numpy().flatten()
-
-    # Sobol analysis
-    Si = salib_sobol.analyze(problem, Y_torch, calc_second_order=True, print_to_console=False)
-
-    #print(f"Results for {name} ({dim}D):")
-    #print("First-order indices:", Si['S1'])
-    #print("Second-order indices:", Si['S2'])
-    return Si['S2']
-
-def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
-        """
-        Grid-search UCB maximizer.
-        Returns: new_x (1 x d tensor), ucb_value (float), idx (int)
-        UCB = mean + kappa * std
-        """
-        gp_model.eval()
-        gp_likelihood.eval()
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            post = gp_likelihood(gp_model(grid_points))
-            mean = post.mean           # shape (n_points,)
-            var = post.variance
-            std = var.clamp_min(0.0).sqrt()
-            ucb = mean + kappa_val * std
-
-        best_idx = torch.argmax(ucb).item()
-        best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
-        return best_x, ucb[best_idx].item(), best_idx
-
-def optimize(gp, train_x, train_y, n_iter=10, lr=0.1):
-    """
-    Train an ExactGP + Likelihood model.
-
-    Args:
-        gp: ExactGP model
-        likelihood: gpytorch.likelihoods.GaussianLikelihood
-        train_x: torch.Tensor (n, d)
-        train_y: torch.Tensor (n,)
-        n_iter: int, number of training iterations
-        lr: float, learning rate
-
-    Returns:
-        gp (trained), likelihood (trained), mean_epoch_loss (float)
-    """
-
-    # training inputs alignmnet
-    gp.set_train_data(inputs=train_x, targets=train_y, strict=False)
-
-    gp.train()
-    gp.likelihood.train()
-
-    optimizer = torch.optim.Adam(gp.parameters(), lr=lr)
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(gp.likelihood, gp)
-
-    epoch_losses = []
-    for i in range(n_iter):
-        optimizer.zero_grad()
-        output = gp(train_x)
-        loss = -mll(output, train_y)
-
-        if loss.dim() !=0:
-            loss = loss.sum()
-
-        loss.backward()
-        optimizer.step()
-        epoch_losses.append(loss.item())
-
-    mean_loss = float(np.mean(epoch_losses))
-    return gp, gp.likelihood, mean_loss
+### --- Data processing methods --- ###
 
 def set_experiment(dataset_type):
 
@@ -1234,7 +1143,154 @@ def load_data2(dataset_type, m_i):
     else:
         raise ValueError('The dataset type should be 5d_rat, nhp, rat or spinal' )
         
-### --- BO method --- ###   
+
+### Method to calculate true Sobol Interactions
+
+def build_surrogate(X, Y, type, 
+                    D=2, pce_degree=3):
+    if type == "rf":
+        model = RandomForestRegressor(n_estimators=200, n_jobs=-1)
+        model.fit(X, Y)
+
+        def predict(Xq):
+            model.predict(Xq)
+
+        return predict
+    
+    elif type == "gp":
+
+        kernel = ConstantKernel(1.0, (1e-3, 1e3)) * Matern(length_scale=np.ones(D), nu=2.5) + WhiteKernel(noise_level=1e-6)
+        gpr = GaussianProcessRegressor(kernel=kernel, alpha=0.0, normalize_y=True, n_restarts_optimizer=2)
+        with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                gpr.fit(X, Y)
+        
+        def predict(Xq):
+            # GPR predict returns mean, std; use mean
+            mu = gpr.predict(Xq, return_std=False)
+            return mu
+        
+        return predict
+    
+    elif type == 'pce':
+        degree = pce_degree
+        polyf = PolynomialFeatures(degree=degree, include_bias=True)
+        Xpoly = polyf.fit_transform(X)
+        ridge = Ridge(alpha=1e-6, fit_intercept=False)
+        ridge.fit(Xpoly, Y)
+        def predict(Xq):
+            return ridge.predict(polyf.transform(Xq))
+        return predict
+
+def sobol_interactions(dataset_type, surrogate='rf', N=2048):
+
+    print(f'Sobol 2nd order interactions for {dataset_type}')
+    options = set_experiment(dataset_type)
+
+    S1 = []
+    S2 = []
+
+    for m_i in range(options['n_subjects']):
+
+        subject = load_data2(dataset_type, m_i)
+        X = subject['ch2xy'].astype(float)
+
+        s1 = []
+        s2 = []
+
+        for e_i in range(len(subject['emgs'])):
+
+            Y = subject['sorted_respMean'][:,e_i]
+            X_min, X_max = X.min(axis=0), X.max(axis=0)
+            X_scaled = (X - X_min) / (X_max - X_min)
+
+            D = X_scaled.shape[1]
+            problem = {'num_vars': D, 'names': [f"x{i}" for i in range(D)], 'bounds': [[0,1]]*D}
+            predictor = build_surrogate(X_scaled, Y, surrogate, D = D)
+
+            params = sobol_sampler.sample(problem, N, calc_second_order=True)  
+            Y_samp = predictor(params)
+
+            Si = salib_sobol.analyze(problem, Y_samp, calc_second_order=True, print_to_console=False)  
+            s1.append(Si['S1'])
+            s2.append(Si['S2'])
+
+            for i in range(D):
+                for j in range(i+1, D):
+                    print(f"subject {m_i}, emg {e_i} | {problem['names'][i]} & {problem['names'][j]}: S2 = {Si['S2'][i,j]:.4f}")
+            
+        s2 = np.array(s2)
+        
+        S2.append(np.mean(s2, axis=0))
+
+    overall_avg = np.mean(np.array(S2), axis=0)
+    print("\nAvg second-order interaction terms:")
+    for i in range(D):
+        for j in range(i+1, D):
+            print(f"x{i} & x{j}: Avg S2 = {overall_avg[i,j]:.4f}")
+
+
+### --- BO methods --- ###   
+
+def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
+        """
+        Grid-search UCB maximizer.
+        Returns: new_x (1 x d tensor), ucb_value (float), idx (int)
+        UCB = mean + kappa * std
+        """
+        gp_model.eval()
+        gp_likelihood.eval()
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            post = gp_likelihood(gp_model(grid_points))
+            mean = post.mean           # shape (n_points,)
+            var = post.variance
+            std = var.clamp_min(0.0).sqrt()
+            ucb = mean + kappa_val * std
+
+        best_idx = torch.argmax(ucb).item()
+        best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
+        return best_x, ucb[best_idx].item(), best_idx
+
+def optimize(gp, train_x, train_y, n_iter=10, lr=0.1):
+    """
+    Train an ExactGP + Likelihood model.
+
+    Args:
+        gp: ExactGP model
+        likelihood: gpytorch.likelihoods.GaussianLikelihood
+        train_x: torch.Tensor (n, d)
+        train_y: torch.Tensor (n,)
+        n_iter: int, number of training iterations
+        lr: float, learning rate
+
+    Returns:
+        gp (trained), likelihood (trained), mean_epoch_loss (float)
+    """
+
+    # training inputs alignmnet
+    gp.set_train_data(inputs=train_x, targets=train_y, strict=False)
+
+    gp.train()
+    gp.likelihood.train()
+
+    optimizer = torch.optim.Adam(gp.parameters(), lr=lr)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(gp.likelihood, gp)
+
+    epoch_losses = []
+    for i in range(n_iter):
+        optimizer.zero_grad()
+        output = gp(train_x)
+        loss = -mll(output, train_y)
+
+        if loss.dim() !=0:
+            loss = loss.sum()
+
+        loss.backward()
+        optimizer.step()
+        epoch_losses.append(loss.item())
+
+    mean_loss = float(np.mean(epoch_losses))
+    return gp, gp.likelihood, mean_loss
 
 def neurostim_bo(dataset, model_cls, kappas):
 
@@ -1478,7 +1534,7 @@ def neurostim_bo(dataset, model_cls, kappas):
     print(f'saved results to {results_path}')
 
     
-### --- Parser handling
+### --- Parser handling --- ###
 
 def _parse_list_of_floats(text):
     if text is None:
@@ -1548,4 +1604,6 @@ def main(argv=None):
 if __name__ == '__main__':
         
     #neurostim_bo('5d_rat', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
-    main()
+    #main()
+
+    sobol_interactions('spinal', surrogate='pce')

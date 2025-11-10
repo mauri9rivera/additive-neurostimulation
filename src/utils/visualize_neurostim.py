@@ -10,6 +10,7 @@ from itertools import combinations
 from matplotlib import cm
 from matplotlib.colors import Normalize
 
+from src.neurostim import *
 
 def load_results(filepath):
 
@@ -227,133 +228,6 @@ def partition_metrics(data, dataset_type='nhp', threshold=0.05):
 
     partitions = data['PARTITIONS']
     sobols = data['SOBOLS']
-
-    # 3) Build G_true adjacency matrix using threshold 0.05 (upper diagonal)
-    non_additive = true_sobols > threshold  
-    additive = ~non_additive.copy()
-    np.fill_diagonal(non_additive, False)
-    np.fill_diagonal(additive, False)
-
-    # Count unique undirected true edges (i<j)
-    triu_idx = np.triu_indices(d, k=1)
-    true_non_additive_count = int(np.sum(non_additive[triu_idx])) - f_obj.d
-    true_additive_count = int(((d * (d - 1)) // 2) - true_non_additive_count)
-
-        # Helper: build group_of array from partition P
-    def partition_to_group_of(P):
-        """
-        Convert partition list-of-lists to group_of array of length d.
-        If some indices missing, they remain -1 (shouldn't happen).
-        """
-        group_of = np.full(d, -1, dtype=int)
-        for gid, grp in enumerate(P):
-            for idx in grp:
-                group_of[int(idx)] = gid
-        return group_of
-
-   # Helper: build experiment adjacency matrix from partition snapshot P
-    def build_nonadditivity_graph(P):
-        """
-        P: list of lists (groups). Returns symmetric boolean adjacency matrix (d,d):
-           adj[i,j] = True iff i and j are not in the same group (predicted non-additive / interaction).
-        """
-        adj = np.zeros((d, d), dtype=bool)
-        group_of = partition_to_group_of(P)
-        for i in range(d):
-            for j in range(i + 1, d):
-                adj[i, j] = (group_of[i] != group_of[j])
-                # adj[j,i] will be mirrored below
-        adj = adj | adj.T
-        np.fill_diagonal(adj, False)
-        return adj
-    
-    # 4) For each partition snapshot compute CC and CS
-    cc_list = []
-    cs_list = []
-
-    prev_group_of = None
-    partition_changed_flags = []
-
-    for t, P in enumerate(partitions_all):
-
-        iter_num = n_init + t + 1
-
-        # compute if partition changed since last iteration
-        current_group_of = partition_to_group_of(P)
-        if prev_group_of is None:
-            changed = True  # mark first snapshot as a change (so it can get markers if desired)
-        else:
-            changed = not np.array_equal(prev_group_of, current_group_of)
-        partition_changed_flags.append(bool(changed))
-        prev_group_of = current_group_of.copy()
-
-        # predicted adjacency
-        G_exp = build_nonadditivity_graph(P)
-        non_additive_overlap = np.logical_and(non_additive, G_exp)
-        non_additive_overlap_count = int(np.sum(non_additive_overlap[triu_idx]))
-
-        # CC = fraction of true non-additive edges recovered
-        if true_non_additive_count > 0:
-            CC = non_additive_overlap_count / true_non_additive_count
-        else:
-            CC = 0.0
-
-        # Count true additive (non-edge) that are predicted non-edge
-        # predicted non-edge matrix:
-        nonedge_pred = ~G_exp
-        # true additive & predicted non-edge
-        additive_overlap = np.logical_and(additive, nonedge_pred)
-        np.fill_diagonal(additive_overlap, False)
-        additive_overlap_count = int(np.sum(additive_overlap[triu_idx]))
-
-        if true_additive_count > 0:
-            CS = additive_overlap_count / true_additive_count
-        else:
-            CS = 0.0
-
-        cc_list.append(CC)
-        cs_list.append(CS)
-
-
-    # 5) Plot CC and CS vs iteration
-    plt.figure(figsize=(9, 5))
-    update_iters = list(range(n_iter))
-    x = np.array(update_iters)
-
-    # n_init_padding
-    cc_list = [0.0] * n_init + cc_list
-    cs_list = [0.0] * n_init + cs_list
-    partition_changed_flags = [False] * n_init + partition_changed_flags
-
-    color = 'green' if model_cls.__name__ == 'SobolGP' else 'orange'
-
-    # Plot CC (match of true edges)
-    plt.plot(x, cc_list, label='CC (true-edge overlap)', linestyle='-', color=color)
-    change_x = x[np.array(partition_changed_flags, dtype=bool)]
-    change_cc = np.array(cc_list)[np.array(partition_changed_flags, dtype=bool)]
-    if change_x.size > 0:
-        plt.plot(change_x, change_cc, linestyle='None', marker='o', color=color)
-
-    # Plot CS (match of true non-edges)
-    plt.plot(x, cs_list, label='CS (true-nonedge overlap)', linestyle='--', color='dimgrey')
-    change_cs = np.array(cs_list)[np.array(partition_changed_flags, dtype=bool)]
-    if change_x.size > 0:
-        plt.plot(change_x, change_cs, linestyle='None', marker='s', color='dimgrey')
-
-    plt.xlabel('Iteration')
-    plt.ylabel('Reconstruction score')
-    plt.ylim(0.0, 1.1)
-    plt.title(f'Partition reconstruction for {dataset_type} kappa{kappa} |  (Additivity threshold={threshold})')
-    plt.grid(True)
-    plt.legend()
-    
-    output_dir = os.path.join('output', 'neurostim_experiments', dataset_type)
-    os.makedirs(output_dir, exist_ok=True)
-    fname = f'partition_recon_{dataset_type}_kappa{kappa}.png'
-    outpath = os.path.join(output_dir, fname)
-    plt.savefig(outpath, dpi=200)
-
-   
 
     ### Figure 2: Sobol interaction traces
     pairs = [(i, j) for i in range(d) for j in range(i+1, d)]
