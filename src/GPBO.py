@@ -1003,8 +1003,8 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
 
     # Map models -> (class, color, label, kappa)
     model_specs = [
-        (ExactGPModel, 'red',  'ExactGPModel',    kappas[0]),
-        (AdditiveKernelGP, 'blue', 'AdditiveGP',   kappas[1]),
+        (ExactGP, 'red',  'ExactGPModel',    kappas[0]),
+        (AdditiveGP, 'blue', 'AdditiveGP',   kappas[1]),
         (SobolGP, 'green', 'SobolGP',             kappas[2]),
         (MHGP, 'orange', 'MHGP',                  kappas[3])
     ]
@@ -1080,7 +1080,7 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
     output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
     os.makedirs(output_dir, exist_ok=True)
     dim = f_obj.d
-    perf_filename = f'explr-explt_{dim}d-{f_obj.name}_budget{n_iter}_local.svg'
+    perf_filename = f'explr-explt_{dim}d-{f_obj.name}_budget{n_iter}.svg'
     perf_path = os.path.join(output_dir, perf_filename)
     plt.savefig(perf_path, format='svg')
     plt.close(fig1)
@@ -1133,7 +1133,7 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
     ax2.grid(True)
     ax2.legend(loc='upper right', fontsize='small')
 
-    regrets_filename = f'regrets_{dim}d-{f_obj.name}_budget{n_iter}_local.svg'
+    regrets_filename = f'regrets_{dim}d-{f_obj.name}_budget{n_iter}.svg'
     regrets_path = os.path.join(output_dir, regrets_filename)
     plt.savefig(regrets_path, format='svg')
     plt.close(fig2)
@@ -1377,7 +1377,7 @@ def main(argv=None):
 
     # Method selection
     parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, kappa_search, optimization_metrics, partition_reconstruction')
-    parser.add_argument('--model_cls', type=str, default='ExactGPModel', help='Model class name (ExactGPModel, AdditiveKernelGP, SobolGP, MHGP, BaseGP)')
+    parser.add_argument('--model_cls', type=str, default='ExactGP', help='Model class name (ExactGP, AdditiveGP, SobolGP, MHGP)')
     parser.add_argument('--bo_method', type=str, default='run_bo', help='BO method used by higher-level routines (run_bo or run_partitionbo)')
     parser.add_argument('--acq_method', type=str, default='grid', help='Acquisition function scoring method (botorch or grid)')
 
@@ -1400,8 +1400,8 @@ def main(argv=None):
 
     # Allowed mappings (whitelist)
     model_map = {
-        'ExactGPModel': ExactGP,
-        'AdditiveKernelGP': AdditiveGP,
+        'ExactGP': ExactGP,
+        'AdditiveGP': AdditiveGP,
         'SobolGP': SobolGP,
         'MHGP': MHGP,
     }
