@@ -89,7 +89,7 @@ class MHGP(gpytorch.models.ExactGP):
         self.sobol = sobol
         self.name = 'MHGP'
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
+        self.epsilon = 0.05 - 0.02 * min(1.0, (self.n_dims**2 / 30.0))
         self.split_bias = 0.7
 
         #build covar_module based on partition
@@ -281,7 +281,7 @@ class SobolGP(gpytorch.models.ExactGP):
         self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
         self.sobol = sobol
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
+        self.epsilon = 0.05 - 0.02 * min(1.0, (self.n_dims**2 / 30.0))
         self.name = 'SobolGP'
         # build covar_module based on partition
         self._build_covar()
@@ -351,7 +351,7 @@ class Sobol:
             If None, some default (e.g. 1024) will be chosen.
         """
         d = f_obj.d
-        self.epsilon = 0.05 #- 0.02 * min(1.0, (d**2 / 40.0))
+        self.epsilon = 0.05 - 0.02 * min(1.0, (d**2 / 30.0))
         self.n_sobol_samples = n_sobol_samples
         self.problem = self._build_problem(f_obj)  # to be set up when know input bounds and d
 
@@ -650,7 +650,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
 
     # Pre-train a surrogate (ExactGP) on initial data to seed the first sobol job
     surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood()
-    surrogate = ExactGPModel(train_x, train_y, surrogate_likelihood)
+    surrogate = ExactGP(train_x, train_y, surrogate_likelihood)
     surrogate, surrogate_likelihood, _ = optimize(surrogate, train_x, train_y)
     interactions = model.sobol.update_interactions(train_x, train_y, surrogate, surrogate_likelihood)
     
@@ -737,7 +737,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
             if space_reconfiguration is None or space_reconfiguration.done():
                 try:
                     surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood()
-                    surrogate = ExactGPModel(train_x, train_y, surrogate_likelihood)
+                    surrogate = ExactGP(train_x, train_y, surrogate_likelihood)
                     space_reconfiguration = executor.submit(sobol.update_interactions, train_x, train_y, surrogate, surrogate_likelihood)
                 except Exception as e:
                     space_reconfiguration = None
@@ -984,7 +984,7 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
     """
     Run BO variants for f_obj and plot:
       - Plot 1: Exploration (dashed), Exploitation (solid) averaged across n_reps
-                    for ExactGPModel (red), AdditiveKernelGP (blue), SobolGP (green), MHGP (orange)
+                    for ExactGP (red), AdditiveGP (blue), SobolGP (green), MHGP (orange)
       - Plot 2: Mean regret +/- CI, plotted on a log y-scale (log-regrets)
     Results saved to: output/synthetic_experiments/<f_obj.name>/results_<f_obj.name>-<dim>_<date>.svg
 
@@ -994,7 +994,7 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
         Objective function object (expects .name and .f.d attributes used in filename).
     kappas : sequence-like of length 4
         kappa values for the four models in order:
-         [ExactGPModel, AdditiveKernelGP, SobolGP, MHGP]
+         [ExactGP, AdditiveGP, SobolGP, MHGP]
     n_init, n_iter, n_reps : ints
         BO parameters (passed to run_bo/run_sobolbo)
     ci : int (default=95)
@@ -1003,7 +1003,7 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
 
     # Map models -> (class, color, label, kappa)
     model_specs = [
-        (ExactGP, 'red',  'ExactGPModel',    kappas[0]),
+        (ExactGP, 'red',  'ExactGP',    kappas[0]),
         (AdditiveGP, 'blue', 'AdditiveGP',   kappas[1]),
         (SobolGP, 'green', 'SobolGP',             kappas[2]),
         (MHGP, 'orange', 'MHGP',                  kappas[3])
@@ -1064,10 +1064,8 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
         kappa = vals['kappa']
         T = exploit.shape[0]
         it = np.arange(1, T + 1)
-        if explore.size >= T:
-            ax1.plot(it, explore[:T], linestyle='-', color=color, label=f'{label} kappa {kappa}')
-        if exploit.size >= T:
-            ax1.plot(it, exploit[:T], linestyle='--', color=color)
+        ax1.plot(it, explore[:T], linestyle='-', color=color, label=f'{label} kappa {kappa}')
+        ax1.plot(it, exploit[:T], linestyle='--', color=color)
 
     ax1.set_xlabel('Iteration')
     ax1.set_ylabel('Metric')
@@ -1439,8 +1437,7 @@ def main(argv=None):
         raise ValueError("bo_method must be 'grid' or 'botorch'")
 
     model_cls = model_map[args.model_cls]
-    method = method_map[args.method]
-    bo_method = method_map[args.bo_method]
+    bo_method = run_partitionbo if args.model_cls in ['MHGP', 'SobolGP'] else run_bo
 
     # Construct SyntheticTestFun object
     if args.dim is None:
