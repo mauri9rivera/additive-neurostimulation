@@ -21,6 +21,9 @@ from SALib.analyze import sobol as salib_sobol
 from SALib.sample import saltelli
 from SALib.sample import sobol as sobol_sampler
 
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import warnings
@@ -80,17 +83,18 @@ class AdditiveGP(gpytorch.models.ExactGP):
 
 class MHGP(gpytorch.models.ExactGP):
 
-    def __init__(self, train_x, train_y, likelihood, partition = None, sobol=None, epsilon=5e-2):
+    def __init__(self, train_x, train_y, likelihood, partition = None, history = None, sobol=None, epsilon=5e-2):
 
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean() 
-        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
-        self.history = [self.partition_to_key(self.partition)]
+        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
+        self.history = history if history else [self.partition_to_key(self.partition)] 
         self.sobol = sobol
         self.name = 'MHGP'
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.05 - 0.02 * min(1.0, (self.n_dims**2 / 30.0))
+        self.epsilon = 0.05 # - 0.02 * min(1.0, (self.n_dims**2 / 30.0))
         self.split_bias = 0.7
+        self.max_attempts = self.bell_number(self.n_dims)
 
         #build covar_module based on partition
         self._build_covar()
@@ -115,24 +119,7 @@ class MHGP(gpytorch.models.ExactGP):
         self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)
 
     def partition_to_key(self, partition):
-        """
-        Return a canonical, hashable key for `partition`.
-        Canonicalization:
-          - convert each subgroup elements to int and sort within subgroup
-          - drop empty groups
-          - sort the list of groups lexicographically
-        Result: tuple(tuple(...), tuple(...), ...)
-        """
-        groups = []
-        for grp in partition:
-            if len(grp) == 0:
-                continue
-            # ensure ints and sorted within group
-            sorted_grp = tuple(sorted(int(x) for x in grp))
-            groups.append(sorted_grp)
-        # sort the groups lexicographically to make partition order-insensitive
-        key = tuple(sorted(groups))
-        return key
+        return tuple(sorted(tuple(sorted(sub)) for sub in partition))
 
     def check_history(self, new_partition):
         """
@@ -158,7 +145,10 @@ class MHGP(gpytorch.models.ExactGP):
         has_candidate = False
         attempts = 0
 
-        while not has_candidate and attempts < 100:
+        if len(self.history) == self.max_attempts:
+            return old_partition
+
+        while not has_candidate and attempts < (self.max_attempts + 5):
 
             new_partition = copy.deepcopy(self.partition)
             
@@ -209,8 +199,17 @@ class MHGP(gpytorch.models.ExactGP):
  
             attempts +=1
 
-        print(f'Number of attempts exceedded')
+        #print(f'Number of attempts exceedded')
         return old_partition
+
+    def bell_number(self, n):
+        bell = [[0]*(n+1) for _ in range(n+1)]
+        bell[0][0] = 1
+        for i in range(1, n+1):
+            bell[i][0] = bell[i-1][i-1]
+            for j in range(1, i+1):
+                bell[i][j] = bell[i-1][j-1] + bell[i][j-1]
+        return bell[n][0]
 
     def are_additive(self, individual, set, interactions):
 
@@ -246,8 +245,10 @@ class MHGP(gpytorch.models.ExactGP):
 
         # update sobol interactions from surrogate model training
         new_partition = self.sobol_partitioning(interactions)
+        if new_partition == self.partition:
+            return self.partition
         proposed_model = MHGP(self.train_inputs[0], self.train_targets, gpytorch.likelihoods.GaussianLikelihood(), 
-                              partition=new_partition)
+                              partition=new_partition, history=self.history, sobol=self.sobol)
         proposed_model.to(device)
         proposed_model.likelihood.to(device)
         proposed_model, proposed_model.likelihood, _ = optimize(proposed_model, proposed_model.train_inputs[0], proposed_model.train_targets)
@@ -275,13 +276,14 @@ class SobolGP(gpytorch.models.ExactGP):
     - sobol: an associated Sobol object (optional)
     - epsilon: additivity threshold (kept as attribute)
     """
-    def __init__(self, train_x, train_y, likelihood, partition=None, sobol=None, epsilon=5e-2):
+    def __init__(self, train_x, train_y, likelihood, partition=None, history = None, sobol=None, epsilon=5e-2):
         super(SobolGP, self).__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean()
-        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
+        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
+        self.history = history if history else None
         self.sobol = sobol
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.05 - 0.02 * min(1.0, (self.n_dims**2 / 30.0))
+        self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 30.0))
         self.name = 'SobolGP'
         # build covar_module based on partition
         self._build_covar()
@@ -351,7 +353,7 @@ class Sobol:
             If None, some default (e.g. 1024) will be chosen.
         """
         d = f_obj.d
-        self.epsilon = 0.05 - 0.02 * min(1.0, (d**2 / 30.0))
+        self.epsilon = 0.05 # - 0.02 * min(1.0, (d**2 / 30.0))
         self.n_sobol_samples = n_sobol_samples
         self.problem = self._build_problem(f_obj)  # to be set up when know input bounds and d
 
@@ -371,7 +373,7 @@ class Sobol:
 
         return problem
 
-    def update_interactions(self, train_x, train_y, simulator, likelihood):
+    def update_interactions_gp(self, train_x, train_y, simulator, likelihood):
         """
         train_x: Tensor (n, d) or array
         train_y: Tensor or array (n,) or (n,1)
@@ -406,7 +408,7 @@ class Sobol:
 
             # Determine how many samples to use
             N = self.n_sobol_samples or (n // (2 * (d + 2)))
-            N = max(N, 128)
+            N = max(N, 2048)
 
             # Generate Saltelli samples
             param_values = sobol_sampler.sample(self.problem, N, calc_second_order=True, skip_values=N*2)
@@ -433,7 +435,6 @@ class Sobol:
                 d = self.problem['num_vars']
                 S2_sym = np.zeros((d, d), dtype=float)
                 np.fill_diagonal(S2_sym, 0.0)
-                self.interactions = S2_sym
                 return S2_sym
 
             # Analyze with SALib
@@ -441,9 +442,6 @@ class Sobol:
                 self.problem, y_s,
                 calc_second_order=True, print_to_console=False
             )
-
-            if 'S2' not in Si:
-                raise RuntimeError("SALib did not return 'S2'. Ensure calc_second_order=True.")
 
             # Build symmetric interactions matrix
             S2 = np.asarray(Si['S2'], dtype=float)
@@ -462,6 +460,58 @@ class Sobol:
             traceback.print_exc(file=sys.stdout)
             # re-raise so the Future contains the exception (better than returning None)
             raise
+
+    def update_interactions(self, train_x, train_y, simulator, likelihood,
+                                n_estimators=100, max_depth=None, 
+                                min_samples_split=2, min_samples_leaf=1, bootstrap=True):
+
+        x = train_x.detach().cpu().numpy()
+        y = train_y.detach().cpu().numpy()
+        y = y.reshape(-1)
+        n, d = x.shape
+        # Train Random Forest
+        rf_model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            bootstrap=bootstrap,
+            random_state=42,  # for reproducibility
+            n_jobs=-1  # use all available cores
+        )
+        
+        rf_model.fit(x, y)
+
+        # Determine number of samples for Sobol analysis
+        N = self.n_sobol_samples or (n // (2 * (d + 2)))
+        N = max(N, 2048)
+
+        # Generate Saltelli samples
+        param_values = sobol_sampler.sample(self.problem, N, calc_second_order=True, skip_values=N*2)
+        param_values = np.asarray(param_values, dtype=np.float32)
+        
+        # Use Random Forest to predict (very fast)
+        y_s = rf_model.predict(param_values)
+        
+        if np.var(y_s) < 1e-12 or np.unique(y_s).size <= 1:
+            d = self.problem['num_vars']
+            S2_sym = np.zeros((d, d), dtype=float)
+            np.fill_diagonal(S2_sym, 0.0)
+            return S2_sym
+
+        # Analyze with SALib
+        Si = salib_sobol.analyze(
+            self.problem, y_s,
+            calc_second_order=True, print_to_console=False
+        )
+
+        # Build symmetric interactions matrix
+        S2 = np.asarray(Si['S2'], dtype=float)
+        S2 = np.nan_to_num(S2, nan=0.0)
+        S2 = np.clip(S2, a_min=0.0, a_max=None)
+        np.fill_diagonal(S2, 1.0)
+
+        return S2
 
     def update_partition(self, interactions):
         """
@@ -494,7 +544,7 @@ class Sobol:
                 for x in sub:
                     if modif:
                         break
-                    if interactions[x, e] > self.epsilon:
+                    if interactions[e, x] > self.epsilon:
                         additive = False
                         sub.append(e)
                         modif = True
@@ -538,10 +588,6 @@ def sobol_sensitivity(f_obj, n_samples=1000):
 
     # Sobol analysis
     Si = salib_sobol.analyze(problem, Y_torch, calc_second_order=True, print_to_console=False)
-
-    #print(f"Results for {name} ({dim}D):")
-    #print("First-order indices:", Si['S1'])
-    #print("Second-order indices: \n", Si['S2'])
     return Si['S2']
 
 def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
@@ -668,8 +714,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
             # Next point
             warnings.filterwarnings("ignore", category=RuntimeWarning)
             new_x, _ = optimize_acqf(
-                acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512)
-            
+                acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512)        
         else:
             new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
 
@@ -729,7 +774,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
         elapsed_train = t1 - t0
         train_times.append(elapsed_train)
         model = model_cls(train_x, train_y, likelihood,
-                          model.partition, model.sobol) 
+                          model.partition, model.history, model.sobol) 
         
 
         # Submit a new Sobol background job every n_sobol iterations (if none pending)
@@ -958,8 +1003,8 @@ def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_init=1, n_iter=100, n_r
         explore_padded = np.concatenate([np.zeros(n_init), mean_explore])
         exploit_padded = np.concatenate([np.zeros(n_init), mean_exploit])
         # plot exploration as dashed line
-        plt.plot(x, explore_padded, linestyle='--', marker=None, label=f'k={kappa} Explore', color=color)
-        plt.plot(x, exploit_padded, linestyle='-', marker=None, color=color)
+        plt.plot(x, explore_padded, linestyle='-', marker=None, label=f'k={kappa} Explore', color=color)
+        plt.plot(x, exploit_padded, linestyle='--', marker=None, color=color)
 
 
     plt.xlabel('Iteration')
@@ -1299,9 +1344,10 @@ def partition_reconstruction(f_obj,  model_cls, n_init=1, n_iter=200, n_reps= 10
     n_pairs = len(pairs)
     nrows = int(n_pairs)
 
-    fig2, axes = plt.subplots(nrows, 1, figsize=(8, 1.8*nrows + 1.5), squeeze=False)
+    fig2, axes = plt.subplots(nrows, 1, figsize=(8, 3*nrows + 1), squeeze=False)
     axes_flat = axes.flatten()
     color = 'green' if model_cls.__name__ == 'SobolGP' else 'orange'
+    labels = ['True interaction', 'Additivity threshold', 'Predicted interaction']
 
     x_full = np.arange(1, n_iter + 1)
     for idx, (i, j) in enumerate(pairs):
@@ -1309,7 +1355,8 @@ def partition_reconstruction(f_obj,  model_cls, n_init=1, n_iter=200, n_reps= 10
 
         # Plot true as horizontal black line
         true_sobol = float(sobols_sym[i,j])
-        ax.plot(x_full, [true_sobol]*x_full.shape[0], color='black', linestyle='--', linewidth=1.2)
+        true_label = ax.plot(x_full, [true_sobol]*x_full.shape[0], color='black', linestyle='--', linewidth=1.2)
+        threshold_label = ax.plot(x_full, [threshold]*x_full.shape[0], color='red', linestyle='--', linewidth=1.2)
 
         # Estimated sobol interaction curve
         surrogate_mean = []
@@ -1321,11 +1368,11 @@ def partition_reconstruction(f_obj,  model_cls, n_init=1, n_iter=200, n_reps= 10
                 sobol_trace.append(float(surrogate_estimation[i][j]))
             sobol_trace = np.asarray(sobol_trace, dtype=float)
             surrogate_mean.append(sobol_trace)
-            ax.plot(x_full, sobol_trace, color=color, linestyle='-', alpha=0.4)
+            ax.plot(x_full, sobol_trace, color=color, linestyle='-', alpha=0.1)
 
         surrogate_mean = np.asarray(surrogate_mean)
         surrogate_mean = np.mean(surrogate_mean, axis=0)
-        ax.plot(x_full, surrogate_mean, color=color, linestyle='-')
+        prediction_label = ax.plot(x_full, surrogate_mean, color=color, linestyle='-')
 
         ax.set_ylim(-0.1, 1.0)
         ax.set_xlim(1, n_iter)
@@ -1337,9 +1384,10 @@ def partition_reconstruction(f_obj,  model_cls, n_init=1, n_iter=200, n_reps= 10
     wrapped_title = textwrap.fill(raw_title, width=80)
 
     fig2.suptitle(wrapped_title, fontsize=14)
-    plt.tight_layout(rect=[0, 0.02, 1, 0.96])
+    fig2.legend([true_label, threshold_label, prediction_label], labels=labels, loc="upper right", bbox_to_anchor=(0.9, 0.9))
+    plt.tight_layout()
 
-    sobol_fname = f'sobol_recon_{model_cls.__name__}_{f_obj.d}d={f_obj.name}_kappa{kappa}.svg'
+    sobol_fname = f'sobol_recon_{model_cls.__name__}_{f_obj.d}d-{f_obj.name}_kappa{kappa}.svg'
     outpath = os.path.join(output_dir, sobol_fname)
     fig2.savefig(outpath)
     plt.close(fig2)
@@ -1492,6 +1540,8 @@ def main(argv=None):
 if __name__ == '__main__':
 
     main()
+    #run_partitionbo(SyntheticTestFun('twoblobs', 2, False, False), SobolGP, n_iter=100, n_sobol=20, kappa=1.0)
+    #partition_reconstruction(SyntheticTestFun('twoblobs', 2, False, False), SobolGP, n_iter=100, n_reps=10, n_sobol=20, kappa=1.0)
     
     
 

@@ -291,7 +291,7 @@ class neuralMHGP(gpytorch.models.ExactGP):
         self.sobol = sobol
         self.name = 'neuralMHGP'
         self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
-        self.split_bias = 0.5
+        self.split_bias = 0.7
 
         #build covar_module based on partition
         self.lengthscale_prior = lengthscale_prior
@@ -867,18 +867,18 @@ def load_data2(dataset_type, m_i):
         match m_i:
             case 0:
                 data = scipy.io.loadmat(f'{path_to_dataset}/BCI00_5D.mat')
-                emgs = np.array(['left extensor carpi radialis', 'biceps', 'triceps',
-                                 'left flexor carpi ulnaris', 'unknown']),
+                emgs = ['left extensor carpi radialis', 'biceps', 'triceps',
+                                 'left flexor carpi ulnaris', 'unknown']
                 dim_sizes = np.array([8, 4, 4, 4, 4])
             case 1:
                 data = scipy.io.loadmat(f'{path_to_dataset}/rCer1.5_5D.mat')
-                emgs = np.array(['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
-                                 'left biceps']),
+                emgs = ['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
+                                 'left biceps']
                 dim_sizes = np.array([8, 4, 4, 4, 4])
             case 2:
                 data = scipy.io.loadmat(f'{path_to_dataset}/rData03_5D.mat')
-                emgs = np.array(['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
-                                    'left pectoralis']),
+                emgs = ['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
+                                    'left pectoralis']
                 dim_sizes = np.array([8, 4, 3, 4, 4])
 
         resp = data['emg_response']
@@ -1182,12 +1182,11 @@ def build_surrogate(X, Y, type,
             return ridge.predict(polyf.transform(Xq))
         return predict
 
-def sobol_interactions(dataset_type, surrogate='rf', N=2048):
+def sobol_interactions(dataset_type, surrogate='rf', N=4096):
 
     print(f'Sobol 2nd order interactions for {dataset_type}')
     options = set_experiment(dataset_type)
 
-    S1 = []
     S2 = []
 
     for m_i in range(options['n_subjects']):
@@ -1197,6 +1196,7 @@ def sobol_interactions(dataset_type, surrogate='rf', N=2048):
 
         s1 = []
         s2 = []
+        n_reps = 30
 
         for e_i in range(len(subject['emgs'])):
 
@@ -1206,8 +1206,9 @@ def sobol_interactions(dataset_type, surrogate='rf', N=2048):
 
             D = X_scaled.shape[1]
             problem = {'num_vars': D, 'names': [f"x{i}" for i in range(D)], 'bounds': [[0,1]]*D}
+            
+            
             predictor = build_surrogate(X_scaled, Y, surrogate, D = D)
-
             params = sobol_sampler.sample(problem, N, calc_second_order=True)  
             Y_samp = predictor(params)
 
@@ -1215,9 +1216,25 @@ def sobol_interactions(dataset_type, surrogate='rf', N=2048):
             s1.append(Si['S1'])
             s2.append(Si['S2'])
 
+            emg_avg = []
+            for rep_i in range(n_reps):
+                predictor = build_surrogate(X_scaled, Y, surrogate, D = D)
+                params = sobol_sampler.sample(problem, N, calc_second_order=True)  
+                Y_samp = predictor(params)
+                Si = salib_sobol.analyze(problem, Y_samp, calc_second_order=True, print_to_console=False)  
+                emg_avg.append(Si['S2'])
+
             for i in range(D):
                 for j in range(i+1, D):
-                    print(f"subject {m_i}, emg {e_i} | {problem['names'][i]} & {problem['names'][j]}: S2 = {Si['S2'][i,j]:.4f}")
+
+                    interactions = []
+                    for rep_i in range(n_reps):
+                        ref = emg_avg[rep_i]
+                        interactions.append(ref[i,j])
+
+                    interactions = np.asarray(interactions)
+                    avg_interaction = np.mean(interactions, axis=0)
+                    print(f"subject {m_i}, emg {e_i} | {problem['names'][i]} & {problem['names'][j]}: S2 = {avg_interaction:.4f}")
             
         s2 = np.array(s2)
         
@@ -1606,4 +1623,4 @@ if __name__ == '__main__':
     #neurostim_bo('5d_rat', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
     #main()
 
-    sobol_interactions('spinal', surrogate='pce')
+    sobol_interactions('5d_rat', surrogate='pce')
