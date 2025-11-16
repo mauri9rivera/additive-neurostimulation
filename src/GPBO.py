@@ -21,6 +21,12 @@ from SALib.analyze import sobol as salib_sobol
 from SALib.sample import saltelli
 from SALib.sample import sobol as sobol_sampler
 
+from UQpy.sensitivity.PceSensitivity import PceSensitivity
+from UQpy.distributions import Uniform, JointIndependent
+from UQpy.surrogates import *
+from UQpy.surrogates.polynomial_chaos.PolynomialChaosExpansion import PolynomialChaosExpansion
+
+
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
 
@@ -279,7 +285,7 @@ class SobolGP(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, partition=None, history = None, sobol=None, epsilon=5e-2):
         super(SobolGP, self).__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean()
-        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
+        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
         self.history = history if history else None
         self.sobol = sobol
         self.n_dims = train_x.shape[-1]
@@ -373,102 +379,128 @@ class Sobol:
 
         return problem
 
-    def update_interactions_gp(self, train_x, train_y, simulator, likelihood):
-        """
-        train_x: Tensor (n, d) or array
-        train_y: Tensor or array (n,) or (n,1)
-        simulator: a trained ExactGP model
-        likelihood: corresponding GPyTorch likelihood
+    def bell_number(self, n):
+        bell = [[0]*(n+1) for _ in range(n+1)]
+        bell[0][0] = 1
+        for i in range(1, n+1):
+            bell[i][0] = bell[i-1][i-1]
+            for j in range(1, i+1):
+                bell[i][j] = bell[i-1][j-1] + bell[i][j-1]
+        return bell[n][0]
 
-        Returns:
-          interactions: numpy array (d, d), symmetric, with entries S2[i,j]
+    def update_interactions(self, train_x, train_y, simulator, likelihood):
         """
-
+        Calculate second-order Sobol indices using GP metamodel as described in the paper.
         
-        # train surrogate model
-        simulator, likelihood, _ = optimize(simulator, train_x, train_y,)
+        Args:
+            train_x: Tensor (n, d) or array - training inputs
+            train_y: Tensor or array (n,) or (n,1) - training outputs  
+            simulator: trained ExactGP model
+            likelihood: corresponding GPyTorch likelihood            
+        Returns:
+            interactions: numpy array (d, d), symmetric, with entries S2[i,j]
+        """
+        
+        # Retrain the surrogate model
+        simulator, likelihood, _ = optimize(simulator, train_x, train_y)
+        
+        n, d = train_x.shape
+        
+        # Determine number of Monte Carlo samples
+        N = self.n_sobol_samples or (n // (2 * (d + 2)))
+        N = max(N, 2048)
+        
+        # Generate Saltelli samples
+        param_values = sobol_sampler.sample(self.problem, N, calc_second_order=True, skip_values=N*2)
+        param_values = np.asarray(param_values, dtype=np.float32)
+        
+        M = param_values.shape[0] // (2 * d + 2)  # Actual number of MC samples per matrix
+        
+        # Split Saltelli samples into matrices A, B, and hybrid matrices
+        # Saltelli sequence: [A, B, AB_1, AB_2, ..., AB_d, BA_1, BA_2, ..., BA_d]
+        A = param_values[:M]  # First M samples
+        B = param_values[M:2*M]  # Next M samples
+        
+        # Extract hybrid matrices A_B_i and B_A_i
+        A_B = {}  # A with i-th column from B
+        B_A = {}  # B with i-th column from A
+        
+        for i in range(d):
+            start_idx = 2*M + i*M
+            A_B[i] = param_values[start_idx:start_idx + M]
+            
+            start_idx = 2*M + d*M + i*M  
+            B_A[i] = param_values[start_idx:start_idx + M]
+        
+        # Convert to torch tensors
+        device = train_x.device
+        dtype = train_x.dtype
+        
+        A_tensor = torch.tensor(A, device=device, dtype=dtype)
+        B_tensor = torch.tensor(B, device=device, dtype=dtype)
+        
+        # Evaluate GP at all points
+        simulator.eval()
+        likelihood.eval()
+        
+        with torch.no_grad():
+            # Evaluate at A and B
+            pred_A = likelihood(simulator(A_tensor)).mean.cpu().numpy().flatten()
+            pred_B = likelihood(simulator(B_tensor)).mean.cpu().numpy().flatten()
+            
+            # Evaluate at hybrid matrices
+            pred_A_B = {}
+            pred_B_A = {}
+            
+            for i in range(d):
+                A_B_tensor = torch.tensor(A_B[i], device=device, dtype=dtype)
+                B_A_tensor = torch.tensor(B_A[i], device=device, dtype=dtype)
+                
+                pred_A_B[i] = likelihood(simulator(A_B_tensor)).mean.cpu().numpy().flatten()
+                pred_B_A[i] = likelihood(simulator(B_A_tensor)).mean.cpu().numpy().flatten()
+        
+        # Calculate variance term V[fGP_N([A B])]
+        all_preds = np.concatenate([pred_A, pred_B])
+        V = np.var(all_preds)
+        
+        # Calculate first order indices S_i (needed for second order)
+        S_i = np.zeros(d)
+        for i in range(d):
+            numerator = np.mean(pred_B * (pred_A_B[i] - pred_A))
+            S_i[i] = numerator / V
+        
+        # Calculate second order indices S_ij using Equation (20) from the paper
+        interactions = np.zeros((d, d))
+        
+        for i in range(d):
+            for j in range(d):
+                if i != j:  # Second order indices are for i ≠ j
+                    # Equation (20): S_ij = [1/M * sum(fGP(B_A_i) * fGP(A_B_j) - fGP(A) * fGP(B))] / V - S_i - S_j
+                    term1 = np.mean(pred_B_A[i] * pred_A_B[j] - pred_A * pred_B)
+                    S_ij = (term1 / V) - S_i[i] - S_i[j]
+                    interactions[i, j] = max(S_ij, 0)  # Sobol indices should be non-negative
+                else:
+                    # Diagonal elements are not second-order indices (set to 0)
+                    interactions[i, j] = 1.0
+        
+        # Make symmetric (S_ij = S_ji in Sobol decomposition)
+        for i in range(d):
+            for j in range(i+1, d):
+                avg = (interactions[i, j] + interactions[j, i]) / 2
+                interactions[i, j] = avg
+                interactions[j, i] = avg
+        
+        return interactions
 
-        try:
-
-            # Convert to numpy
-            if isinstance(train_x, torch.Tensor):
-                x = train_x.detach().cpu().numpy()
-            else:
-                x = np.asarray(train_x)
-
-            if isinstance(train_y, torch.Tensor):
-                y = train_y.detach().cpu().numpy()
-            else:
-                y = np.asarray(train_y)
-
-            # Flatten y
-            y = y.reshape(-1)
-
-            n, d = x.shape
-
-            # Determine how many samples to use
-            N = self.n_sobol_samples or (n // (2 * (d + 2)))
-            N = max(N, 2048)
-
-            # Generate Saltelli samples
-            param_values = sobol_sampler.sample(self.problem, N, calc_second_order=True, skip_values=N*2)
-
-            # Evaluate simulator at param_values
-            param_values = np.asarray(param_values, dtype=np.float32)
-            m_total = param_values.shape[0]
-            y_s_list = []
-            batch_size = 2048
-
-            simulator.eval(), likelihood.eval()
-            with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                for start in range(0, m_total, batch_size):
-                    end = min(start + batch_size, m_total)
-                    batch_np = param_values[start:end]
-                    batch_t = torch.from_numpy(batch_np).float()
-                    post = likelihood(simulator(batch_t))
-                    y_s_list.append(post.mean.cpu().numpy())
-
-            y_s = np.concatenate(y_s_list, axis=0)
-
-            if np.var(y_s) < 1e-12 or np.unique(y_s).size <= 1:
-                # Option A: return zero interactions (no interactions found)
-                d = self.problem['num_vars']
-                S2_sym = np.zeros((d, d), dtype=float)
-                np.fill_diagonal(S2_sym, 0.0)
-                return S2_sym
-
-            # Analyze with SALib
-            Si = salib_sobol.analyze(
-                self.problem, y_s,
-                calc_second_order=True, print_to_console=False
-            )
-
-            # Build symmetric interactions matrix
-            S2 = np.asarray(Si['S2'], dtype=float)
-            S2 = np.nan_to_num(S2, nan=0.0)
-            S2 = np.clip(S2, a_min=0.0, a_max=None)
-
-            # Symmetrize and zero diagonal
-            #S2_sym = 0.5 * (S2 + S2.T)
-            np.fill_diagonal(S2, 1.0)
-
-            return S2
-
-
-        except Exception as e:
-            print("compute_interactions: EXCEPTION:", e)
-            traceback.print_exc(file=sys.stdout)
-            # re-raise so the Future contains the exception (better than returning None)
-            raise
-
-    def update_interactions(self, train_x, train_y, simulator, likelihood,
+    def update_interactions_rf(self, train_x, train_y, simulator, likelihood,
                                 n_estimators=100, max_depth=None, 
-                                min_samples_split=2, min_samples_leaf=1, bootstrap=True):
+                                min_samples_split=3, min_samples_leaf=3, bootstrap=True):
 
         x = train_x.detach().cpu().numpy()
         y = train_y.detach().cpu().numpy()
         y = y.reshape(-1)
         n, d = x.shape
+        max_depth = self.bell_number(self.problem['num_vars'])
         # Train Random Forest
         rf_model = RandomForestRegressor(
             n_estimators=n_estimators,
@@ -476,6 +508,7 @@ class Sobol:
             min_samples_split=min_samples_split,
             min_samples_leaf=min_samples_leaf,
             bootstrap=bootstrap,
+            criterion='poisson',
             random_state=42,  # for reproducibility
             n_jobs=-1  # use all available cores
         )
@@ -510,6 +543,69 @@ class Sobol:
         S2 = np.nan_to_num(S2, nan=0.0)
         S2 = np.clip(S2, a_min=0.0, a_max=None)
         np.fill_diagonal(S2, 1.0)
+
+        return S2
+
+    def update_interactions_pce(self, train_x, train_y, simulator, likelihood, grid_x):
+        """
+        Compute Sobol interactions using UQPy's PCE and sensitivity analysis.
+        
+        Args:
+            train_x: numpy array (n, d)
+            train_y: numpy array (n,)
+        """
+
+        simulator, likelihood, _ = optimize(simulator, train_x, train_y,)
+
+        simulator.eval(), likelihood.eval()
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            post = likelihood(simulator(grid_x))
+            y = post.mean.cpu().numpy()
+        y = np.asarray(y)
+
+        x = grid_x.detach().cpu().numpy()
+        #y = train_y.detach().cpu().numpy()
+        #y = y.reshape(-1)
+
+        n, d = x.shape
+        
+        # 1. Define distributions for each dimension based on your problem bounds
+        bounds = self.problem['bounds']  # From your _build_problem method
+        distributions = [Uniform(loc=low, scale=high) for low, high in bounds]
+        joint = JointIndependent(marginals=distributions)
+
+        P = self.problem['num_vars']
+        polynomial_basis = TotalDegreeBasis(joint, P)
+        regressor = LeastSquareRegression()
+
+        # 2. Build the PCE surrogate
+        pce = PolynomialChaosExpansion(polynomial_basis=polynomial_basis, regression_method=regressor)
+        
+        # Train the PCE model with your data
+        pce.fit(x, y)
+        
+        # 3. Compute sensitivity indices
+        pce_sensitivity = PceSensitivity(pce_object=pce)
+        pce_sensitivity.run()
+        
+        # 4. Extract second-order indices and build matrix
+        sobol_first = pce_sensitivity.first_order_indices
+        sobol_total = pce_sensitivity.total_order_indices
+
+        S2 = np.zeros((d,d))
+        # for every i  in range(d), calculate if its additive by sobol_total[0][0] - sobol_first[[0][0]]
+        #print(f'Additive? {sobol_total[0][0] - sobol_first[0][0]} <= 0.05\n')
+        
+        # Build symmetric second-order interaction matrix (approximation)
+        S2 = np.zeros((d,d))
+        for i in range(d):
+
+            additive = sobol_total[i][0] - sobol_first[0][0]
+
+            for j in range(i+1, d):
+                
+                S2[i,j] = additive
+                S2[j,i] = additive
 
         return S2
 
@@ -1331,7 +1427,7 @@ def partition_reconstruction(f_obj,  model_cls, n_init=1, n_iter=200, n_reps= 10
     
     output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'partition_recon_{model_cls.__name__}_{f_obj.d}d={f_obj.name}_kappa{kappa}.png'
+    fname = f'partition_recon_{model_cls.__name__}_{f_obj.d}d-{f_obj.name}_kappa{kappa}.png'
     outpath = os.path.join(output_dir, fname)
     plt.savefig(outpath, dpi=200)
     if verbose:
@@ -1374,7 +1470,7 @@ def partition_reconstruction(f_obj,  model_cls, n_init=1, n_iter=200, n_reps= 10
         surrogate_mean = np.mean(surrogate_mean, axis=0)
         prediction_label = ax.plot(x_full, surrogate_mean, color=color, linestyle='-')
 
-        ax.set_ylim(-0.1, 1.0)
+        ax.set_ylim(-0.05, 0.5)
         ax.set_xlim(1, n_iter)
         ax.set_title(f'x{i}-x{j} interaction')
         ax.grid(True, linestyle='--', linewidth=0.4)
@@ -1539,9 +1635,12 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    main()
-    #run_partitionbo(SyntheticTestFun('twoblobs', 2, False, False), SobolGP, n_iter=100, n_sobol=20, kappa=1.0)
-    #partition_reconstruction(SyntheticTestFun('twoblobs', 2, False, False), SobolGP, n_iter=100, n_reps=10, n_sobol=20, kappa=1.0)
+    #main()
+    run_partitionbo(SyntheticTestFun('twoblobs', 2, True, False), SobolGP, n_iter=100, n_sobol=20, kappa=1.0)
+    #optimization_metrics(SyntheticTestFun('twoblobs', 2, False, False), [0.5, 1.0, 0.25, 0.5], n_iter=100, n_reps=15)
+    #optimization_metrics(SyntheticTestFun('michalewicz', 2, False, True), [7.0, 9.0, 9.0, 9.0], n_iter=101, n_reps=15)
+    #optimization_metrics(SyntheticTestFun('dblobs', 3, False, False), [1.0, 1.0, 1.0, 1.0], n_iter=101, n_reps=15)
+    #optimization_metrics(SyntheticTestFun('hartmann', 6, False, True), [7.0, 9.0, 11.0, 9.0], n_iter=199, n_reps=15)
     
     
 
