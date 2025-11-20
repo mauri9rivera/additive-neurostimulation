@@ -93,7 +93,7 @@ class MHGP(gpytorch.models.ExactGP):
 
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean() 
-        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
+        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
         self.history = history if history else [self.partition_to_key(self.partition)] 
         self.sobol = sobol
         self.name = 'MHGP'
@@ -1461,7 +1461,7 @@ def partition_reconstruction(f_obj,  model_cls, n_init=1, n_iter=200, n_reps= 10
             sobol_trace = [1.0]*n_init
             for t in range(n_iter-n_init):
                 surrogate_estimation = surrogate_sobol[t]
-                sobol_trace.append(float(surrogate_estimation[i][j]))
+                sobol_trace.append(float(surrogate_estimation[i,j]))
             sobol_trace = np.asarray(sobol_trace, dtype=float)
             surrogate_mean.append(sobol_trace)
             ax.plot(x_full, sobol_trace, color=color, linestyle='-', alpha=0.1)
@@ -1582,6 +1582,7 @@ def main(argv=None):
 
     model_cls = model_map[args.model_cls]
     bo_method = run_partitionbo if args.model_cls in ['MHGP', 'SobolGP'] else run_bo
+    n_init = args.dim*3
 
     # Construct SyntheticTestFun object
     if args.dim is None:
@@ -1602,20 +1603,20 @@ def main(argv=None):
     # dispatch
     try:
         if args.method == 'run_bo':
-            result = run_bo(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
+            result = run_bo(f_obj, model_cls, n_init=n_init, n_iter=args.n_iter, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
         elif args.method == 'run_partitionbo':
-            result = run_partitionbo(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
+            result = run_partitionbo(f_obj, model_cls, n_init=n_init, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
         elif args.method == 'kappa_search':
             # Provide a default kappa list if none given
             k_list = args.kappa_list or [0.5, 1.0, 3.0, 5.0, 7.0, 9.0, 15.0]
-            result = kappa_search(f_obj, k_list, model_cls=model_cls, n_init=args.n_init, n_iter=args.n_iter, n_reps=args.n_reps, bo_method=bo_method, acq_method=args.acq_method)
+            result = kappa_search(f_obj, k_list, model_cls=model_cls, n_init=n_init, n_iter=args.n_iter, n_reps=args.n_reps, bo_method=bo_method, acq_method=args.acq_method)
         elif args.method == 'optimization_metrics':
             if args.kappas is None:
                 raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values)')
             kappas = args.kappas
-            result = optimization_metrics(f_obj, kappas, n_init=args.n_init, n_iter=args.n_iter, n_reps=args.n_reps, acq_method=args.acq_method)
+            result = optimization_metrics(f_obj, kappas, n_init=n_init, n_iter=args.n_iter, n_reps=args.n_reps, acq_method=args.acq_method)
         elif args.method == 'partition_reconstruction':
-            result = partition_reconstruction(f_obj, model_cls, n_init=args.n_init, n_iter=args.n_iter, n_reps= args.n_reps, n_sobol=args.n_sobol, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
+            result = partition_reconstruction(f_obj, model_cls, n_init=n_init, n_iter=args.n_iter, n_reps= args.n_reps, n_sobol=args.n_sobol, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
         else:
             raise ValueError('Unsupported method')
 
@@ -1636,11 +1637,12 @@ def main(argv=None):
 if __name__ == '__main__':
 
     #main()
-    run_partitionbo(SyntheticTestFun('twoblobs', 2, True, False), SobolGP, n_iter=100, n_sobol=20, kappa=1.0)
-    #optimization_metrics(SyntheticTestFun('twoblobs', 2, False, False), [0.5, 1.0, 0.25, 0.5], n_iter=100, n_reps=15)
-    #optimization_metrics(SyntheticTestFun('michalewicz', 2, False, True), [7.0, 9.0, 9.0, 9.0], n_iter=101, n_reps=15)
-    #optimization_metrics(SyntheticTestFun('dblobs', 3, False, False), [1.0, 1.0, 1.0, 1.0], n_iter=101, n_reps=15)
-    #optimization_metrics(SyntheticTestFun('hartmann', 6, False, True), [7.0, 9.0, 11.0, 9.0], n_iter=199, n_reps=15)
+    #run_partitionbo(SyntheticTestFun('twoblobs', 2, True, False), SobolGP, n_iter=100, n_sobol=20, kappa=1.0)
+    #partition_reconstruction(SyntheticTestFun('twoblobs', 2, False, False), SobolGP, n_iter=100, n_reps=15, kappa=0.4)
+    #partition_reconstruction(SyntheticTestFun('michalewicz', 2, False, True), SobolGP, n_iter=100, n_reps=15, kappa=3.0)
+    #partition_reconstruction(SyntheticTestFun('dblobs', 3, False, False), SobolGP, n_iter=100, n_sobol=10, n_reps=15, kappa=1.0)
+    #partition_reconstruction(SyntheticTestFun('dblobs', 4, False, False), SobolGP, n_iter=100, n_sobol=10, n_reps=15, kappa=1.0)
+    partition_reconstruction(SyntheticTestFun('ackley', 5, False, True), SobolGP, n_iter=250, n_reps=10, kappa=10.0)
     
     
 
