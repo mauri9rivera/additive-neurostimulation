@@ -746,7 +746,7 @@ def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
     best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
     return best_x, ucb[best_idx].item(), best_idx
 
-def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10, kappa=1.0, acq_method = 'grid', save=False, verbose=False):
+def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=20, kappa=1.0, acq_method = 'grid', save=False, verbose=False):
     """
     Returns the same metrics as run_bo, plus:
       - partition_updates: list of partition structures (list of lists) when updates occurred
@@ -771,7 +771,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=10,
     best_observed = train_y.max().item()
 
     # initialize metrics (same as run_bo)
-    r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [], [], [], [], [], []
+    r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [0.0 for i in range(n_init)], [], [0.0 for i in range(n_init)], [0.0 for i in range(n_init)], [1.0 for i in range(n_init)], []
 
     # Additional metrics
     partition_updates = []
@@ -940,7 +940,7 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
     best_observed = train_y.max().item()
 
     #initialize metrics
-    r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [], [], [], [], [], []
+    r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [0.0 for i in range(n_init)], [], [0.0 for i in range(n_init)], [0.0 for i in range(n_init)], [1.0 for i in range(n_init)], []
     
     likelihood = gpytorch.likelihoods.GaussianLikelihood()
     model = model_cls(train_x, train_y, likelihood)
@@ -1636,13 +1636,8 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    #main()
-    #run_partitionbo(SyntheticTestFun('twoblobs', 2, True, False), SobolGP, n_iter=100, n_sobol=20, kappa=1.0)
-    #partition_reconstruction(SyntheticTestFun('twoblobs', 2, False, False), SobolGP, n_iter=100, n_reps=15, kappa=0.4)
-    #partition_reconstruction(SyntheticTestFun('michalewicz', 2, False, True), SobolGP, n_iter=100, n_reps=15, kappa=3.0)
-    #partition_reconstruction(SyntheticTestFun('dblobs', 3, False, False), SobolGP, n_iter=100, n_sobol=10, n_reps=15, kappa=1.0)
-    #partition_reconstruction(SyntheticTestFun('dblobs', 4, False, False), SobolGP, n_iter=100, n_sobol=10, n_reps=15, kappa=1.0)
-    partition_reconstruction(SyntheticTestFun('ackley', 5, False, True), SobolGP, n_iter=250, n_reps=10, kappa=10.0)
+    main()
+    
     
     
 
