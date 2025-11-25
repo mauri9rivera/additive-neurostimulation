@@ -21,10 +21,10 @@ from SALib.analyze import sobol as salib_sobol
 from SALib.sample import saltelli
 from SALib.sample import sobol as sobol_sampler
 
-from UQpy.sensitivity.PceSensitivity import PceSensitivity
-from UQpy.distributions import Uniform, JointIndependent
-from UQpy.surrogates import *
-from UQpy.surrogates.polynomial_chaos.PolynomialChaosExpansion import PolynomialChaosExpansion
+#from UQpy.sensitivity.PceSensitivity import PceSensitivity
+#from UQpy.distributions import Uniform, JointIndependent
+#from UQpy.surrogates import *
+#from UQpy.surrogates.polynomial_chaos.PolynomialChaosExpansion import PolynomialChaosExpansion
 
 
 from sklearn.ensemble import RandomForestRegressor
@@ -93,7 +93,7 @@ class MHGP(gpytorch.models.ExactGP):
 
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean() 
-        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
+        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.history = history if history else [self.partition_to_key(self.partition)] 
         self.sobol = sobol
         self.name = 'MHGP'
@@ -285,7 +285,7 @@ class SobolGP(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, partition=None, history = None, sobol=None, epsilon=5e-2):
         super(SobolGP, self).__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean()
-        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
+        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.history = history if history else None
         self.sobol = sobol
         self.n_dims = train_x.shape[-1]
@@ -746,7 +746,7 @@ def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
     best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
     return best_x, ucb[best_idx].item(), best_idx
 
-def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=20, kappa=1.0, acq_method = 'grid', save=False, verbose=False):
+def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20, kappa=1.0, acq_method = 'grid', save=False, verbose=False):
     """
     Returns the same metrics as run_bo, plus:
       - partition_updates: list of partition structures (list of lists) when updates occurred
@@ -766,6 +766,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=1, n_iter=200, n_sobol=20,
     grid_min = grid_y.min().item()
 
     # Initiate training set
+    n_init = f_obj.d*3
     true_best = grid_y.max().item() #f_obj.f.optimal_value
     train_x, train_y  = f_obj.simulate(n_init)
     best_observed = train_y.max().item()
@@ -935,6 +936,7 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
     grid_min = grid_y.min().item()
     
     # Initiate training set
+    n_init = f_obj.d*3
     true_best = grid_y.max().item() #f_obj.f.optimal_value  
     train_x, train_y  = f_obj.simulate(n_init)
     best_observed = train_y.max().item()
@@ -1045,7 +1047,7 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
 
 ### Graph generation functions ###
 
-def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_init=1, n_iter=100, n_reps=15,
+def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_init=6, n_iter=100, n_reps=15,
                 bo_method=run_bo, acq_method = 'grid'):
     """
     For each kappa in kappa_list, run BO n_reps times and plot averaged exploration
@@ -1060,7 +1062,8 @@ def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_init=1, n_iter=100, n_r
       dict with averaged traces per kappa and path to saved plot.
     """
 
-    averaged = {}  
+    averaged = {}
+    n_init = 3*f_obj.d
 
     for kappa in kappa_list:
         
@@ -1095,12 +1098,9 @@ def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_init=1, n_iter=100, n_r
         mean_explore = vals['explore']
         mean_exploit = vals['exploit']
 
-        # prepend n_init zeros (initialization period)
-        explore_padded = np.concatenate([np.zeros(n_init), mean_explore])
-        exploit_padded = np.concatenate([np.zeros(n_init), mean_exploit])
         # plot exploration as dashed line
-        plt.plot(x, explore_padded, linestyle='-', marker=None, label=f'k={kappa} Explore', color=color)
-        plt.plot(x, exploit_padded, linestyle='--', marker=None, color=color)
+        plt.plot(x, mean_explore, linestyle='-', marker=None, label=f'k={kappa} Explore', color=color)
+        plt.plot(x, mean_exploit, linestyle='--', marker=None, color=color)
 
 
     plt.xlabel('Iteration')
@@ -1121,7 +1121,7 @@ def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_init=1, n_iter=100, n_r
     plt.close()
     print(f"Saved kappa search plot to {plot_path}")
 
-def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, acq_method = 'grid'):
+def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, acq_method = 'grid'):
     """
     Run BO variants for f_obj and plot:
       - Plot 1: Exploration (dashed), Exploitation (solid) averaged across n_reps
@@ -1252,7 +1252,7 @@ def optimization_metrics(f_obj, kappas, n_init=1, n_iter=100, n_reps=15, ci=95, 
         ax2.plot(it, mean_reg, color=color, label=f'{label} kappa={kappa}')
         ax2.fill_between(it, mean_reg - ci_regrets, mean_reg + ci_regrets, color=color, alpha=0.2)
 
-    
+
     # Snap y-limits to full decades (powers of ten) so ticks are exactly 10^k
     log10_min = np.floor(np.log10(global_min))
     log10_max = np.ceil(np.log10(global_max))
@@ -1527,7 +1527,7 @@ def main(argv=None):
     parser.add_argument('--n_init', type=int, default=1)
     parser.add_argument('--n_iter', type=int, default=200)
     parser.add_argument('--n_reps', type=int, default=10)
-    parser.add_argument('--n_sobol', type=int, default=10)
+    parser.add_argument('--n_sobol', type=int, default=20)
     parser.add_argument('--kappa', type=float, default=1.0)
     parser.add_argument('--kappa_list', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for kappa_search')
     parser.add_argument('--kappas', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for optimization_metrics (3 values expected)')
@@ -1637,10 +1637,3 @@ def main(argv=None):
 if __name__ == '__main__':
 
     main()
-    
-    
-    
-
-   
-      
-    

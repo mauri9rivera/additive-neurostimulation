@@ -2,6 +2,7 @@ import random
 import numpy as np
 from botorch.test_functions.synthetic import Hartmann, Ackley, Griewank, Michalewicz, Rosenbrock, Shekel
 from botorch.test_functions.base import BaseTestProblem
+from botorch.test_functions.sensitivity_analysis import Ishigami, Gsobol, Morris
 import torch
 import math
 from typing import Optional, List, Literal
@@ -18,21 +19,41 @@ class SyntheticTestFun:
         """
         self.d = d
         self.name = name
+        no_need_negate = ['twoblobs', 'dblobs', 'multprod', 'cyclical-fun', 'ishigami', 'gsobol', 'morris']
+        negate = False if name in no_need_negate else True
+        self.negate = negate
         match name:
             case 'hartmann':
                 # Note: Need to negate to turn into maximization
                 if d != 6:
-                    raise ValueError("The HartMann function needs to be 6 dimensional")
+                    raise ValueError("The Hartmann function needs to be 6 dimensional")
                 self.f = Hartmann(noise_std=noise, negate=negate)
             case 'ackley':
-                # Note: Keep original for maximization
+                # Note: Need to negate to turn into maximization
                 self.f = Ackley(d, noise_std=noise, negate=negate)
             case 'grienwank':
-                # Note: Keep original for maximization
+                # Note: Need to negate to turn into maximization
                 self.f = Griewank(d, noise_std=noise, negate=negate)
             case 'michalewicz':
                 # Note: Need to negate to turn into maximization
                 self.f = Michalewicz(d, noise_std=noise, negate=negate)
+            case 'ishigami':
+                # Note: Keep original for maximization
+                self.f = Ishigami(b=0.1, noise_std=noise, negate=negate)
+            case 'gsobol':
+                if d not in [6, 8, 15]:
+                    raise ValueError("The GSobol function needs to be a 6, 8, or 15 dimensional")
+                if d == 6:
+                    a=[0, 0.5, 3, 9, 99, 99]
+                elif d == 8:
+                    a= [0, 1, 4.5, 9, 99, 99, 99, 99] 
+                elif d == 15: 
+                    a= [1, 2, 5, 10, 20, 50, 100, 500, 1000, 1000, 1000, 1000, 1000, 1000, 1000]
+                self.f = Gsobol(d, a, noise, negate=negate)
+            case 'morris':
+                if d != 20:
+                    raise ValueError("The Morris function needs to be 20 dimensional")
+                self.f = Morris(noise_std=noise, negate=negate)
             case 'schwefel':
                 if d != 2:
                     raise ValueError("The Schewefel function needs to be a 2 dimensional")
@@ -59,6 +80,7 @@ class SyntheticTestFun:
             case 'rosenbrock':
                 self.f = Rosenbrock(d, noise_std=noise, negate=negate)
             case 'shekel':
+                # Note: Need to negate to turn into maximization
                 self.f = Shekel(m=5, negate=True)
                 self.d = 4
             case 'goldstein-price':
@@ -87,7 +109,6 @@ class SyntheticTestFun:
 
 
         self.f.d = d
-        self.negate = False if name in ('twoblobs', 'dblobs', 'multprod', 'cyclical-fun') else negate
         self.lower_bounds = np.array(self.f._bounds)[:, 0]
         self.upper_bounds = np.array(self.f._bounds)[:, 1]
 
@@ -234,7 +255,7 @@ class TwoBlobs(BaseTestProblem):
     One blob is scaled up so there is a clear single maximum at blob1's mean.
     """
 
-    def __init__(self, noise_std=0.0, negate=False, weight1=1.0, weight2=0.3):
+    def __init__(self, noise_std=0.0, negate=False, weight1=1.0, weight2=0.4):
         self._bounds = [(0.0, 10.0), (0.0, 10.0)]
         self.noise_std = noise_std
         self.negate = negate
@@ -245,13 +266,13 @@ class TwoBlobs(BaseTestProblem):
         # Gaussian 1 (dominant blob)
         self.mean1 = torch.tensor([7.0, 6.0], dtype=dtype)
         self.std1 = torch.tensor([1.0, 0.5], dtype=dtype)
-        self.rho1 = torch.tensor(0.3, dtype=dtype)
+        self.rho1 = torch.tensor(0.7, dtype=dtype)
         self.weight1 = torch.tensor(weight1, dtype=dtype)
 
         # Gaussian 2 (smaller blob)
         self.mean2 = torch.tensor([4.0, 4.0], dtype=dtype)
         self.std2 = torch.tensor([0.7, 1.2], dtype=dtype)
-        self.rho2 = torch.tensor(-0.4, dtype=dtype)
+        self.rho2 = torch.tensor(-0.3, dtype=dtype)
         self.weight2 = torch.tensor(weight2, dtype=dtype)
 
         # Peak value at mean1 (analytical)
@@ -302,171 +323,6 @@ class TwoBlobs(BaseTestProblem):
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
 
-class DBlobs_old(BaseTestProblem):
-    """
-    D-dimensional generalization of TwoBlobs: weighted mixture of n Gaussian blobs.
-    
-    The function is a weighted sum of multivariate Gaussian PDFs in d-dimensions.
-    One blob is scaled to be the dominant maximum.
-    
-    - Domain: x_i ∈ [0, 10] for all dimensions (consistent with TwoBlobs)
-    - Global MAXIMUM value: analytically computed at the dominant blob's mean
-    """
-
-    def __init__(self, d: int = 5, n_blobs: Optional[int] = None, noise_std: float = 0.0, 
-                 negate: bool = False, seed: Optional[int] = None):
-        self.dim = d
-        self._bounds = [(0.0, 10.0) for _ in range(d)]
-        self.noise_std = noise_std
-        self.negate = negate
-        
-        # Set number of blobs (default to d if not specified)
-        self.n_blobs = n_blobs if n_blobs is not None else d
-        
-        # Random seed for reproducibility
-        if seed is not None:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-        
-        # Initialize blobs
-        self.means = []
-        self.cov_matrices = []
-        self.weights = []
-        self.rhos = []  # Correlation parameters
-
-        jitter = 1e-8
-        
-        # Generate random blobs
-        for i in range(self.n_blobs):
-            # Random mean within [2, 8] to avoid edges
-            mean = torch.as_tensor(2.0 + 6.0 * torch.rand(d), dtype=torch.get_default_dtype())
-            self.means.append(mean)
-            
-            # Random standard deviations between [0.5, 2.0]
-            stds = torch.as_tensor(0.5 + 1.5 * torch.rand(d), dtype=torch.get_default_dtype())
-
-            # Random correlation parameter rho for correlation structure
-            rho_max = 0.4
-            rho_min = -1.0 / float(d - 1) + 1e-6  # safe lower bound for exchangeable corr
-            if rho_min >= rho_max:
-                rho_min = rho_max - 1e-6 
-            rho_val = float(rho_min + (rho_max - rho_min) * torch.rand(1).item())
-            rho = torch.as_tensor(rho_val, dtype=torch.get_default_dtype())
-            self.rhos.append(rho)
-            
-            # Create covariance matrix with exchangeable correlation structure
-            cov_matrix = self._create_exchangeable_covariance(stds, rho, eps=jitter)
-            self.cov_matrices.append(cov_matrix)
-            
-            # Weights: first blob gets weight 1.0, others get decreasing weights
-            weight = 1.0 if i == 0 else 0.7 / (i + 1)
-            self.weights.append(torch.tensor(weight))
-        
-        # Ensure first blob is dominant by giving it the highest weight
-        self.weights[0] = torch.tensor(1.0)
-        
-        # Convert to tensors
-        self.means = torch.stack(self.means)
-        self.cov_matrices = torch.stack(self.cov_matrices)
-        self.weights = torch.tensor(self.weights)
-        self.rhos = torch.tensor(self.rhos)
-        
-        # Precompute covariance inverses and determinants for efficiency
-        self.cov_dets = torch.linalg.det(self.cov_matrices)
-        self.cov_invs = torch.linalg.inv(self.cov_matrices)
-        
-        # Analytical optimum is at the mean of the dominant (first) blob
-        self.optimal_point = self.means[0]
-        self.optimal_value = self._evaluate_single_point(self.optimal_point.unsqueeze(0)).item()
-
-    def _create_exchangeable_covariance(self, stds: torch.Tensor, rho: float, eps: float = 1e-8) -> torch.Tensor:
-        """
-        Create covariance matrix with exchangeable correlation structure.
-        
-        Sigma_ij = std_i * std_j * rho for i ≠ j
-        Sigma_ii = std_i²
-        """
-        d = stds.numel()
-        # basic construction
-        outer = torch.outer(stds, stds)  # std_i * std_j
-        eye = torch.eye(d, dtype=stds.dtype, device=stds.device)
-        cov = outer * (eye + (1.0 - eye) * rho)
-
-        # symmetrize for safety
-        cov = 0.5 * (cov + cov.T)
-
-        # attempt a Cholesky; if it fails, do eigen-decomposition and clamp eigenvalues
-        try:
-            torch.linalg.cholesky(cov)
-            # success => return
-            return cov
-        except RuntimeError:
-            # eigen-decompose, clamp eigenvalues to >= eps, rebuild
-            vals, vecs = torch.linalg.eigh(cov)
-            vals_clamped = torch.clamp(vals, min=eps)
-            cov_pd = (vecs @ torch.diag(vals_clamped) @ vecs.T)
-            # renormalize small numeric asymmetry and return
-            cov_pd = 0.5 * (cov_pd + cov_pd.T)
-            return cov_pd
-
-    def _multivariate_gaussian_pdf(self, X: torch.Tensor, mean: torch.Tensor, 
-                                 cov_inv: torch.Tensor, cov_det: torch.Tensor) -> torch.Tensor:
-        """
-        Compute multivariate Gaussian PDF for a single blob.
-        """
-        d = self.dim
-        X_centered = X - mean
-        
-        # Compute quadratic form: (x-μ)^T Σ^{-1} (x-μ)
-        if X.dim() == 1:
-            quad_form = X_centered @ cov_inv @ X_centered
-        else:
-            quad_form = torch.einsum('ni,ij,nj->n', X_centered, cov_inv, X_centered)
-        
-        # Multivariate Gaussian PDF formula
-        normalization = 1.0 / torch.sqrt((2 * math.pi) ** d * cov_det)
-        pdf_value = normalization * torch.exp(-0.5 * quad_form)
-        
-        return pdf_value
-
-    def _evaluate_single_point(self, X: torch.Tensor) -> torch.Tensor:
-        """
-        Evaluate the function at single or multiple points.
-        """
-        result = torch.zeros(X.shape[0])
-        
-        # Sum contributions from all blobs
-        for i in range(self.n_blobs):
-            pdf_val = self._multivariate_gaussian_pdf(
-                X, self.means[i], self.cov_invs[i], self.cov_dets[i]
-            )
-            result += self.weights[i] * pdf_val
-        
-        return result.unsqueeze(-1)
-
-    def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
-        # compatibility wrapper
-        return self._evaluate_true(X)
-
-    def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
-        return self._evaluate_single_point(X).reshape(-1)
-
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        Y = self._evaluate_true(X)
-        if self.noise_std > 0:
-            Y = Y + torch.randn_like(Y) * self.noise_std
-        return -Y if self.negate else Y
-
-    def get_blob_info(self) -> dict:
-        """Return information about the blobs for analysis."""
-        return {
-            'means': self.means,
-            'weights': self.weights,
-            'rhos': self.rhos,
-            'optimal_point': self.optimal_point,
-            'optimal_value': self.optimal_value
-        }    
-
 class DBlobs(BaseTestProblem):
     """
     D-dimensional weighted mixture of multivariate Gaussian blobs (exchangeable corr).
@@ -481,7 +337,6 @@ class DBlobs(BaseTestProblem):
         rho_max: upper bound for exchangeable rho (default 0.4)
         normalize_method: 'max' (scale by estimated global max -> outputs in [0,1] approx)
                           or 'minmax' (map observed min->0 and max->1 from random sample)
-        normalize_search: whether to run numeric search to estimate extrema (default True)
         n_random_samples: budget for random sampling when searching (default 5000)
         refine_restarts, refine_steps, refine_lr: gradient-refine settings (used when normalize_search True & method='max')
         jitter: tiny jitter to ensure PD
@@ -493,10 +348,7 @@ class DBlobs(BaseTestProblem):
         n_blobs: Optional[int] = None,
         noise_std: float = 0.0,
         negate: bool = False,
-        seed: Optional[int] = None,
-        rho_max: float = 0.4,
-        normalize_method: Literal["max", "minmax"] = "max",
-        normalize_search: bool = True,
+        rho_max: float = 0.3,
         n_random_samples: int = 5000,
         refine_restarts: int = 8,
         refine_steps: int = 200,
@@ -506,12 +358,11 @@ class DBlobs(BaseTestProblem):
         # --- attributes BaseTestProblem expects BEFORE super().__init__() ---
         self.d = int(d)
         self.dim = self.d
-        # treat all inputs as continuous
         self.continuous_inds = list(range(self.d))
         self.discrete_inds = []
         self.categorical_inds = []
-        # bounds on original domain
-        self._bounds = [(0.0, 10.0) for _ in range(self.d)]
+        self._bounds = [(0.0, 10.0) for _ in range(self.d)] # bounds on original domain
+
 
         # initialize BaseTestProblem / nn.Module internals
         super().__init__()
@@ -524,9 +375,8 @@ class DBlobs(BaseTestProblem):
         self.n_blobs = n_blobs if n_blobs is not None else self.d
 
         # RNG
-        if seed is not None:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
+        torch.manual_seed(1)
+        np.random.seed(1)
 
         # storage lists (will convert to tensors)
         means_list = []
@@ -539,11 +389,7 @@ class DBlobs(BaseTestProblem):
 
         # safe rho sampling range for exchangeable corr
         rho_upper = float(rho_max)
-        rho_lower_theory = -1.0 / float(self.d - 1)
-        eps = 1e-8
-        rho_lower = rho_lower_theory + 1e-6
-        if rho_lower >= rho_upper:
-            rho_lower = rho_upper - 1e-6
+        rho_lower = -0.01
 
         # build blobs
         for i in range(self.n_blobs):
@@ -578,22 +424,9 @@ class DBlobs(BaseTestProblem):
         cov_logdets = []
         for k in range(self.n_blobs):
             C = self.cov_matrices[k]
-            # add tiny jitter for numeric stability
-            Cj = C + torch.eye(self.d, dtype=C.dtype, device=C.device) * (1e-10)
-            # Cholesky (should succeed as we regularized earlier)
-            try:
-                L = torch.linalg.cholesky(Cj)
-            except RuntimeError:
-                # last resort: eigen-clamp
-                vals, vecs = torch.linalg.eigh(Cj)
-                vals_clamped = torch.clamp(vals, min=1e-12)
-                Cj = vecs @ torch.diag(vals_clamped) @ vecs.T
-                Cj = 0.5 * (Cj + Cj.T)
-                L = torch.linalg.cholesky(Cj)
-
-            # compute inverse via cholesky_inverse for stability
-            # torch.cholesky_inverse expects Cholesky factor from torch.cholesky; for modern torch use:
-            invC = torch.cholesky_inverse(L) if hasattr(torch, "cholesky_inverse") else torch.linalg.inv(Cj)
+            Cj = C + torch.eye(self.d, dtype=C.dtype, device=C.device) * (1e-10) # add tiny jitter for numeric stability
+            L = torch.linalg.cholesky(Cj) # Cholesky (should succeed as we regularized earlier)
+            invC = torch.cholesky_inverse(L) 
             cov_invs.append(invC)
 
             # compute logdet robustly
@@ -615,83 +448,61 @@ class DBlobs(BaseTestProblem):
         self.optimal_value = analytic_val
 
         # ---------- Normalization logic ----------
-        self._normalize_method = normalize_method
         self._scale = max(float(analytic_val), 1e-12)  # fallback scale
         self._min_obs = 0.0
         self._max_obs = float(analytic_val)
 
-        if normalize_search:
-            # random sampling budget; do in batches
-            best_val = analytic_val
-            worst_val = float("inf")
-            device = self.means.device
-            dtype = self.means.dtype
-            n_rem = max(0, int(n_random_samples))
-            batch = 4096
-            # simple random sampling
-            while n_rem > 0:
-                bs = min(batch, n_rem)
-                Xs = 10.0 * torch.rand(bs, self.d, dtype=dtype, device=device)
-                Ys = self._evaluate_single_point(Xs).reshape(-1)
-                max_Y = float(Ys.max().item())
-                min_Y = float(Ys.min().item())
-                if max_Y > best_val:
-                    best_val = max_Y
-                if min_Y < worst_val:
-                    worst_val = min_Y
-                n_rem -= bs
+        # random sampling budget; do in batches
+        best_val = analytic_val
+        worst_val = float("inf")
+        device = self.means.device
+        dtype = self.means.dtype
+        n_rem = max(0, int(n_random_samples))
+        batch = 4096
+        # simple random sampling
+        while n_rem > 0:
+            bs = min(batch, n_rem)
+            Xs = 10.0 * torch.rand(bs, self.d, dtype=dtype, device=device)
+            Ys = self._evaluate_single_point(Xs).reshape(-1)
+            max_Y = float(Ys.max().item())
+            min_Y = float(Ys.min().item())
+            if max_Y > best_val:
+                best_val = max_Y
+            if min_Y < worst_val:
+                worst_val = min_Y
+            n_rem -= bs
 
-            # optionally refine best point via gradient ascent (only for 'max' mode)
-            if normalize_method == "max":
-                # find a reasonable starting candidate: analytic mean and top random sample
-                # We'll pick the best-of-k random candidates for gradient starts
-                # Small set of restarts for refinement
-                best_ref_val = best_val
-                best_ref_x = self.optimal_point.clone()
-                # seed starts: use a few random points plus analytic mean
-                starts = [self.optimal_point.clone()]
-                for _ in range(refine_restarts - 1):
-                    starts.append(10.0 * torch.rand(self.d, dtype=dtype, device=device))
+        # Refine best point via gradient ascent 
+           
+        best_ref_val = best_val
+        best_ref_x = self.optimal_point.clone()
+        starts = [self.optimal_point.clone()]
+        for _ in range(refine_restarts - 1):
+            starts.append(10.0 * torch.rand(self.d, dtype=dtype, device=device))
 
-                for s in starts:
-                    x = s.clone().detach().to(dtype).requires_grad_(True)
-                    opt = torch.optim.Adam([x], lr=refine_lr)
-                    for _ in range(refine_steps):
-                        opt.zero_grad()
-                        v = self._evaluate_single_point(x.unsqueeze(0)).squeeze()
-                        # maximize -> minimize negative
-                        (-v).backward()
-                        opt.step()
-                        with torch.no_grad():
-                            x.clamp_(0.0, 10.0)
-                    vfin = float(self._evaluate_single_point(x.unsqueeze(0)).squeeze().item())
-                    if vfin > best_ref_val:
-                        best_ref_val = vfin
-                        best_ref_x = x.detach().clone()
+        for s in starts:
+            x = s.clone().detach().to(dtype).requires_grad_(True)
+            opt = torch.optim.Adam([x], lr=refine_lr)
+            for _ in range(refine_steps):
+                opt.zero_grad()
+                v = self._evaluate_single_point(x.unsqueeze(0)).squeeze()
+                (-v).backward()
+                opt.step()
+                with torch.no_grad():
+                    x.clamp_(0.0, 10.0)
+            vfin = float(self._evaluate_single_point(x.unsqueeze(0)).squeeze().item())
+            if vfin > best_ref_val:
+                best_ref_val = vfin
+                best_ref_x = x.detach().clone()
 
-                self._scale = float(max(best_ref_val, analytic_val, 1e-12))
-                self.optimal_point = best_ref_x.clone()
-                self._min_obs = float(min(worst_val, 0.0))
-                self._max_obs = float(self._scale)
-            else:
-                # 'minmax' mode: set observed range from sampling
-                # ensure sensible defaults if sampling was too small
-                if worst_val == float("inf"):
-                    worst_val = 0.0
-                self._min_obs = float(min(worst_val, 0.0))
-                self._max_obs = float(max(best_val, analytic_val, 1e-12))
-                # keep scale for backward compatibility, but main scheme will be min-max
-                self._scale = float(max(self._max_obs, 1e-12))
-
-        # finalize normalized optimal_value
-        if self._normalize_method == "max":
-            self.optimal_value = 1.0
-        else:
-            # minmax mapping yields observed max -> 1.0
-            self.optimal_value = 1.0
+        self._scale = float(max(best_ref_val, analytic_val, 1e-12))
+        self.optimal_point = best_ref_x.clone()
+        self._min_obs = float(min(worst_val, 0.0))
+        self._max_obs = float(self._scale)
+        self.optimal_value = 1.0
 
     # ----------------- helpers -----------------
-    def _create_exchangeable_covariance(self, stds: torch.Tensor, rho: float, eps: float = 1e-8) -> torch.Tensor:
+    def _create_exchangeable_covariance(self, stds: torch.Tensor, rho: float, eps: float = 1e-9) -> torch.Tensor:
         """
         Compound-symmetry covariance:
            Sigma_ij = std_i * std_j * rho   (i != j)
@@ -704,34 +515,22 @@ class DBlobs(BaseTestProblem):
         cov = outer * (eye + (1.0 - eye) * float(rho))
         cov = 0.5 * (cov + cov.T)
 
-        # quick PD check with cholesky
-        try:
-            torch.linalg.cholesky(cov)
-            return cov
-        except RuntimeError:
-            vals, vecs = torch.linalg.eigh(cov)
-            vals_clamped = torch.clamp(vals, min=eps)
-            cov_pd = vecs @ torch.diag(vals_clamped) @ vecs.T
-            cov_pd = 0.5 * (cov_pd + cov_pd.T)
-            # ensure tiny jitter so later cholesky succeeds
-            cov_pd = cov_pd + torch.eye(d, dtype=cov_pd.dtype, device=cov_pd.device) * (1e-12)
-            return cov_pd
+        vals, vecs = torch.linalg.eigh(cov)
+        vals_clamped = torch.clamp(vals, min=eps)
+        cov_pd = vecs @ torch.diag(vals_clamped) @ vecs.T
+        cov_pd = 0.5 * (cov_pd + cov_pd.T)
+        cov_pd = cov_pd + torch.eye(d, dtype=cov_pd.dtype, device=cov_pd.device) * (1e-12)
+        return cov_pd
 
     def _multivariate_gaussian_pdf(self, X: torch.Tensor, mean: torch.Tensor, cov_inv: torch.Tensor, cov_logdet: float) -> torch.Tensor:
         """
         Evaluate multivariate Gaussian pdf at rows of X for given mean, precision (cov_inv) and logdet.
         Returns (N,) for X shape (N,d) or scalar for (d,) inputs.
         """
-        if X.dim() == 1:
-            Xc = X - mean
-            quad = float((Xc @ cov_inv @ Xc).item())
-            norm_log = -0.5 * (self.d * math.log(2.0 * math.pi) + float(cov_logdet))
-            return torch.tensor(math.exp(norm_log - 0.5 * quad), dtype=mean.dtype)
-        else:
-            Xc = X - mean.unsqueeze(0)  # (N,d)
-            quad = torch.einsum("ni,ij,nj->n", Xc, cov_inv, Xc)  # (N,)
-            norm_log = -0.5 * (self.d * math.log(2.0 * math.pi) + float(cov_logdet))
-            return torch.exp(norm_log - 0.5 * quad)  # (N,)
+        Xc = X - mean.unsqueeze(0)  # (N,d)
+        quad = torch.einsum("ni,ij,nj->n", Xc, cov_inv, Xc)  # (N,)
+        norm_log = -0.5 * (self.d * math.log(2.0 * math.pi) + float(cov_logdet))
+        return torch.exp(norm_log - 0.5 * quad)  # (N,)
 
     def _evaluate_single_point(self, X: torch.Tensor) -> torch.Tensor:
         """
@@ -755,15 +554,9 @@ class DBlobs(BaseTestProblem):
     def _evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         vals = self._evaluate_single_point(X)  # (N,)
         # normalization
-        if self._normalize_method == "max":
-            scaled = vals / float(max(self._scale, 1e-12))
-            scaled = torch.clamp(scaled, min=0.0, max=1.0)
-            return scaled.reshape(-1)
-        else:  # minmax
-            denom = float(self._max_obs - self._min_obs) if (self._max_obs - self._min_obs) > 1e-12 else 1.0
-            scaled = (vals - float(self._min_obs)) / denom
-            scaled = torch.clamp(scaled, min=0.0, max=1.0)
-            return scaled.reshape(-1)
+        scaled = vals / float(max(self._scale, 1e-12))
+        scaled = torch.clamp(scaled, min=0.0, max=1.0)
+        return scaled.reshape(-1)
 
     def evaluate_true(self, X: torch.Tensor) -> torch.Tensor:
         # compatibility wrapper expected by some BaseTestProblem versions
@@ -791,6 +584,8 @@ class DBlobs(BaseTestProblem):
             "min_obs": self._min_obs,
             "max_obs": self._max_obs,
         }
+
+### Functions that need re-design
 
 class GoldsteinPrice(BaseTestProblem):
     """
@@ -1030,11 +825,6 @@ class CyclicalFunction(BaseTestProblem):
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
     
-
-
-### Functions that need re-design
-
-
 class GriewankRosenbrockHybrid(BaseTestProblem):
     """
     Hybrid function with first half dimensions as Ackley and second half as Rosenbrock.
@@ -1123,7 +913,6 @@ class GriewankRosenbrockHybrid(BaseTestProblem):
         if self.noise_std > 0:
             Y = Y + torch.randn_like(Y) * self.noise_std
         return -Y if self.negate else Y
-
 
 class MultiplicativeInteraction(BaseTestProblem):
     """
