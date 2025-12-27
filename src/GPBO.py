@@ -91,7 +91,7 @@ class AdditiveGP(gpytorch.models.ExactGP):
 
 class MHGP(gpytorch.models.ExactGP):
 
-    def __init__(self, train_x, train_y, likelihood, partition = None, history = None, sobol=None, epsilon=5e-2):
+    def __init__(self, train_x, train_y, likelihood, partition = None, history = None, sobol=None, epsilon=8e-2):
 
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean() 
@@ -100,7 +100,7 @@ class MHGP(gpytorch.models.ExactGP):
         self.sobol = sobol
         self.name = 'MHGP'
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.05 # - 0.02 * min(1.0, (self.n_dims**2 / 30.0))
+        self.epsilon = 0.08 # - 0.02 * min(1.0, (self.n_dims**2 / 30.0))
         self.split_bias = 0.7
         self.max_attempts = self.bell_number(self.n_dims)
 
@@ -284,14 +284,14 @@ class SobolGP(gpytorch.models.ExactGP):
     - sobol: an associated Sobol object (optional)
     - epsilon: additivity threshold (kept as attribute)
     """
-    def __init__(self, train_x, train_y, likelihood, partition=None, history = None, sobol=None, epsilon=5e-2):
+    def __init__(self, train_x, train_y, likelihood, partition=None, history = None, sobol=None, epsilon=8e-2):
         super(SobolGP, self).__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean()
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.history = history if history else None
         self.sobol = sobol
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 30.0))
+        self.epsilon = 0.08 #- 0.02 * min(1.0, (self.n_dims**2 / 30.0))
         self.name = 'SobolGP'
         # build covar_module based on partition
         self._build_covar()
@@ -668,7 +668,7 @@ class Sobol:
       update_partition(interactions) -> partition (list of list of dims)
     """
 
-    def __init__(self, f_obj, epsilon=5e-2, method='scipy', M=2048, B=128):
+    def __init__(self, f_obj, epsilon=8e-2, method='scipy', M=2048, B=128):
         """
         f_obj: SyntheticTestFun object for the test function to optimize
         epsilon: threshold for high-order sobol interactions
@@ -676,7 +676,7 @@ class Sobol:
         M: number of monte-carlo samples for sobol metamodel
         method: string representing the Sobol global sensitivity analysis method to use.
         """
-        self.epsilon = 0.05 # - 0.02 * min(1.0, (d**2 / 30.0))
+        self.epsilon = 0.08 # - 0.02 * min(1.0, (d**2 / 30.0))
         self.B = B
         self.M = M
         self.problem = self._build_problem(f_obj)
