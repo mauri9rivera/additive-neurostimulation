@@ -1458,7 +1458,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20,
             with torch.no_grad(), gpytorch.settings.fast_pred_var():
                 post = likelihood(model(grid_x))
 
-            y_true = grid_y.squeeze(-1)
+            y_true = (grid_y.squeeze(-1) - grid_min) / (true_best - grid_min)
             y_pred = post.mean
             ss_res = torch.sum((y_true - y_pred) ** 2)
             ss_tot = torch.sum((y_true - y_true.mean()) ** 2)
@@ -1496,7 +1496,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20,
         t1 = time.time()
         elapsed_train = t1 - t0
         train_times.append(elapsed_train)
-        model = model_cls(train_x, train_y, likelihood,
+        model = model_cls(train_x, train_y_norm, likelihood,
                           model.partition, model.history, model.sobol) 
         
 
@@ -1564,10 +1564,15 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
     grid_min = grid_y.min().item()
     
     # Initiate training set
+    sobol = Sobol(f_obj)
     n_init = f_obj.d*3
     true_best = grid_y.max().item() #f_obj.f.optimal_value  
-    train_x, train_y  = f_obj.simulate(n_init)
+    train_x = torch.from_numpy(sobol_sampler.sample(sobol.problem, n_init, calc_second_order=False)).float()
+    train_y = f_obj.f.forward(train_x)
     best_observed = train_y.max().item()
+
+    current_min = min(grid_min, train_y.min().item())
+    current_max = max(true_best, train_y.max().item())
 
     #initialize metrics
     r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [0.0 for i in range(n_init)], [], [0.0 for i in range(n_init)], [0.0 for i in range(n_init)], [1.0 for i in range(n_init)], []
@@ -1579,13 +1584,15 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
 
         # Train model
         t0 = time.time()
-        model, likelihood, epoch_losses = optimize(model, train_x, train_y)
+        y_range = current_max - current_min
+        train_y_norm = (train_y - current_min) / y_range
+        model, likelihood, epoch_losses = optimize(model, train_x, train_y_norm)
 
         loss_curve.append(np.mean(epoch_losses))
 
         if acq_method == 'botorch':
             # Acquisition scoring
-            UCB = UpperConfidenceBound(model=gp, beta=kappa**2, maximize=True)
+            UCB = UpperConfidenceBound(model=model, beta=kappa**2, maximize=True)
             # Next point
             warnings.filterwarnings("ignore", category=RuntimeWarning)
             new_x, _ = optimize_acqf(
@@ -1596,22 +1603,30 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
 
         new_y = f_obj.f.forward(new_x)
 
-        #update dataset
+        # Update global bounds and exploration metrics
+        new_y_val = new_y.item()
+        if new_y_val < current_min:
+            current_min = new_y_val
+        if new_y_val > current_max:
+            current_max = new_y_val
+            
+        # Keep your original tracking for the final score
+        if new_y_val > true_best:
+            true_best = new_y_val
+        if new_y_val < grid_min:
+            grid_min = new_y_val
+        
         train_x = torch.cat([train_x, new_x])
         train_y  = torch.cat([train_y, new_y])
-        if train_y.min().item() < grid_min:
-            grid_min = train_y.min().item()
-        if train_y.max().item() > true_best:
-            true_best = train_y.max().item()
 
         # Posterior predictions for R^2
         model.eval(); likelihood.eval()
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=GPInputWarning)
             with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                post = likelihood(model(train_x))
+                post = likelihood(model(grid_x))
             
-            y_true = train_y.squeeze(-1)
+            y_true = (grid_y.squeeze(-1) - grid_min) / (true_best - grid_min)
             y_pred = post.mean
             ss_res = torch.sum((y_true - y_pred) ** 2)
             ss_tot = torch.sum((y_true - y_true.mean()) ** 2)
@@ -2264,7 +2279,8 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    f_obj = SyntheticTestFun('michalewicz', 2, 0, False)
-    results = run_partitionbo(f_obj, SobolGP, 6, 100, 20, 5.0, 'grid')
+    f_obj = SyntheticTestFun('hartmann', 6, 0, False)
+    results = run_partitionbo(f_obj, SobolGP, 18, 200, 20, 5.0, 'grid')
+    results_exact = run_bo(f_obj, ExactGP, 18, 200, 5.0)
     print(f'done')
     #main()
