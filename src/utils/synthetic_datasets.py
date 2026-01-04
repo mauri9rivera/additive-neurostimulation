@@ -256,10 +256,21 @@ class TwoBlobs(BaseTestProblem):
     """
 
     def __init__(self, noise_std=0.0, negate=False, weight1=1.0, weight2=0.4):
-        self._bounds = [(0.0, 10.0), (0.0, 10.0)]
+        
+        # --- attributes BaseTestProblem expects BEFORE super().__init__() ---
+        self.d = 2
+        self.dim = self.d
+        self.continuous_inds = list(range(self.d))
+        self.discrete_inds = []
+        self.categorical_inds = []
+        self._bounds = [(0.0, 10.0) for _ in range(self.d)] # bounds on original domain
+
+
+        # initialize BaseTestProblem / nn.Module internals
+        super().__init__(noise_std, negate)
+
         self.noise_std = noise_std
         self.negate = negate
-        self.d = 2
 
         dtype = torch.get_default_dtype()
 
@@ -279,6 +290,7 @@ class TwoBlobs(BaseTestProblem):
         peak1 = self._gaussian_peak(self.std1, self.rho1) * self.weight1
         val_blob2_at_mean1 = self._gaussian_pdf_at_point(self.mean1, self.mean2, self.std2, self.rho2) * self.weight2
         self.optimal_value = (peak1 + val_blob2_at_mean1).item()
+
 
     def _gaussian_peak(self, std, rho):
         sx, sy = std[0], std[1]

@@ -33,7 +33,7 @@ from models.gaussians import *
 from models.sobols import *
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="SALib.util")
-
+warnings.filterwarnings("ignore", category=UserWarning, module="SALib")
 
 ### Runners ###
 
@@ -502,7 +502,7 @@ def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_iter=100, n_reps=15,
     plt.close()
     print(f"Saved kappa search plot to {plot_path}")
 
-def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, devices=['cpu']):
+def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['cpu']):
     """
     Run BO variants for f_obj and plot:
       - Plot 1: Exploration (dashed), Exploitation (solid) averaged across n_reps
@@ -653,7 +653,7 @@ def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, 
     # ----------------------
     fig2, ax2 = plt.subplots(figsize=(12, 5))
 
-    iterations = np.arange(1, n_iter -n_init + 1)
+    iterations = np.arange(1, n_iter)
     eps = 1e-12  # small positive to avoid log(0)
     global_min, global_max = float('inf'), 0.0
 
@@ -1058,6 +1058,3 @@ def main(argv=None):
 if __name__ == '__main__':
 
     main()
-    #f_obj = SyntheticTestFun('michalewicz', 2, False, True).to('cuda:1')
-    #results = run_partitionbo(f_obj, SobolGP, n_iter=50, kappa=3.0, device='cuda:1')
-    #print('done')
