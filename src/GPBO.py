@@ -379,7 +379,7 @@ def run_single_kappa(kappa, device, f_obj, model_cls, n_iter, n_reps, bo_method)
     return kappa, stacked_explore.mean(axis=0), stacked_exploit.mean(axis=0)
 
 def run_single_optm(model_label, model_cls, kappa, rep, device, 
-                           f_obj, n_init, n_iter, acq_method):
+                           f_obj, n_iter):
     """
     Worker to run a single repetition for a specific model class.
     """
@@ -390,11 +390,11 @@ def run_single_optm(model_label, model_cls, kappa, rep, device,
     try:
         # Select correct runner
         if model_label in ['SobolGP', 'MHGP']:
-            res = run_partitionbo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, 
-                                  kappa=kappa, acq_method=acq_method, save=False, device=device)
+            res = run_partitionbo(f_obj, model_cls, n_iter=n_iter, 
+                                  kappa=kappa, save=False, device=device)
         else:
-            res = run_bo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, 
-                         kappa=kappa, acq_method=acq_method, save=False, device=device)
+            res = run_bo(f_obj, model_cls, n_iter=n_iter, 
+                         kappa=kappa, save=False, device=device)
             
         # Return lightweight data (numpy arrays)
         return (model_label, {
@@ -707,7 +707,7 @@ def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, 
         'regrets_path': regrets_path
     }
 
-def partition_reconstruction(f_obj,  model_cls, n_init=1, n_iter=200, n_reps= 10, n_sobol=10, kappa=1.0, threshold = 0.05, acq_method='grid', save=False, verbose=False):
+def partition_reconstruction(f_obj,  model_cls, n_init=1, n_iter=200, n_reps= 10, n_sobol=10, kappa=1.0, threshold = 0.05, save=False, verbose=False):
 
     """
     Compute and plot how well partition_updates reconstruct the true Sobol interaction graph.
@@ -780,7 +780,6 @@ def partition_reconstruction(f_obj,  model_cls, n_init=1, n_iter=200, n_reps= 10
                             n_iter=n_iter,
                             n_sobol=n_sobol,
                             kappa=kappa,
-                            acq_method=acq_method,
                             save=False,
                             verbose=verbose)
         
@@ -1044,7 +1043,7 @@ def main(argv=None):
         elif args.method == 'optimization_metrics':
             if args.kappas is None: raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values)')
             kappas = args.kappas
-            result = optimization_metrics(f_obj, kappas, n_iter=args.n_iter, n_reps=args.n_reps)
+            result = optimization_metrics(f_obj, kappas, n_iter=args.n_iter, n_reps=args.n_reps, devices=device_list)
         elif args.method == 'partition_reconstruction':
             result = partition_reconstruction(f_obj, model_cls, n_iter=args.n_iter, n_reps= args.n_reps, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose)
         else:
