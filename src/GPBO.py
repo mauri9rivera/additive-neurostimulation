@@ -378,6 +378,36 @@ def run_single_kappa(kappa, device, f_obj, model_cls, n_iter, n_reps, bo_method)
     
     return kappa, stacked_explore.mean(axis=0), stacked_exploit.mean(axis=0)
 
+def run_single_optm(model_label, model_cls, kappa, rep, device, 
+                           f_obj, n_init, n_iter, acq_method):
+    """
+    Worker to run a single repetition for a specific model class.
+    """
+    f_obj.to(device)
+        
+    print(f"[Worker {device}] Starting {model_label} rep {rep+1} (k={kappa})")
+    
+    try:
+        # Select correct runner
+        if model_label in ['SobolGP', 'MHGP']:
+            res = run_partitionbo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, 
+                                  kappa=kappa, acq_method=acq_method, save=False, device=device)
+        else:
+            res = run_bo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, 
+                         kappa=kappa, acq_method=acq_method, save=False, device=device)
+            
+        # Return lightweight data (numpy arrays)
+        return (model_label, {
+            'regrets': res['regrets'],
+            'exploration': res['exploration'],
+            'exploitation': res['exploitation'],
+            'r2': res['r2']
+        })
+    except Exception as e:
+        print(f"FAILED: {model_label} rep {rep} on {device}: {e}")
+        traceback.print_exc()
+        return None
+
 ### Graph generation functions ###
 
 def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_iter=100, n_reps=15,
@@ -473,7 +503,7 @@ def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_iter=100, n_reps=15,
     plt.close()
     print(f"Saved kappa search plot to {plot_path}")
 
-def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, acq_method = 'grid'):
+def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, devices=['cpu']):
     """
     Run BO variants for f_obj and plot:
       - Plot 1: Exploration (dashed), Exploitation (solid) averaged across n_reps
@@ -502,32 +532,60 @@ def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, 
         #(MHGP, 'orange', 'MHGP',                  kappas[3])
     ]
 
-    # Containers for metrics
+    # Pre-allocate results containers
+    # Structure: raw_results[label] = list of result dicts
+    raw_results = {spec[2]: [] for spec in model_specs}
+    
+    # 1. Prepare Jobs
+    jobs = []
+    num_workers = len(devices)
+    job_idx = 0
+    
+    for model_cls, color, label, kappa in model_specs:
+        for rep in range(n_reps):
+            device = devices[job_idx % num_workers]
+            jobs.append({
+                'model_label': label,
+                'model_cls': model_cls,
+                'kappa': kappa,
+                'rep': rep,
+                'device': device,
+                'f_obj': f_obj,
+                'n_init': n_init,
+                'n_iter': n_iter,
+            })
+            job_idx += 1
+
+    print(f"\nStarting Optimization Metrics with {len(jobs)} total jobs on {num_workers} workers.")
+
+    # 2. Execute Parallel Jobs
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(run_single_optm, **job) for job in jobs]
+        
+        for future in as_completed(futures):
+            res = future.result()
+            if res is not None:
+                label, data = res
+                raw_results[label].append(data)
+
+    # 3. Aggregate and Plot (The rest is mostly your original logic)
+    print("\nProcessing results and generating plots...")
     metrics = {}
     regrets_results = {}
 
-     # Run experiments for each model
     for model_cls, color, label, kappa in model_specs:
-        all_regrets, all_explore, all_exploit, all_r2 = [], [], [], []
-
-        for rep in range(n_reps):
-            if label in ['SobolGP', 'MHGP']:
-                exp_results = run_partitionbo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, acq_method=acq_method)
-            else:
-                exp_results = run_bo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, acq_method=acq_method)
-
-            regrets, explore, exploit, r2 = exp_results['regrets'], exp_results['exploration'], exp_results['exploitation'], exp_results['r2']
-            all_regrets.append(regrets)
-            all_explore.append(explore)
-            all_exploit.append(exploit)
-            all_r2.append(r2)
-
-        # Convert to arrays and average across repetitions
-        all_regrets = np.array(all_regrets)  # shape (n_reps, n_iter)
-        all_explore = np.array(all_explore)
-        all_exploit = np.array(all_exploit)
-        all_r2 = np.array(all_r2)
+        data_list = raw_results[label]
+        if not data_list:
+            print(f"Warning: No results for {label}")
+            continue
             
+        # Stack results
+        all_regrets = np.array([d['regrets'] for d in data_list])
+        all_explore = np.array([d['exploration'] for d in data_list])
+        all_exploit = np.array([d['exploitation'] for d in data_list])
+        all_r2 = np.array([d['r2'] for d in data_list])
+
+        # Averages
         mean_explore = np.mean(all_explore, axis=0)
         mean_exploit = np.mean(all_exploit, axis=0)
         mean_regrets = np.mean(all_regrets, axis=0)
@@ -542,12 +600,21 @@ def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, 
             'kappa': kappa,
         }
 
-        # Compute confidence interval (normal approx)
-        ci_scale = 1.96 if ci == 95 else 1.0  # crude but works
-        ci_regrets = ci_scale * std_regrets / np.sqrt(n_reps)
-        regrets_results[label] = {'mean': mean_regrets, 'ci': ci_regrets, 'color': color, 'kappa': kappa,}
+        # Confidence Interval
+        ci_scale = 1.96 if ci == 95 else 1.0
+        # safety check for single rep
+        denom = np.sqrt(len(data_list)) if len(data_list) > 0 else 1.0
+        ci_regrets = ci_scale * std_regrets / denom
+        
+        regrets_results[label] = {
+            'mean': mean_regrets, 
+            'ci': ci_regrets, 
+            'color': color, 
+            'kappa': kappa
+        }
 
 
+    
     # ----------------------
     # Figure 1: Performance (R², Exploration, Exploitation)
     # ----------------------
@@ -619,10 +686,6 @@ def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, 
     ymax = 10.0 ** log10_max
 
     ax2.set_xlabel('Iteration')
-    #ax2.set_yscale('log')
-    #ax2.set_ylim(ymin, ymax)
-    #ax2.yaxis.set_major_locator(LogLocator(base=10.0))
-    #ax2.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
     ax2.set_ylabel('Regret (log scale)')
     ax2.set_title(f'Mean Log-Regret across {n_reps} runs | {f_obj.d}-{f_obj.name}')
     ax2.set_yscale("log")

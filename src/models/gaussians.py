@@ -1,15 +1,12 @@
 import gpytorch
-import math
 import torch
 import random
 import copy
 import numpy as np
 
-from botorch.acquisition import ExpectedImprovement, UpperConfidenceBound
-from botorch.optim import optimize_acqf
+
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from botorch.models.gpytorch import GPyTorchModel
-from botorch.posteriors import GPyTorchPosterior
 
 
 ### Model utils ###

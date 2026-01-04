@@ -10,7 +10,7 @@ import gpytorch
 
 def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
     """
-    Train an ExactGP + Likelihood model.
+    Train an GP + Likelihood model.
 
     Args:
         gp: ExactGP model
