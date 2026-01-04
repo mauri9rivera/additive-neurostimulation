@@ -6,6 +6,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 import queue
 import threading
+
+
 # ==========================================
 # Part 1: Kernel Definitions (Ground Up)
 # ==========================================
@@ -320,7 +322,7 @@ class GPUWorker(threading.Thread):
         while self.running:
             # Block until we get a command
             try:
-                task = self.in_queue.get(timeout=5.0) 
+                task = self.in_queue.get() 
             except queue.Empty:
                 continue
 
@@ -374,11 +376,11 @@ class AdditiveGPQueue:
     def __init__(self, train_x, train_y, devices=None):
         self.N, self.D = train_x.shape
         self.devices = devices if devices else ['cuda:0' if torch.cuda.is_available() else 'cpu']
-        self.primary_device = self.devices[0]
+        self.primary_device = 'cpu' #self.devices[0]
         self.train_y = train_y.to(self.primary_device)
         
         # Jitter for stability
-        self.jitter = 1e-5
+        self.jitter = 1e-3
         
         # 1. Initialize Sub-Kernels & Workers
         self.workers = []
@@ -434,12 +436,14 @@ class AdditiveGPQueue:
         K_global.requires_grad_(True)
         
         # Manual NLL calculation
-        K_noise = K_global + torch.eye(self.N, device=self.primary_device) * (self.noise + self.jitter)
+        K_noise = K_global + torch.eye(self.N, device=self.primary_device) * (self.noise)
+        K_noise += torch.eye(K_global.size(0), device=self.primary_device) * self.jitter
+        
         try:
             L = torch.linalg.cholesky(K_noise)
         except torch.linalg.LinAlgError:
             # Fallback stability
-            K_noise += torch.eye(self.N, device=self.primary_device) * 1e-3
+            K_noise += torch.eye(self.N, device=self.primary_device) * 1e-2
             L = torch.linalg.cholesky(K_noise)
             
         alpha = torch.cholesky_solve(self.train_y.unsqueeze(1), L)
@@ -516,13 +520,13 @@ def ackley_func(x):
 # Part 6: Runner
 # ==========================================
 
-def benchmark():
+def benchmark_dimensions():
     # Setup
     if torch.cuda.is_available():
         mp.set_start_method('spawn', force=True)
     
     dims = [2, 5, 10, 50, 100,] 
-    N = 5000
+    N = 1000
     modes = ['simple', 'serial', 'threaded']
     if torch.cuda.device_count() > 1:
         modes.append('multiprocess_gpu')
@@ -541,7 +545,7 @@ def benchmark():
 
         for mode in modes:
             if mode == 'simple':
-                gp = ExactGP(X, y, device='cuda:1' if torch.cuda.is_available() else 'cpu')
+                gp = ExactGP(X, y, device='cpu')
                 params = gp.parameters()
             elif mode == 'multiprocess_gpu':
                 gp = AdditiveGPQueue(X, y, devices=devices)
@@ -574,5 +578,64 @@ def benchmark():
             
             print(f"{D:<5} | {mode:<20} | {avg_time:.4f}")
 
+def benchmark_queries():
+    # Setup
+    if torch.cuda.is_available():
+        mp.set_start_method('spawn', force=True)
+    
+    D = 2 
+    n_iters = [100, 1000, 5000, 10000]
+    modes = ['simple', 'serial', 'threaded']
+    if torch.cuda.device_count() > 1:
+        modes.append('multiprocess_gpu')
+        devices = [f'cuda:{i}' for i in range(torch.cuda.device_count())]
+    else:
+        devices = None
+
+    print(f"{'Queries':<5} | {'Mode':<15} | {'Fwd/Bwd Time (s)':<15}")
+    print("-" * 40)
+
+    for N in n_iters:
+        # Data Gen
+        X = torch.rand(N, D) * math.pi
+        y = michalewicz_func(X)
+        y = (y - y.mean()) / y.std() # Normalize
+
+        for mode in modes:
+            if mode == 'simple':
+                gp = ExactGP(X, y, device='cpu')
+                params = gp.parameters()
+            elif mode == 'multiprocess_gpu':
+                gp = AdditiveGPQueue(X, y, devices=devices)
+                params = gp.get_parameters()
+            else:
+                gp = AdditiveGP(X, y, mode=mode, devices=devices)
+                params = gp.get_parameters()
+            
+            optimizer = torch.optim.Adam(params, lr=0.1)
+            
+            # Timing Loop
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            start = time.time()
+
+            for _ in range(50): # Short benchmark
+                optimizer.zero_grad()
+                
+                if mode == 'simple':
+                    loss = gp.negative_log_likelihood()
+                    loss.backward()
+                else:
+                    # The magic happens here: Explicit Parallel Backward
+                    gp.compute_loss_and_gradients()
+                    
+                optimizer.step()
+
+            
+            #if torch.cuda.is_available(): torch.cuda.synchronize()
+            avg_time = (time.time() - start) / 5
+            
+            print(f"{N:<5} | {mode:<20} | {avg_time:.4f}")
+
 if __name__ == "__main__":
-    benchmark()
+    #benchmark_dimensions()
+    benchmark_queries()

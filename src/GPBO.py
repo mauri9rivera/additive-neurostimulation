@@ -1,6 +1,5 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.ticker import LogLocator, LogFormatterMathtext
 import textwrap
 import sys
 import os
@@ -10,7 +9,6 @@ import datetime
 import random
 import copy
 import argparse
-import ast
 import time
 from gpytorch.models.exact_gp import GPInputWarning
 
@@ -23,1371 +21,50 @@ from SALib.sample import sobol as sobol_sampler
 from scipy.stats import qmc, uniform
 from scipy.stats import sobol_indices as scipy_sobol
 
-#from UQpy.sensitivity.PceSensitivity import PceSensitivity
-#from UQpy.distributions import Uniform, JointIndependent
-#from UQpy.surrogates import *
-#from UQpy.surrogates.polynomial_chaos.PolynomialChaosExpansion import PolynomialChaosExpansion
 
-
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error
-
-from concurrent.futures import ThreadPoolExecutor
-import threading
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import warnings
 import traceback
 
 ### MODULES HANDLING ###
-# If the package structure differs you may need to adjust PYTHONPATH or the imports below
 from utils.synthetic_datasets import *
+from utils.sensitivity_utils import *
+from models.gaussians import *
+from models.sobols import *
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="SALib.util")
 
 
-### GLOBAL VARIABLES ###
-DEVICE = 'cpu' #'cuda' if torch.cuda.is_available() else 'cpu'
-
-# ---------- GP classes ----------
-
-class ExactGP(gpytorch.models.ExactGP):
-    def __init__(self, train_x, train_y, likelihood):
-        super(ExactGP, self).__init__(train_x, train_y, likelihood)
-        self.mean_module = gpytorch.means.ConstantMean()
-        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=train_x.shape[-1]))
-        self.likf = likelihood
-        self.name = 'ExactGP'
-
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
-class AdditiveGP(gpytorch.models.ExactGP):
-
-    def __init__(self, X_train, y_train, likelihood):
-        super().__init__(X_train, y_train, likelihood)
-        input_dim = X_train.shape[-1]
-        self.covar_module = gpytorch.kernels.ScaleKernel(
-                                gpytorch.kernels.MaternKernel(
-                                    nu=2.5,
-                                    batch_shape=torch.Size([input_dim]),
-                                    ard_num_dims=1,
-                                )
-        )
-
-        self.mean_module = gpytorch.means.ConstantMean()
-        self.likelihood = likelihood
-        self.name = 'AdditiveGP'
-
-    @property
-    def num_outputs(self):
-        return 1
-
-    def forward(self, X):
-        mean = self.mean_module(X)
-        batched_dimensions_of_X = X.mT.unsqueeze(-1)  # Now a d x n x 1 tensor
-        covar = self.covar_module(batched_dimensions_of_X).sum(dim=-3)
-        return gpytorch.distributions.MultivariateNormal(mean, covar)
-
-class MHGP(gpytorch.models.ExactGP):
-
-    def __init__(self, train_x, train_y, likelihood, partition = None, history = None, sobol=None, epsilon=8e-2):
-
-        super().__init__(train_x, train_y, likelihood)
-        self.mean_module = gpytorch.means.ZeroMean() 
-        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
-        self.history = history if history else [self.partition_to_key(self.partition)] 
-        self.sobol = sobol
-        self.name = 'MHGP'
-        self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.08 # - 0.02 * min(1.0, (self.n_dims**2 / 30.0))
-        self.split_bias = 0.7
-        self.max_attempts = self.bell_number(self.n_dims)
-
-        #build covar_module based on partition
-        self._build_covar()
-
-    def _build_covar(self):
-
-        kernels = []
-        for group in self.partition:
-
-            ard_dims = len(group)
-
-            base_kernel = gpytorch.kernels.MaternKernel(
-                nu = 2.5,
-                ard_num_dims = ard_dims,
-                active_dims = group,
-            )
-
-            scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel)
-
-            kernels.append(scaled_kernel)
-
-        self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)
-
-    def partition_to_key(self, partition):
-        return tuple(sorted(tuple(sorted(sub)) for sub in partition))
-
-    def check_history(self, new_partition):
-        """
-        Return True if the canonical key for new_partition is already in history.
-        """
-        key = self.partition_to_key(new_partition)
-        return key in self.history
-    
-    def update_partition(self, new_partition):
-
-        # normalize indices to ints
-        new_key = self.partition_to_key(new_partition)
-        current_key = self.partition_to_key(self.partition)
-        # avoid unnecessary rebuilds:
-        if new_partition == current_key:
-            return
-        self.partition = [list(grp) for grp in new_key]
-        self._build_covar()
-    
-    def sobol_partitioning(self, interactions):
-        
-        old_partition = self.partition
-        has_candidate = False
-        attempts = 0
-
-        if len(self.history) == self.max_attempts:
-            return old_partition
-
-        while not has_candidate and attempts < (self.max_attempts + 5):
-
-            new_partition = copy.deepcopy(self.partition)
-            
-            # Split strategy
-            if random.random() < self.split_bias:
-
-                robbed_idx = random.randint(0, len(new_partition) - 1)
-                robbed_subset = new_partition[robbed_idx]
-
-                if len(robbed_subset) > 1:
-
-                    victim = np.random.choice(robbed_subset) #, random.randint(1, len(splitted_subset) - 1))
-                    robbed_subset.remove(victim)
-                    new_partition[robbed_idx] = robbed_subset # to fix split duplicate singletons issue
-                    new_partition.append([victim.astype(int)]) 
-                
-                    if (not self.check_history(new_partition)) and self.are_additive(victim, robbed_subset, interactions):
-
-                        has_candidate = True
-                        return new_partition
-                else:
-                    attempts+=1
-
-            # Merge strategy
-            else:
-                
-                if len(new_partition) > 1:
-
-                    robber_idx, robbed_idx = random.sample(range(len(new_partition)), 2)
-
-                    robbed_subset = new_partition[robbed_idx]
-                    robber_subset = new_partition[robber_idx]
-
-                    new_partition.remove(robbed_subset)
-                    new_partition.remove(robber_subset)
-                    new_partition.append(robbed_subset + robber_subset)
-
-                    all_additive = True
-                    for victim in robbed_subset:
-                            additive = self.are_additive(victim, robber_subset, interactions)
-                            if not additive:
-                                all_additive = False
-                                break
-                    
-                    has_candidate = all_additive
-                    if has_candidate and (not self.check_history(new_partition)):
-                        return new_partition
- 
-            attempts +=1
-
-        #print(f'Number of attempts exceedded')
-        return old_partition
-
-    def bell_number(self, n):
-        bell = [[0]*(n+1) for _ in range(n+1)]
-        bell[0][0] = 1
-        for i in range(1, n+1):
-            bell[i][0] = bell[i-1][i-1]
-            for j in range(1, i+1):
-                bell[i][j] = bell[i-1][j-1] + bell[i][j-1]
-        return bell[n][0]
-
-    def are_additive(self, individual, set, interactions):
-
-        for evaluator in set:
-
-            i = min(evaluator, individual)
-            j = max(evaluator, individual)
-
-            if interactions[j] > self.epsilon:
-                return False
-        
-        return True
-        
-    def calculate_acceptance(self, proposed_model):
-
-        self.train()
-        self.likelihood.train()
-        proposed_model.train()
-        proposed_model.likelihood.train()
-
-        mll_curr = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
-        mll_proposed = gpytorch.mlls.ExactMarginalLogLikelihood(proposed_model.likelihood, proposed_model)
-        train_inputs = tuple(t.to(DEVICE) for t in self.train_inputs)
-
-        curr_evidence = mll_curr(self(*train_inputs), self.train_targets)
-        proposed_evidence = mll_proposed(proposed_model(proposed_model.train_inputs[0]), proposed_model.train_targets)
-
-        acceptance = min(1.0, proposed_evidence / (curr_evidence + 1e-9))
-
-        return acceptance
-    
-    def metropolis_hastings(self, interactions, device=DEVICE):
-
-        # update sobol interactions from surrogate model training
-        new_partition = self.sobol_partitioning(interactions)
-        if new_partition == self.partition:
-            return self.partition
-        proposed_model = MHGP(self.train_inputs[0], self.train_targets, gpytorch.likelihoods.GaussianLikelihood(), 
-                              partition=new_partition, history=self.history, sobol=self.sobol)
-        proposed_model.to(device)
-        proposed_model.likelihood.to(device)
-        proposed_model, proposed_model.likelihood, _ = optimize(proposed_model, proposed_model.train_inputs[0], proposed_model.train_targets)
-        
-        acceptance_ratio = self.calculate_acceptance(proposed_model)
-
-        if acceptance_ratio >= 1.0:
-            #print(f'Update for model accepted! Genetics propose to partition {new_partition} from {self.partition} with acceptance {acceptance_ratio}')
-            self.history.append(self.partition_to_key(new_partition))
-            return new_partition
-
-        else: 
-            return self.partition 
-        
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
-class SobolGP(gpytorch.models.ExactGP):
-
-    """
-    Exact GP that composes an additive kernel according to `partition`.
-    - partition: list of lists of integer dimension indices, e.g. [[0,2],[1,3]]
-    - sobol: an associated Sobol object (optional)
-    - epsilon: additivity threshold (kept as attribute)
-    """
-    def __init__(self, train_x, train_y, likelihood, partition=None, history = None, sobol=None, epsilon=8e-2):
-        super(SobolGP, self).__init__(train_x, train_y, likelihood)
-        self.mean_module = gpytorch.means.ZeroMean()
-        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
-        self.history = history if history else None
-        self.sobol = sobol
-        self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.08 #- 0.02 * min(1.0, (self.n_dims**2 / 30.0))
-        self.name = 'SobolGP'
-        # build covar_module based on partition
-        self._build_covar()
-
-    def _build_covar(self):
-
-        kernels = []
-        for group in self.partition:
-
-            ard_dims = len(group)
-
-            base_kernel = gpytorch.kernels.MaternKernel(
-                nu = 2.5,
-                ard_num_dims = ard_dims,
-                active_dims = group,
-            )
-
-            scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel)
-
-            kernels.append(scaled_kernel)
-
-        self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)
-
-    def update_partition(self, new_partition):
-
-        # normalize indices to ints
-        new_partition = [list(map(int, grp)) for grp in new_partition if len(grp) > 0]
-        # avoid unnecessary rebuilds:
-        if new_partition == self.partition:
-            return
-        self.partition = new_partition
-        self._build_covar()
-
-    def reconfigure_space(self, surrogate, surrogate_likelihood):
-    
-        # update Sobol interactions based on new surrogate train data
-        interactions = self.sobol.method(surrogate.train_inputs[0], surrogate.train_targets, surrogate)
-        new_partition = self.sobol.update_partition(interactions)
-        #self.update_partition(new_partition)
-
-        return interactions, new_partition
-
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
-class Sobol_old:
-    """
-    Uses SALib to compute variance-based Sobol indices (including second-order),
-    and produce a partition based on thresholds of interaction strength.
-
-    Attributes:
-      epsilon : float threshold on |S2_ij| above which we consider (i,j) interacting
-      problem : dict for SALib problem definition (names, bounds, etc.)
-        Initialized when first compute_interactions is called.
-
-    Methods:
-      compute_interactions(train_x, train_y) -> interactions matrix (d x d numpy)
-      update_partition(interactions) -> partition (list of list of dims)
-    """
-
-    def __init__(self, f_obj, epsilon=5e-2, n_sobol_samples=None):
-        """
-        epsilon: threshold for second-order interactions
-        n_sobol_samples: number of base samples N used by SALib's Saltelli sampler.
-            If None, some default (e.g. 1024) will be chosen.
-        """
-        d = f_obj.d
-        self.epsilon = 0.05 # - 0.02 * min(1.0, (d**2 / 30.0))
-        self.problem = self._build_problem(f_obj)  # to be set up when know input bounds and d
-
-    def _build_problem(self, f_obj):
-        """
-        Build SALib 'problem' dict from data array x_np shape (n, d).
-        Uses per-dimension observed min/max as bounds (assumes uniform marginals).
-        """
-        d = f_obj.d
-        lb = f_obj.lower_bounds
-        ub = f_obj.upper_bounds
-        problem = {
-            'num_vars': int(d),
-            'names': np.array([f"x{i}" for i in range(d)]),
-            'bounds': np.stack([lb, ub], axis=1).tolist()
-        }
-
-        return problem
-
-    def bell_number(self, n):
-        bell = [[0]*(n+1) for _ in range(n+1)]
-        bell[0][0] = 1
-        for i in range(1, n+1):
-            bell[i][0] = bell[i-1][i-1]
-            for j in range(1, i+1):
-                bell[i][j] = bell[i-1][j-1] + bell[i][j-1]
-        return bell[n][0]
-
-    def update_interactions(self, train_x, train_y, simulator, likelihood):
-        """
-        Calculate second-order Sobol indices using GP metamodel as described in the paper.
-        
-        Args:
-            train_x: Tensor (n, d) or array - training inputs
-            train_y: Tensor or array (n,) or (n,1) - training outputs  
-            simulator: trained ExactGP model
-            likelihood: corresponding GPyTorch likelihood            
-        Returns:
-            interactions: numpy array (d, d), symmetric, with entries S2[i,j]
-        """
-        
-        # Retrain the surrogate model
-        simulator, likelihood, _ = optimize(simulator, train_x, train_y)
-        
-        n, d = train_x.shape
-        
-        # Determine number of Monte Carlo samples
-        N = self.n_sobol_samples or (n // (2 * (d + 2)))
-        N = max(N, 2048)
-        
-        # Generate Saltelli samples
-        param_values = sobol_sampler.sample(self.problem, N, calc_second_order=True, skip_values=N*2)
-        param_values = np.asarray(param_values, dtype=np.float32)
-        
-        M = param_values.shape[0] // (2 * d + 2)  # Actual number of MC samples per matrix
-        
-        # Split Saltelli samples into matrices A, B, and hybrid matrices
-        # Saltelli sequence: [A, B, AB_1, AB_2, ..., AB_d, BA_1, BA_2, ..., BA_d]
-        A = param_values[:M]  # First M samples
-        B = param_values[M:2*M]  # Next M samples
-        
-        # Extract hybrid matrices A_B_i and B_A_i
-        A_B = {}  # A with i-th column from B
-        B_A = {}  # B with i-th column from A
-        
-        for i in range(d):
-            start_idx = 2*M + i*M
-            A_B[i] = param_values[start_idx:start_idx + M]
-            
-            start_idx = 2*M + d*M + i*M  
-            B_A[i] = param_values[start_idx:start_idx + M]
-        
-        # Convert to torch tensors
-        device = train_x.device
-        dtype = train_x.dtype
-        
-        A_tensor = torch.tensor(A, device=device, dtype=dtype)
-        B_tensor = torch.tensor(B, device=device, dtype=dtype)
-        
-        # Evaluate GP at all points
-        simulator.eval()
-        likelihood.eval()
-        
-        with torch.no_grad():
-            # Evaluate at A and B
-            pred_A = likelihood(simulator(A_tensor)).mean.cpu().numpy().flatten()
-            pred_B = likelihood(simulator(B_tensor)).mean.cpu().numpy().flatten()
-            
-            # Evaluate at hybrid matrices
-            pred_A_B = {}
-            pred_B_A = {}
-            
-            for i in range(d):
-                A_B_tensor = torch.tensor(A_B[i], device=device, dtype=dtype)
-                B_A_tensor = torch.tensor(B_A[i], device=device, dtype=dtype)
-                
-                pred_A_B[i] = likelihood(simulator(A_B_tensor)).mean.cpu().numpy().flatten()
-                pred_B_A[i] = likelihood(simulator(B_A_tensor)).mean.cpu().numpy().flatten()
-        
-        # Calculate variance term V[fGP_N([A B])]
-        all_preds = np.concatenate([pred_A, pred_B])
-        V = np.var(all_preds)
-        
-        # Calculate first order indices S_i (needed for second order)
-        S_i = np.zeros(d)
-        for i in range(d):
-            numerator = np.mean(pred_B * (pred_A_B[i] - pred_A))
-            S_i[i] = numerator / V
-        
-        # Calculate second order indices S_ij using Equation (20) from the paper
-        interactions = np.zeros((d, d))
-        
-        for i in range(d):
-            for j in range(d):
-                if i != j:  # Second order indices are for i ≠ j
-                    # Equation (20): S_ij = [1/M * sum(fGP(B_A_i) * fGP(A_B_j) - fGP(A) * fGP(B))] / V - S_i - S_j
-                    term1 = np.mean(pred_B_A[i] * pred_A_B[j] - pred_A * pred_B)
-                    S_ij = (term1 / V) - S_i[i] - S_i[j]
-                    interactions[i, j] = max(S_ij, 0)  # Sobol indices should be non-negative
-                else:
-                    # Diagonal elements are not second-order indices (set to 0)
-                    interactions[i, j] = 1.0
-        
-        # Make symmetric (S_ij = S_ji in Sobol decomposition)
-        for i in range(d):
-            for j in range(i+1, d):
-                avg = (interactions[i, j] + interactions[j, i]) / 2
-                interactions[i, j] = avg
-                interactions[j, i] = avg
-        
-        return interactions
-
-    def update_interactions_rf(self, train_x, train_y, simulator, likelihood,
-                                n_estimators=100, max_depth=None, 
-                                min_samples_split=3, min_samples_leaf=3, bootstrap=True):
-
-        x = train_x.detach().cpu().numpy()
-        y = train_y.detach().cpu().numpy()
-        y = y.reshape(-1)
-        n, d = x.shape
-        max_depth = self.bell_number(self.problem['num_vars'])
-        # Train Random Forest
-        rf_model = RandomForestRegressor(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            min_samples_split=min_samples_split,
-            min_samples_leaf=min_samples_leaf,
-            bootstrap=bootstrap,
-            criterion='poisson',
-            random_state=42,  # for reproducibility
-            n_jobs=-1  # use all available cores
-        )
-        
-        rf_model.fit(x, y)
-
-        # Determine number of samples for Sobol analysis
-        N = self.n_sobol_samples or (n // (2 * (d + 2)))
-        N = max(N, 2048)
-
-        # Generate Saltelli samples
-        param_values = sobol_sampler.sample(self.problem, N, calc_second_order=True, skip_values=N*2)
-        param_values = np.asarray(param_values, dtype=np.float32)
-        
-        # Use Random Forest to predict (very fast)
-        y_s = rf_model.predict(param_values)
-        
-        if np.var(y_s) < 1e-12 or np.unique(y_s).size <= 1:
-            d = self.problem['num_vars']
-            S2_sym = np.zeros((d, d), dtype=float)
-            np.fill_diagonal(S2_sym, 0.0)
-            return S2_sym
-
-        # Analyze with SALib
-        Si = salib_sobol.analyze(
-            self.problem, y_s,
-            calc_second_order=True, print_to_console=False
-        )
-
-        # Build symmetric interactions matrix
-        S2 = np.asarray(Si['S2'], dtype=float)
-        S2 = np.nan_to_num(S2, nan=0.0)
-        S2 = np.clip(S2, a_min=0.0, a_max=None)
-        np.fill_diagonal(S2, 1.0)
-
-        return S2
-
-    def update_interactions_pce(self, train_x, train_y, simulator, likelihood, grid_x):
-        """
-        Compute Sobol interactions using UQPy's PCE and sensitivity analysis.
-        
-        Args:
-            train_x: numpy array (n, d)
-            train_y: numpy array (n,)
-        """
-
-        simulator, likelihood, _ = optimize(simulator, train_x, train_y,)
-
-        simulator.eval(), likelihood.eval()
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            post = likelihood(simulator(grid_x))
-            y = post.mean.cpu().numpy()
-        y = np.asarray(y)
-
-        x = grid_x.detach().cpu().numpy()
-        #y = train_y.detach().cpu().numpy()
-        #y = y.reshape(-1)
-
-        n, d = x.shape
-        
-        # 1. Define distributions for each dimension based on your problem bounds
-        bounds = self.problem['bounds']  # From your _build_problem method
-        distributions = [Uniform(loc=low, scale=high) for low, high in bounds]
-        joint = JointIndependent(marginals=distributions)
-
-        P = self.problem['num_vars']
-        polynomial_basis = TotalDegreeBasis(joint, P)
-        regressor = LeastSquareRegression()
-
-        # 2. Build the PCE surrogate
-        pce = PolynomialChaosExpansion(polynomial_basis=polynomial_basis, regression_method=regressor)
-        
-        # Train the PCE model with your data
-        pce.fit(x, y)
-        
-        # 3. Compute sensitivity indices
-        pce_sensitivity = PceSensitivity(pce_object=pce)
-        pce_sensitivity.run()
-        
-        # 4. Extract second-order indices and build matrix
-        sobol_first = pce_sensitivity.first_order_indices
-        sobol_total = pce_sensitivity.total_order_indices
-
-        S2 = np.zeros((d,d))
-        # for every i  in range(d), calculate if its additive by sobol_total[0][0] - sobol_first[[0][0]]
-        #print(f'Additive? {sobol_total[0][0] - sobol_first[0][0]} <= 0.05\n')
-        
-        # Build symmetric second-order interaction matrix (approximation)
-        S2 = np.zeros((d,d))
-        for i in range(d):
-
-            additive = sobol_total[i][0] - sobol_first[0][0]
-
-            for j in range(i+1, d):
-                
-                S2[i,j] = additive
-                S2[j,i] = additive
-
-        return S2
-
-    def update_partition(self, interactions):
-        """
-        Partition dimensions using a greedy algorithm based on 2nd-order interactions.
-
-        Inputs:
-        - interactions: numpy array (d, d) symmetric matrix with 2nd-order Sobol indices.
-                        Only the upper diagonal is needed but full symmetric is expected.
-        Output:
-        - partitions: list of lists, each sublist contains indices belonging to a partition.
-        """
-        d = self.problem['num_vars']
-
-        # initialize stack of dimensions
-        S = list(range(d))
-
-        # P will hold the partitions
-        P = []
-        # seed P with first element
-        P.append([S.pop()])
-
-        while S:
-            e = S.pop()
-            additive = True
-            modif = False
-
-            for sub in P:
-                if modif:
-                    break
-                for x in sub:
-                    if modif:
-                        break
-                    if interactions[e, x] > self.epsilon:
-                        additive = False
-                        sub.append(e)
-                        modif = True
-
-            if additive:
-                P.append([e])
-
-        return P
-
-class Sobol:
-    """
-    Uses SALib to compute variance-based Sobol indices (including second-order),
-    and produce a partition based on thresholds of interaction strength.
-
-    Attributes:
-      epsilon : float threshold for 'additivity' interaction
-      problem : dict for SALib problem definition (names, bounds, etc.)
-      method: string describing what Sobol global sensitivity analysis method to use.
-      M: int (power of two) for sobol sampler
-      B: int bootstrap for sobol methods
-
-    Methods:
-      compute_interactions(train_x, train_y) -> interactions matrix (d x d numpy)
-      update_partition(interactions) -> partition (list of list of dims)
-    """
-
-    def __init__(self, f_obj, epsilon=8e-2, method='scipy', M=2048, B=128):
-        """
-        f_obj: SyntheticTestFun object for the test function to optimize
-        epsilon: threshold for high-order sobol interactions
-        B: number of bootstrap samples
-        M: number of monte-carlo samples for sobol metamodel
-        method: string representing the Sobol global sensitivity analysis method to use.
-        """
-        self.epsilon = 0.08 # - 0.02 * min(1.0, (d**2 / 30.0))
-        self.B = B
-        self.M = M
-        self.problem = self._build_problem(f_obj)
-
-        method_map = {
-            'scipy': self.interactions_scipy,
-            'wirthl': self.interactions_wirthl,
-            'deriv': self.interactions_deriv,
-            'tt': self.interactions_tt,
-            'asm': self.interactions_asm
-        }
-        self.method = method_map[method]
-
-
-    def _build_problem(self, f_obj):
-        """
-        Build SALib 'problem' dict from data array x_np shape (n, d).
-        Uses per-dimension observed min/max as bounds (assumes uniform marginals).
-        """
-        d = f_obj.d
-        lb = f_obj.lower_bounds
-        ub = f_obj.upper_bounds
-        problem = {
-            'num_vars': int(d),
-            'names': np.array([f"x{i}" for i in range(d)]),
-            'bounds': np.stack([lb, ub], axis=1).tolist()
-        }
-
-        return problem
-    
-    def interactions_wirthl(self, train_x, train_y, metamodel):
-        """
-        Calculate higher-order Sobol indices using GP metamodel as described in the paper
-        Global Sensitivity Analysis based on GP metamodelling for complex biomechanical problems.
-        
-        Args:
-            train_x: Tensor (n, d) or array - training inputs
-            train_y: Tensor or array (n,) or (n,1) - training outputs  
-            simulator: trained ExactGP model
-            likelihood: corresponding GPyTorch likelihood            
-        Returns:
-            high-order interactions mean, variance and 95% confidence interval
-        """
-
-        #problem vars
-        d = self.problem['num_vars']
-        self.NZ = train_x.shape[0] 
-        
-        # tensor converters
-        device = train_x.device
-        dtype = train_x.dtype
-        
-        # Train the meta model
-        metamodel, metamodel.likelihood, _ = optimize(metamodel, train_x, train_y)
-
-        # Generate Monte-Carlo samples
-        A = sobol_sampler.sample(self.problem, self.M, calc_second_order=True, skip_values=self.M*2)
-        B = sobol_sampler.sample(self.problem, self.M, calc_second_order=True, skip_values=self.M*2)
-        A, B = torch.tensor(A, device=device, dtype=dtype), torch.tensor(B, device=device, dtype=dtype)
-        A_B = {i: copy.deepcopy(A) for i in range(d)}
-        B_A = {i: copy.deepcopy(B) for i in range(d)}
-        for i in range(d):
-            A_B[i][:, i] = B[:, i]
-            B_A[i][:, i] = A[:,i] 
-
-        high_order_estimates = torch.zeros((self.NZ, self.B, d))
-        second_order_estimates = torch.zeros((self.NZ, self.B, d, d))
-
-        metamodel.eval(); metamodel.likelihood.eval()
-
-        # Repeat for all metamodel realizations
-        for k in range(self.NZ):
-
-            # Sample realisations of metamodel at MC samples
-            with torch.no_grad():
-
-                # Get metamodel realization
-                f_A_post = metamodel.likelihood(metamodel(A))
-                f_B_post = metamodel.likelihood(metamodel(B))
-                f_A_B_post = {i: metamodel.likelihood(metamodel(A_B[i])) for i in range(d)}
-                f_B_A_post = {i: metamodel.likelihood(metamodel(B_A[i])) for i in range(d)}
-
-                for b in range(self.B):
-
-                    # Get bootstrap sample
-                    f_A_sample = f_A_post.sample(sample_shape=torch.Size([self.B]))
-                    f_B_sample = f_B_post.sample(sample_shape=torch.Size([self.B]))
-                    f_A_B_sample = {i: f_A_B_post[i].sample(sample_shape=torch.Size([self.B])) for i in range(d)}
-                    f_B_A_sample = {i: f_B_A_post[i].sample(sample_shape=torch.Size([self.B])) for i in range(d)}
-
-                    # Valculate total variance between A, B
-                    V = torch.var(torch.cat([f_A_sample.flatten(), f_B_sample.flatten()]))
-                    V += 1e-9
-
-                    #Saltelli formula for first order interaction
-                    S_1 = torch.zeros(d)
-                    for i in range(d):
-                        numerator = torch.mean(f_B_sample*(f_A_B_sample[i] - f_A_sample))
-                        S_1[i] = numerator / V
-
-                    # Jansen formula for total order interaction
-                    S_T = torch.zeros(d)
-                    for i in range(d):
-                        numerator = 0.5 * torch.mean((f_A_sample - f_A_B_sample[i])**2)
-                        S_T[i] = numerator / V
-
-                    # Calculate second order interactions
-                    S_2 = torch.ones((d, d))
-    
-                    for i in range(d):
-                        for j in range(i+1, d):
-                            numerator = torch.mean((f_A_B_sample[i]*f_B_A_sample[j]) - (f_A_sample*f_B_sample))
-                            S_2[i, j] = (numerator / V) - S_1[i] - S_1[j]
-                            S_2[j, i] = S_2[i, j]
-
-                    # Calculate high-order indices for bootstrap, gp_realization sample
-                    high_order_estimates[k, b, : ] = S_T - S_1
-                    second_order_estimates[k, b, :, :] = S_2
-        
-        # Evaluate statistics: mean + variance
-        high_order_interactions = high_order_estimates.reshape(-1, d).cpu().numpy()
-        second_order_interactions = second_order_estimates.cpu().numpy()
-
-        # (Equation 19)
-        high_order_mean = np.mean(high_order_interactions, axis=0)
-        # (Equation 20)
-        high_order_variance = np.var(high_order_interactions, axis=0, ddof=1)
-
-        # Calculate confidence intervals (95% by default)
-        confidence_level = 0.95
-        alpha = 1 - confidence_level
-        lower_percentile = alpha / 2 * 100
-        upper_percentile = (1 - alpha / 2) * 100
-        
-        confidence_intervals = np.column_stack([
-            np.percentile(high_order_interactions, lower_percentile, axis=0),
-            np.percentile(high_order_interactions, upper_percentile, axis=0)
-        ])
-
-        print(f'Results for interactions of Wirthl (SobolGP) method\n')
-        print(f'Higher order interactions: {high_order_mean} with var: {high_order_variance}')
-
-        #print(f'mean second order interactions: \n {np.mean(second_order_interactions, axis=(0,1))}')
-
-        #return high_order_mean, high_order_variance, confidence_intervals        
-
-    def interactions_scipy(self, train_x, train_y, metamodel):
-        """
-        Calculate higher-order Sobol indices using GP metamodel and Scipy's machinery 
-        
-        Args:
-            train_x: Tensor (n, d) or array - training inputs
-            train_y: Tensor or array (n,) or (n,1) - training outputs  
-            simulator: trained ExactGP model
-            likelihood: corresponding GPyTorch likelihood            
-        Returns:
-            high-order interactions mean, variance and 95% confidence interval
-        """
-
-        #problem vars
-        d = self.problem['num_vars']
-        self.NZ = train_x.shape[0]
-        
-        # tensor converters
-        device = train_x.device
-        dtype = train_x.dtype
-        
-        # Train the meta model
-        metamodel, metamodel.likelihood, _ = optimize(metamodel, train_x, train_y)
-
-        # Define Distributions for Scipy
-        bounds = np.array(self.problem['bounds'], dtype=np.float32)
-        lb = bounds[:, 0]
-        ub = bounds[:, 1]
-        
-        dists = [
-            uniform(loc=b[0], scale=b[1] - b[0]) 
-            for b in bounds
-        ]
-
-        metamodel.eval(); metamodel.likelihood.eval()
-        # Define Wrapper Function
-        def gp_mean_wrapper(x_np):
-            
-            x_tens = torch.tensor(np.transpose(x_np), device=device, dtype=dtype) # Convert Scipy's numpy input to Torch tensor
-            with torch.no_grad():
-                output = metamodel.likelihood(metamodel(x_tens))
-                mean_pred = output.mean
-            return mean_pred.cpu().numpy().reshape(-1) # Return numpy array to Scipy
-
-
-        # ---- Bootstrap storage ----
-        S1_boot = np.zeros((self.B, d))
-        ST_boot = np.zeros((self.B, d))
-        high_boot = np.zeros((self.B, d))
-
-
-        for b in range(self.B):
-
-            result = scipy_sobol(
-            func=gp_mean_wrapper, 
-            n=self.B, 
-            dists=dists, 
-            )
-
-            # Extract components
-            S1 = result.first_order     # (d,)
-            ST = result.total_order     # (d,)
-            # S2 = res["S2"]    # (d, d) -- available if needed
-
-            #print(f'confidence interval: {result.bootstrap().total_order.confidence_interval}')
-
-            S1_boot[b] = S1
-            ST_boot[b] = ST
-            high_boot[b] = ST - S1     # higher-order index
-
-
-        # ---- Aggregation over bootstrap ----
-        high_mean = high_boot.mean(axis=0)
-        high_var = high_boot.var(axis=0, ddof=1)
-        S1_tot = S1_boot.mean(axis=0)
-        ST_tot = ST_boot.mean(axis=0)
-
-        #print(f'predicted S1: {S1_tot} and predicted S_total: {ST_tot}')
-
-        # 95% CI
-        lower = np.percentile(high_boot, 2.5, axis=0)
-        upper = np.percentile(high_boot, 97.5, axis=0)
-        CI = np.vstack([lower, upper]).T
-
-        #print(f'Results for interactions of Saltelli-scipy (SobolGP) method\n')
-        #print(f'Higher order interactions: {high_mean} with var: {high_var}')
-
-        return high_mean
-
-    def interactions_deriv(self, train_x, train_y, metamodel):
-        """
-        Calculate derivative-based sensitivity indices (DGSM) using GP gradients.
-        Serves as a computationally efficient proxy for Total Interaction indices.
-
-        Approximation:
-            S_tot_i ~ E[(df/dx_i)^2] * Var(X_i) / Var(Y)
-        
-        Args:
-            train_x: Tensor (n, d)
-            train_y: Tensor (n, 1)
-            metamodel: GPyTorch model
-            
-        Returns:
-            dgsm_mean: (d,) array of normalized derivative indices
-            dgsm_var: (d,) variance of the index (across GP realizations)
-            confidence_intervals: (d, 2) 95% CI
-        """
-        
-        # 1. Setup & Optimization
-        d = self.problem['num_vars']
-        self.NZ = train_x.shape[0] # Keeping your convention of using N for realizations
-        
-        device = train_x.device
-        dtype = train_x.dtype
-
-        # Train/Optimize the metamodel
-        metamodel, metamodel.likelihood, _ = optimize(metamodel, train_x, train_y)
-        metamodel.eval(); metamodel.likelihood.eval()
-
-        # 2. Generate Evaluation Points (Sobol sequence, but just N samples)
-        X_eval = torch.tensor(sobol_sampler.sample(self.problem, self.M, calc_second_order=False), device=device, dtype=dtype)
-        X_eval.requires_grad_(True)
-
-        # 3. Pre-calculate variances for Normalization
-        var_x = torch.var(train_x, dim=0).detach() + 1e-9 
-
-        dgsm_estimates = torch.zeros((self.B, d), device=device) # Shape: (B, d) -> We assume B (bootstrap) is 1 per realization or synonymous with NZ loop
-
-        # 4. Compute Derivatives over GP Realizations
-        for k in range(self.B):
-            
-            output_dist = metamodel.likelihood(metamodel(X_eval))
-            
-            # Sample a single posterior function realization
-            # shape: (M,) (M samples of the function)
-            f_sample = output_dist.rsample(sample_shape=torch.Size([1])).squeeze(0)
-
-            var_y_pred = torch.var(f_sample).detach() + 1e-9
-
-            # Compute gradients: d(f_sample) / d(X_eval)
-            grad_outputs = torch.ones_like(f_sample)
-            grads = torch.autograd.grad(
-                outputs=f_sample, 
-                inputs=X_eval, 
-                grad_outputs=grad_outputs,
-                create_graph=False, # We don't need 2nd derivatives
-                retain_graph=False,
-                only_inputs=True
-            )[0] # Shape: (M, d)
-            
-
-            # Calculate DGSM (unnormalized): E[(df/dx)^2]
-            nu_i = torch.mean(grads**2, dim=0) # Average over M spatial samples -> (d,)
-
-            # Normalize to match Sobol scale: nu_i * Var(X) / Var(Y)
-            S_proxy = (nu_i * var_x) / var_y_pred
-            
-            dgsm_estimates[k, :] = S_proxy
-
-            # Zero out gradients for next loop (safety, though X_eval is re-used)
-            if X_eval.grad is not None:
-                X_eval.grad.zero_()
-
-        # 5. Statistics & Output
-        dgsm_np = dgsm_estimates.cpu().numpy()
-
-        dgsm_mean = np.mean(dgsm_np, axis=0)
-        dgsm_var = np.var(dgsm_np, axis=0, ddof=1)
-
-        # 95% Confidence Intervals
-        confidence_level = 0.95
-        alpha = 1 - confidence_level
-        lower = np.percentile(dgsm_np, alpha / 2 * 100, axis=0)
-        upper = np.percentile(dgsm_np, (1 - alpha / 2) * 100, axis=0)
-        confidence_intervals = np.column_stack([lower, upper])
-
-        print(f'Results for interactions of derivative-based sensitivity measure (DGSM) method')
-        print(f"Effectively an upper bound on the total order sobol indices \n")
-        print(f'predicted mean: {dgsm_mean} and var: {dgsm_var}')
-
-    def interactions_tt(self, train_x, train_y, metamodel):
-        """
-        Calculate higher-order Sobol indices using Tensor Train (TT) decomposition.
-
-        Method:
-            1. Uses TT-Cross approximation to compress the GP Posterior Mean into a TT.
-            2. Computes Sobol indices analytically from the TT cores.
-            3. Approximates 'High Order' as S_total - S_1.
-
-        Note:
-            This method analyzes the deterministic 'Mean' surface of the GP. 
-            Variance and CIs are returned as zeros because the TT-Cross is 
-            performed once on the expected predictor.
-
-        Args:
-            train_x: Tensor (n, d)
-            train_y: Tensor (n, 1)
-            metamodel: GPyTorch model
-
-        Returns:
-            tt_mean: (d,) array of high-order interaction indices
-            tt_var: (d,) zeros (deterministic approximation)
-            confidence_intervals: (d, 2) zeros
-        """
-
-        # 1. Setup & Optimization
-        d = self.problem['num_vars']
-        device = train_x.device
-        dtype = train_x.dtype
-
-        # Train/Optimize the metamodel
-        metamodel, metamodel.likelihood, _ = optimize(metamodel, train_x, train_y)
-        metamodel.eval(); metamodel.likelihood.eval()
-
-        # 2. Define Function Wrapper for TT-Cross
-        # tntorch requires a function f(x) -> y where x is (batch, d)
-        # We wrap the GP posterior mean.
-        def gp_mean_func(*args):
-            """
-            Supports both:
-            f(x)              where x is (batch, d)
-            f(x1, x2, ..., xd) where each xi is (batch,)
-            """
-            with torch.no_grad():
-
-                # ---- Case 1: f(x) ----
-                if len(args) == 1:
-                    x = args[0]
-
-                # ---- Case 2: f(x1, x2, ..., xd) ----
-                else:
-                    # Stack per-dimension inputs into (batch, d)
-                    x = torch.stack(args, dim=-1)
-
-                # ---- Normalize x ----
-                if isinstance(x, list):
-                    x = torch.as_tensor(x, dtype=dtype)
-                elif isinstance(x, np.ndarray):
-                    x = torch.as_tensor(x, dtype=dtype)
-                elif isinstance(x, torch.Tensor):
-                    x = x.to(dtype=dtype)
-                else:
-                    raise TypeError(f"Unsupported input type: {type(x)}")
-
-                # Ensure shape (batch, d)
-                if x.ndim == 1:
-                    x = x.unsqueeze(0)
-
-                # ---- GP posterior mean ----
-                output = metamodel.likelihood(metamodel(x))
-                return output.mean.squeeze(-1)
-            
-        # Define hyper-rectangle domain from problem bounds
-        bounds_np = np.array(self.problem['bounds'])
-        domain = torch.as_tensor(bounds_np, dtype=dtype)
-
-        # TT-Cross Approximation
-        # ranks_max: controls the complexity of interactions captured
-        # n: number of grid points per dimension (discretization)
-        tt = tn.cross(
-            function=gp_mean_func,
-            domain=domain,
-            rmax=10,       # Increase if interactions are very complex
-            #n=32,               # 32-64 is usually sufficient for smooth GPs
-            #tol=1e-3,           # Approximation tolerance
-            #device=device,
-            verbose=False
-        )
-
-        def sobol_from_tt(tt):
-            """
-            Computes first-order and total Sobol indices from a TT surrogate.
-            """
-            d = tt.dim()
-
-            # Total variance
-            mean = tt.integrate()
-            var = tt.integrate(lambda x: (x - mean) ** 2)
-
-            S1 = torch.zeros(d)
-            ST = torch.zeros(d)
-
-            for i in range(d):
-                # First-order: Var(E[f | xi]) / Var(f)
-                tt_i = tt.marginalize(dims=[j for j in range(d) if j != i])
-                mean_i = tt_i.integrate()
-                S1[i] = tt_i.integrate(lambda x: (x - mean_i) ** 2) / var
-
-                # Total-order: 1 - Var(E[f | x_-i]) / Var(f)
-                tt_not_i = tt.marginalize(dims=[i])
-                mean_not_i = tt_not_i.integrate()
-                ST[i] = 1 - tt_not_i.integrate(lambda x: (x - mean_not_i) ** 2) / var
-
-            return S1, ST
-
-
-        # 4. Compute Sobol Indices from TT
-        #sobol_stats = tn.sensitivity.sobol_indices(tt)
-        
-        # Extract indices (tntorch returns 1D tensors)
-        S1, ST = sobol_from_tt(tt)
-        S1 = S1.cpu().numpy()
-        ST = ST.cpu().numpy()
-        
-        # Calculate Higher Order Interactions proxy
-        high_order_mean = ST - S1
-        
-        # 5. Returns
-        # Variance and CI are 0 because we analyzed the deterministic mean surface
-        high_order_var = np.zeros_like(high_order_mean)
-        confidence_intervals = np.zeros((d, 2))
-
-        print(f'Results for interactions of Sobol Tensor Train (TT) Decomposition method')
-        print(f'predicted TT Higher-Order (S_T - S_1): {high_order_mean} and var: {high_order_var}')
-
-    def interactions_asm(self, train_x, train_y, metamodel):
-        """
-        Perform Active Subspace Method (ASM) analysis to detect ridge structures and interactions.
-        
-        Logic:
-            1. Compute gradient covariance matrix C = E[ (df/dx)^T (df/dx) ]
-            2. Compute eigenvalues (activity) and eigenvectors (active directions).
-            3. Activity Scores (diagonal of C) are returned as sensitivity proxy.
-            4. Eigenvector structure is analyzed for axis-alignment (separability).
-
-        Args:
-            train_x, train_y: Tensor data
-            metamodel: GPyTorch model
-
-        Returns:
-            activity_scores: (d,) numpy array (proxy for Total Sensitivity)
-            activity_var: (d,) zeros (deterministic analysis)
-            confidence_intervals: (d, 2) zeros
-        """
-        
-        # 1. Setup & Optimization
-        d = self.problem['num_vars']
-        self.NZ = train_x.shape[0]
-        device = train_x.device
-        dtype = train_x.dtype
-
-        # Train/Optimize
-        metamodel, metamodel.likelihood, _ = optimize(metamodel, train_x, train_y)
-        metamodel.eval(); metamodel.likelihood.eval()
-
-        # 2. Monte Carlo Sampling for Gradient Estimation
-        # We sample the space uniformly/Sobol to approximate the expectation E[...]
-        X_eval_np = sobol_sampler.sample(self.problem, self.M, calc_second_order=False)
-        X_eval = torch.tensor(X_eval_np, device=device, dtype=dtype)
-        X_eval.requires_grad_(True)
-
-        # 3. Compute Gradients over GP Realizations
-        # Accumulate the C matrix: sum of outer products of gradients
-        C = torch.zeros((d, d), device=device)
-        
-        # We average C over NZ realizations to get a robust estimate
-        for k in range(self.B):
-            output_dist = metamodel.likelihood(metamodel(X_eval))
-            f_sample = output_dist.rsample(sample_shape=torch.Size([1])).squeeze(0)
-
-            # Compute gradients: shape (M, d)
-            # sum() trick is efficient for batch gradients of independent samples
-            grads = torch.autograd.grad(
-                outputs=f_sample.sum(), 
-                inputs=X_eval, 
-                create_graph=False
-            )[0]
-            
-            # Update C: (1/M) * (Grads.T @ Grads)
-            # We average over samples M
-            C_k = torch.matmul(grads.T, grads) / self.M
-            C += C_k
-
-            # Zero grads
-            if X_eval.grad is not None:
-                X_eval.grad.zero_()
-
-        # Average over GP Bootstrap realizations
-        C = C / self.B
-
-        # 4. Eigendecomposition
-        # Eigenvalues (lambda) and Eigenvectors (W)
-        # eigh returns them in ascending order
-        eigvals, eigvecs = torch.linalg.eigh(C)
-        
-        # Sort descending
-        eigvals = torch.flip(eigvals, dims=[0])
-        eigvecs = torch.flip(eigvecs, dims=[1])
-
-        # 5. Metrics Calculation
-        
-        # A) Activity Scores (Sensitivity Proxy)
-        # This is mathematically equivalent to the diagonal of C (DGSM)
-        # But derived from the subspace view: sum(lambda_j * w_ij^2)
-        activity_scores = torch.diag(C).detach().cpu().numpy()
-
-        # B) Interaction Detection (Ridge Structure Analysis)
-        # We analyze the first dominant eigenvector (w_1)
-        w1 = eigvecs[:, 0].detach().cpu().numpy()
-        w1_sq = w1**2
-        
-        print("\n--- Active Subspace Analysis ---")
-        #print(f"Top 3 Eigenvalues: {eigvals[:3].detach().cpu().numpy()}")
-        print(f"Eigenvectors: {w1_sq}")
-        
-        # Heuristic: If energy is spread across multiple components, we have mixing.
-        # Check if the dominant eigenvector is aligned with a single axis.
-        max_component = np.max(w1_sq)
-        dominant_idx = np.argmax(w1_sq)
-        
-        if max_component > 0.9: # Threshold for "Axis Aligned"
-            print(f"Dominant direction is axis-aligned with x{dominant_idx} (Score: {max_component:.2f}).")
-            print("Interpretation: Additive / Separable dominant structure.")
-        else:
-            print(f"Dominant direction is a linear combination (Max alignment: {max_component:.2f}).")
-            print(f"Significant components: {np.where(w1_sq > 0.1)[0]}")
-            print("Interpretation: Ridge structure detected (Interaction).")
-
-        print(f'activity scores: {activity_scores}')
-
-    def update_partition(self, interactions):
-        """
-        Partition dimensions using a greedy algorithm based on 2nd-order interactions.
-
-        Inputs:
-        - interactions: numpy array (1, d) matrix with high-order Sobol indices.
-        Output:
-        - partitions: list of lists, each sublist contains indices belonging to a partition.
-        """
-        d = self.problem['num_vars']
-
-        # initialize stack of dimensions
-        S = list(range(d))
-
-        # P will hold the partitions
-        P = []
-        for x in range(d):
-            if interactions[x] < self.epsilon:
-                P.append([x])
-            else:
-                if len(P) == 0:
-                    P.append([x])
-                else:
-                    P[0].append(x)
-        return P
-
 ### Runners ###
 
-def sobol_sensitivity(f_obj, n_samples=1000):
-    """
-    Compute 1st- and 2nd-order Sobol sensitivity indices for a given SyntheticTestFun object.
-
-    Parameters
-    ----------
-    f_obj : SyntheticTestFun
-        The synthetic test function wrapper.
-    n_samples : int
-        Base sample size for Saltelli sampling. Total model evaluations will be larger.
-
-    Returns
-    -------
-    Si : dict
-        Dictionary with 'S1', 'S1_conf', 'S2', 'S2_conf', 'ST', 'ST_conf'
-    """
-    # Define the problem for SALib
-    problem = {
-        'num_vars': f_obj.d,
-        'names': [f"x{i+1}" for i in range(f_obj.d)],
-        'bounds': list(zip(f_obj.lower_bounds, f_obj.upper_bounds))
-    }
-
-    # Generate Saltelli samples
-    param_values = saltelli.sample(problem, n_samples, calc_second_order=True)
-
-    # Evaluate the function
-    X_torch = torch.tensor(param_values, dtype=torch.float32)
-    Y_torch = f_obj.f.forward(X_torch).detach().numpy().flatten()
-
-    # Sobol analysis
-    Si = salib_sobol.analyze(problem, Y_torch, calc_second_order=True, print_to_console=False)
-    return Si['ST'] - Si['S1']
-
-def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
-    """
-    Train an ExactGP + Likelihood model.
-
-    Args:
-        gp: ExactGP model
-        likelihood: gpytorch.likelihoods.GaussianLikelihood
-        train_x: torch.Tensor (n, d)
-        train_y: torch.Tensor (n,)
-        n_iter: int, number of training iterations
-        lr: float, learning rate
-
-    Returns:
-        gp (trained), likelihood (trained), mean_epoch_loss (float)
-    """
-
-    # training inputs alignmnet
-    gp.set_train_data(inputs=train_x, targets=train_y, strict=False)
-
-    gp.train()
-    gp.likelihood.train()
-
-    optimizer = torch.optim.Adam(gp.parameters(), lr=lr)
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(gp.likelihood, gp)
-
-    epoch_losses = []
-    for i in range(n_iter):
-        optimizer.zero_grad()
-        output = gp(train_x)
-        loss = -mll(output, train_y)
-
-        if loss.dim !=0:
-            loss = loss.sum()
-
-        loss.backward()
-        optimizer.step()
-        epoch_losses.append(loss.item())
-
-    mean_loss = float(np.mean(epoch_losses))
-    return gp, gp.likelihood, mean_loss
-
-def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
-    """
-    Grid-search UCB maximizer.
-    Returns: new_x (1 x d tensor), ucb_value (float), idx (int)
-    UCB = mean + kappa * std
-    """
-    gp_model.eval()
-    gp_likelihood.eval()
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        post = gp_likelihood(gp_model(grid_points))
-        mean = post.mean           # shape (n_points,)
-        var = post.variance
-        std = var.clamp_min(0.0).sqrt()
-        ucb = mean + kappa_val * std
-
-    best_idx = torch.argmax(ucb).item()
-    best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
-    return best_x, ucb[best_idx].item(), best_idx
-
-def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20, kappa=1.0, acq_method = 'grid', save=False, verbose=False):
+def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=20, kappa=1.0, save=False, verbose=False,  device='cpu'):
     """
     Returns the same metrics as run_bo, plus:
       - partition_updates: list of partition structures (list of lists) when updates occurred
       - sobol_interactions: list of interaction matrices (numpy arrays) when updates occurred
     """
+
+    # Setting device for computations
+    device = torch.device(device)
+
     sobol_workers = 1   # background threads for Sobol
     # --------------------------------------------------------
 
     # Initiate n_init points, bounds
     n_points = int(100 * f_obj.d**2)
-    bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float()  # shape (2, d)
+    bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float().to(device)  # shape (2, d)
     lower, upper = bounds[0], bounds[1]
-    grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d)
+    grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d, device=device)
     with torch.no_grad():
-        grid_y = f_obj.f.forward(grid_x).float().squeeze(-1)
+        grid_y = f_obj.f.forward(grid_x).float().squeeze(-1) 
     grid_min = grid_y.min().item()
 
     # Initiate training set
-    sobol = Sobol(f_obj)
+    sobol = Sobol(f_obj).to(device)
     n_init = f_obj.d*3
     true_best = grid_y.max().item() #f_obj.f.optimal_value
-    train_x = torch.from_numpy(sobol_sampler.sample(sobol.problem, n_init, calc_second_order=False)).float()
+    train_x_cpu = torch.from_numpy(sobol_sampler.sample(sobol.problem, n_init, calc_second_order=False)).float()
+    train_x = train_x_cpu.to(device)
     train_y = f_obj.f.forward(train_x)
     best_observed = train_y.max().item()
 
@@ -1395,7 +72,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20,
     current_max = max(true_best, train_y.max().item())
 
     # initialize metrics (same as run_bo)
-    r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [0.0 for i in range(n_init)], [], [0.0 for i in range(n_init)], [0.0 for i in range(n_init)], [1.0 for i in range(n_init)], []
+    r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [0.0 for i in range(n_init)], [], [0.0 for i in range(n_init)], [0.0 for i in range(n_init)], [1.0 for i in range(n_init)], [0.0 for i in range(n_init)]
 
     # Additional metrics
     partition_updates = []
@@ -1406,11 +83,11 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20,
     space_reconfiguration = None
 
     # initialize model 
-    likelihood = gpytorch.likelihoods.GaussianLikelihood()
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
     if model_cls.__name__ == 'MHGP':
         with torch.no_grad():
             likelihood.noise = torch.tensor(1e-3)
-    model = model_cls(train_x, train_y, likelihood)
+    model = model_cls(train_x, train_y, likelihood).to(device)
     model.sobol = sobol
     interactions = None
     # main optimization loop
@@ -1423,16 +100,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20,
         model, likelihood, epoch_losses = optimize(model, train_x, train_y_norm)
         loss_curve.append(np.mean(epoch_losses))
 
-        # Acquisition scoring
-        if acq_method == 'botorch':
-            UCB = UpperConfidenceBound(model=model, beta=kappa**2, maximize=True) #now this won't work
-            # Next point
-            warnings.filterwarnings("ignore", category=RuntimeWarning)
-            new_x, _ = optimize_acqf(
-                acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512)        
-        else:
-            new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
-
+        new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
         new_y = f_obj.f.forward(new_x)
 
         # Update global bounds and exploration metrics
@@ -1458,8 +126,8 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20,
             with torch.no_grad(), gpytorch.settings.fast_pred_var():
                 post = likelihood(model(grid_x))
 
-            y_true = (grid_y.squeeze(-1) - grid_min) / (true_best - grid_min)
-            y_pred = post.mean
+            y_true = ((grid_y.squeeze(-1) - grid_min) / (true_best - grid_min)).cpu()
+            y_pred = post.mean.cpu()
             ss_res = torch.sum((y_true - y_pred) ** 2)
             ss_tot = torch.sum((y_true - y_true.mean()) ** 2)
             r2_score = np.clip(1 - ss_res / ss_tot, 0.0, 1.0)
@@ -1471,8 +139,8 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20,
         exploit = (new_y.item() - grid_min) / (true_best - grid_min + 1e-9)
         explore = np.clip(explore, 0.0, 1.0)
         exploit = np.clip(exploit, 0.0, 1.0)
-        exploit_scores.append(exploit)
-        expl_scores.append(explore)
+        exploit_scores.append(exploit.item())
+        expl_scores.append(explore.item())
 
         # Regret scores
         regret = true_best - best_observed + 1e-9
@@ -1497,17 +165,17 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20,
         elapsed_train = t1 - t0
         train_times.append(elapsed_train)
         model = model_cls(train_x, train_y_norm, likelihood,
-                          model.partition, model.history, model.sobol) 
+                          model.partition, model.history, model.sobol).to(device) 
         
 
         # Submit a new Sobol background job every n_sobol iterations (if none pending)
         if (i % n_sobol) == 0:
             if space_reconfiguration is None or space_reconfiguration.done():
                 try:
-                    surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood()
+                    surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
                     y_range = current_max - current_min
                     train_y_norm = (train_y - current_min) / y_range
-                    surrogate = ExactGP(train_x, train_y_norm, surrogate_likelihood)
+                    surrogate = ExactGP(train_x, train_y_norm, surrogate_likelihood).to(device)
                     space_reconfiguration = executor.submit(sobol.method, train_x, train_y_norm, surrogate)
                 except Exception as e:
                     space_reconfiguration = None
@@ -1552,13 +220,16 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_init=3, n_iter=200, n_sobol=20,
     }
     return result
 
-def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid', save=False, verbose=False):
+def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, device='cpu'):
+
+    # Setting device for computations
+    device = torch.device(device)
 
     # Initiate n_init points, bounds
     n_points = int(100 * f_obj.d**2)
-    bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float()  # shape (2, d)
+    bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float().to(device)  # shape (2, d)
     lower, upper = bounds[0], bounds[1]
-    grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d)
+    grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d, device=device)
     with torch.no_grad():
         grid_y = f_obj.f.forward(grid_x).float().squeeze(-1) 
     grid_min = grid_y.min().item()
@@ -1567,7 +238,8 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
     sobol = Sobol(f_obj)
     n_init = f_obj.d*3
     true_best = grid_y.max().item() #f_obj.f.optimal_value  
-    train_x = torch.from_numpy(sobol_sampler.sample(sobol.problem, n_init, calc_second_order=False)).float()
+    train_x_cpu = torch.from_numpy(sobol_sampler.sample(sobol.problem, n_init, calc_second_order=False)).float()
+    train_x = train_x_cpu.to(device)
     train_y = f_obj.f.forward(train_x)
     best_observed = train_y.max().item()
 
@@ -1575,10 +247,10 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
     current_max = max(true_best, train_y.max().item())
 
     #initialize metrics
-    r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [0.0 for i in range(n_init)], [], [0.0 for i in range(n_init)], [0.0 for i in range(n_init)], [1.0 for i in range(n_init)], []
+    r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [0.0 for i in range(n_init)], [], [0.0 for i in range(n_init)], [0.0 for i in range(n_init)], [1.0 for i in range(n_init)], [0.0 for i in range(n_init)]
     
-    likelihood = gpytorch.likelihoods.GaussianLikelihood()
-    model = model_cls(train_x, train_y, likelihood)
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    model = model_cls(train_x, train_y, likelihood).to(device)
 
     for i in range(n_iter - n_init):
 
@@ -1589,17 +261,7 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
         model, likelihood, epoch_losses = optimize(model, train_x, train_y_norm)
 
         loss_curve.append(np.mean(epoch_losses))
-
-        if acq_method == 'botorch':
-            # Acquisition scoring
-            UCB = UpperConfidenceBound(model=model, beta=kappa**2, maximize=True)
-            # Next point
-            warnings.filterwarnings("ignore", category=RuntimeWarning)
-            new_x, _ = optimize_acqf(
-                acq_function=UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512)
-            
-        else:
-            new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
+        new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
 
         new_y = f_obj.f.forward(new_x)
 
@@ -1626,8 +288,8 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
             with torch.no_grad(), gpytorch.settings.fast_pred_var():
                 post = likelihood(model(grid_x))
             
-            y_true = (grid_y.squeeze(-1) - grid_min) / (true_best - grid_min)
-            y_pred = post.mean
+            y_true = ((grid_y.squeeze(-1) - grid_min) / (true_best - grid_min)).cpu()
+            y_pred = post.mean.cpu()
             ss_res = torch.sum((y_true - y_pred) ** 2)
             ss_tot = torch.sum((y_true - y_true.mean()) ** 2)
             r2_score = np.clip(1 - ss_res / ss_tot, 0.0, 1.0)
@@ -1639,14 +301,14 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
         exploit = (new_y.item() - grid_min) / (true_best - grid_min + 1e-9)
         explore = np.clip(explore, 0.0, 1.0)
         exploit = np.clip(exploit, 0.0, 1.0)
-        exploit_scores.append(exploit)
-        expl_scores.append(explore)
+        exploit_scores.append(exploit.item())
+        expl_scores.append(explore.item())
 
         # Regret scores
         regret = true_best - best_observed + 1e-9
         regrets.append(regret)
 
-        model = model_cls(train_x, train_y, likelihood)
+        model = model_cls(train_x, train_y, likelihood).to(device)
 
         t1 = time.time()
         elapsed_train = t1 - t0
@@ -1688,10 +350,38 @@ def run_bo(f_obj, model_cls, n_init=1, n_iter=200, kappa=1.0, acq_method = 'grid
         'cumulative_time': cumulative_time 
        }
 
+def run_single_kappa(kappa, device, f_obj, model_cls, n_iter, n_reps, bo_method):
+    """
+    Worker function that runs the repetitions for a SINGLE kappa on a specific DEVICE.
+    """
+    explore_list, exploit_list = [], []
+    
+    f_obj.to(device)
+
+    print(f"[Worker {device}] Starting kappa={kappa}")
+    
+    for rep in range(n_reps):
+        try:
+            results = bo_method(f_obj, model_cls, n_iter=n_iter, 
+                                kappa=kappa, save=False, device=device)
+            explore_list.append(results['exploration'])
+            exploit_list.append(results['exploitation'])
+        except Exception as e:
+            print(f"Error in kappa={kappa}, rep={rep} on {device}: {e}")
+            traceback.print_exc()
+            # Append zeros or handle error gracefully to avoid crashing the whole pool
+            explore_list.append(np.zeros(n_iter))
+            exploit_list.append(np.zeros(n_iter))
+
+    stacked_explore = np.stack(explore_list, axis=0)
+    stacked_exploit = np.stack(exploit_list, axis=0)
+    
+    return kappa, stacked_explore.mean(axis=0), stacked_exploit.mean(axis=0)
+
 ### Graph generation functions ###
 
-def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_init=6, n_iter=100, n_reps=15,
-                bo_method=run_bo, acq_method = 'grid'):
+def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_iter=100, n_reps=15,
+                bo_method=run_bo, devices=['cpu']):
     """
     For each kappa in kappa_list, run BO n_reps times and plot averaged exploration
     (dashed line) and exploitation (filled area) traces. The x-axis begins with
@@ -1708,29 +398,48 @@ def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_init=6, n_iter=100, n_r
     averaged = {}
     n_init = 3*f_obj.d
 
-    for kappa in kappa_list:
+    # 1. Setup Parallel Workers
+    # If we have more kappas than devices, we cycle through devices.
+    # Logic: Create a list of tasks where each task is assigned a device.
+    
+    num_workers = len(devices)
+    print(f"\nStarting Kappa Search with {num_workers} workers on devices: {devices}")
+    
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        future_to_kappa = {}
         
-        explore_list, exploit_list = [], []
+        for i, kappa in enumerate(kappa_list):
+            # Round-robin assignment of devices
+            assigned_device = devices[i % num_workers]
+            
+            future = executor.submit(
+                run_single_kappa,
+                kappa, 
+                assigned_device, 
+                f_obj, 
+                model_cls, 
+                n_init, 
+                n_iter, 
+                n_reps, 
+                bo_method, 
+            )
+            future_to_kappa[future] = kappa
 
-        print(f"\nRunning kappa={kappa} for {model_cls.__name__} ({f_obj.name})")
-        for rep in range(n_reps):
-
-            results = bo_method(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, acq_method=acq_method, save=False)
-            explore, exploit = results['exploration'], results['exploitation']
-
-            explore_list.append(explore)
-            exploit_list.append(exploit)
-          
-        stacked_explore = np.stack([explr for explr in explore_list], axis=0)
-        stacked_exploit = np.stack([explt for explt in exploit_list], axis=0)
-
-        averaged[kappa] = {'explore': stacked_explore.mean(axis=0), 'exploit': stacked_exploit.mean(axis=0)}
+        # 2. Collect Results as they finish
+        for future in as_completed(future_to_kappa):
+            kappa = future_to_kappa[future]
+            try:
+                k_res, mean_explore, mean_exploit = future.result()
+                averaged[k_res] = {'explore': mean_explore, 'exploit': mean_exploit}
+                print(f"Finished kappa={k_res}")
+            except Exception as exc:
+                print(f'Kappa {kappa} generated an exception: {exc}')
 
 
     # Plotting
+    print("\nAll runs complete. Generating Plot...")
     plt.figure(figsize=(10, 6))
     cmap = plt.get_cmap('tab10')
-    n_k = len(kappa_list)
     x = np.arange(0, n_iter)
 
     for idx, kappa in enumerate(kappa_list):
@@ -1790,7 +499,7 @@ def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, 
         (ExactGP, 'red',  'ExactGP',    kappas[0]),
         (AdditiveGP, 'blue', 'AdditiveGP',   kappas[1]),
         (SobolGP, 'green', 'SobolGP',             kappas[2]),
-        (MHGP, 'orange', 'MHGP',                  kappas[3])
+        #(MHGP, 'orange', 'MHGP',                  kappas[3])
     ]
 
     # Containers for metrics
@@ -1799,7 +508,7 @@ def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, 
 
      # Run experiments for each model
     for model_cls, color, label, kappa in model_specs:
-        all_regrets, all_explore, all_exploit, all_regrets = [], [], [], []
+        all_regrets, all_explore, all_exploit, all_r2 = [], [], [], []
 
         for rep in range(n_reps):
             if label in ['SobolGP', 'MHGP']:
@@ -1807,24 +516,28 @@ def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, 
             else:
                 exp_results = run_bo(f_obj, model_cls, n_init=n_init, n_iter=n_iter, kappa=kappa, acq_method=acq_method)
 
-            regrets, explore, exploit = exp_results['regrets'], exp_results['exploration'], exp_results['exploitation']
+            regrets, explore, exploit, r2 = exp_results['regrets'], exp_results['exploration'], exp_results['exploitation'], exp_results['r2']
             all_regrets.append(regrets)
             all_explore.append(explore)
             all_exploit.append(exploit)
+            all_r2.append(r2)
 
         # Convert to arrays and average across repetitions
         all_regrets = np.array(all_regrets)  # shape (n_reps, n_iter)
         all_explore = np.array(all_explore)
         all_exploit = np.array(all_exploit)
+        all_r2 = np.array(all_r2)
             
         mean_explore = np.mean(all_explore, axis=0)
         mean_exploit = np.mean(all_exploit, axis=0)
         mean_regrets = np.mean(all_regrets, axis=0)
+        mean_r2 = np.mean(all_r2, axis=0)
         std_regrets = np.std(all_regrets, axis=0)
 
         metrics[label] = {
             'explore': mean_explore,
             'exploit': mean_exploit,
+            'R2': mean_r2,
             'color': color,
             'kappa': kappa,
         }
@@ -1845,11 +558,13 @@ def optimization_metrics(f_obj, kappas, n_init=6, n_iter=100, n_reps=15, ci=95, 
         color = vals['color']
         explore = vals['explore']
         exploit = vals['exploit']
+        r2 = vals['R2']
         kappa = vals['kappa']
         T = exploit.shape[0]
         it = np.arange(1, T + 1)
         ax1.plot(it, explore[:T], linestyle='-', color=color, label=f'{label} kappa {kappa}')
-        ax1.plot(it, exploit[:T], linestyle='--', color=color)
+        ax1.plot(it, exploit[:T], linestyle='-.', color=color)
+        ax1.plot(it, r2[:T], linestyle=':', color=color)
 
     ax1.set_xlabel('Iteration')
     ax1.set_ylabel('Metric')
@@ -2141,6 +856,8 @@ def _parse_list_of_floats(text):
     except Exception:
         raise argparse.ArgumentTypeError('Expected comma-separated list of numbers (e.g. 0.5,1,3)')
 
+def _parse_list_of_strings(arg):
+    return arg.split(',')
 
 def _parse_list_of_ints(text):
     if text is None:
@@ -2164,16 +881,19 @@ def main(argv=None):
     parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, kappa_search, optimization_metrics, partition_reconstruction')
     parser.add_argument('--model_cls', type=str, default='ExactGP', help='Model class name (ExactGP, AdditiveGP, SobolGP, MHGP)')
     parser.add_argument('--bo_method', type=str, default='run_bo', help='BO method used by higher-level routines (run_bo or run_partitionbo)')
-    parser.add_argument('--acq_method', type=str, default='grid', help='Acquisition function scoring method (botorch or grid)')
 
     # Method-specific params
-    parser.add_argument('--n_init', type=int, default=1)
     parser.add_argument('--n_iter', type=int, default=200)
     parser.add_argument('--n_reps', type=int, default=10)
     parser.add_argument('--n_sobol', type=int, default=20)
     parser.add_argument('--kappa', type=float, default=1.0)
     parser.add_argument('--kappa_list', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for kappa_search')
     parser.add_argument('--kappas', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for optimization_metrics (3 values expected)')
+
+    #  Device Flags ---
+    parser.add_argument('--device', type=str, default='cpu', help='Device for single runs (e.g. cuda:0)')
+    parser.add_argument('--devices', type=_parse_list_of_strings, default=None, 
+                        help='Comma-separated list of devices for parallel search (e.g. cuda:0,cuda:1)')
 
     # Misc
     parser.add_argument('--save', action='store_true')
@@ -2220,9 +940,6 @@ def main(argv=None):
     if args.bo_method not in ['run_bo', 'run_partitionbo']:
         raise ValueError("bo_method must be 'run_bo' or 'run_partitionbo'")
 
-    if args.acq_method not in ['grid', 'botorch']:
-        raise ValueError("bo_method must be 'grid' or 'botorch'")
-
     model_cls = model_map[args.model_cls]
     bo_method = run_partitionbo if args.model_cls in ['MHGP', 'SobolGP'] else run_bo
     n_init = args.dim*3
@@ -2240,36 +957,37 @@ def main(argv=None):
 
     f_obj = SyntheticTestFun(name=args.f_ob, d=args.dim, noise=args.noise, negate=negate)
 
+    device_list = args.devices if args.devices else [args.device]
+
     # Call the requested method with the right parameter signatures
     print(f"Running method={args.method} model_cls={args.model_cls} on {args.f_ob} (d={args.dim})")
 
     # dispatch
     try:
         if args.method == 'run_bo':
-            result = run_bo(f_obj, model_cls, n_init=n_init, n_iter=args.n_iter, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
+            result = run_bo(f_obj, model_cls, n_iter=args.n_iter, kappa=args.kappa, 
+                            save=args.save, verbose=args.verbose, device=args.device)
+        
         elif args.method == 'run_partitionbo':
-            result = run_partitionbo(f_obj, model_cls, n_init=n_init, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
+            result = run_partitionbo(f_obj, model_cls, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, 
+                            save=args.save, verbose=args.verbose, device=args.device)
+
         elif args.method == 'kappa_search':
             # Provide a default kappa list if none given
             k_list = args.kappa_list or [0.5, 1.0, 3.0, 5.0, 7.0, 9.0, 15.0]
-            result = kappa_search(f_obj, k_list, model_cls=model_cls, n_init=n_init, n_iter=args.n_iter, n_reps=args.n_reps, bo_method=bo_method, acq_method=args.acq_method)
+            result = kappa_search(f_obj, k_list, model_cls=model_cls, n_iter=args.n_iter, n_reps=args.n_reps, 
+                                  bo_method=bo_method, devices=device_list)
+
         elif args.method == 'optimization_metrics':
-            if args.kappas is None:
-                raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values)')
+            if args.kappas is None: raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values)')
             kappas = args.kappas
-            result = optimization_metrics(f_obj, kappas, n_init=n_init, n_iter=args.n_iter, n_reps=args.n_reps, acq_method=args.acq_method)
+            result = optimization_metrics(f_obj, kappas, n_iter=args.n_iter, n_reps=args.n_reps)
         elif args.method == 'partition_reconstruction':
-            result = partition_reconstruction(f_obj, model_cls, n_init=n_init, n_iter=args.n_iter, n_reps= args.n_reps, n_sobol=args.n_sobol, kappa=args.kappa, acq_method=args.acq_method, save=args.save, verbose=args.verbose)
+            result = partition_reconstruction(f_obj, model_cls, n_iter=args.n_iter, n_reps= args.n_reps, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose)
         else:
             raise ValueError('Unsupported method')
 
         print('Completed. Result summary:')
-        # print a short summary depending on result shape
-        if isinstance(result, dict):
-            keys = list(result.keys())
-            print('Keys in result:', keys)
-        else:
-            print(type(result))
 
     except Exception as e:
         print('ERROR during execution:', e)
@@ -2279,8 +997,7 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    f_obj = SyntheticTestFun('hartmann', 6, 0, False)
-    results = run_partitionbo(f_obj, SobolGP, 18, 200, 20, 5.0, 'grid')
-    results_exact = run_bo(f_obj, ExactGP, 18, 200, 5.0)
-    print(f'done')
-    #main()
+    main()
+    #f_obj = SyntheticTestFun('michalewicz', 2, False, True).to('cuda:1')
+    #results = run_partitionbo(f_obj, SobolGP, n_iter=50, kappa=3.0, device='cuda:1')
+    #print('done')

@@ -1,6 +1,8 @@
 import random
 import numpy as np
-from botorch.test_functions.synthetic import Hartmann, Ackley, Griewank, Michalewicz, Rosenbrock, Shekel, Rastrigin, Levy
+from botorch.test_functions.synthetic import (
+    Hartmann, Ackley, Griewank, Michalewicz, Rosenbrock, Shekel, Rastrigin, Levy
+)
 from botorch.test_functions.base import BaseTestProblem
 from botorch.test_functions.sensitivity_analysis import Ishigami, Gsobol, Morris
 import torch
@@ -19,9 +21,13 @@ class SyntheticTestFun:
         """
         self.d = d
         self.name = name
+        self.device = torch.device("cpu")
+
         no_need_negate = ['twoblobs', 'dblobs', 'multprod', 'cyclical-fun', 'ishigami', 'gsobol', 'morris']
         negate = False if name in no_need_negate else True
         self.negate = negate
+
+
         match name:
             case 'hartmann':
                 # Note: Need to negate to turn into maximization
@@ -99,6 +105,13 @@ class SyntheticTestFun:
         self.lower_bounds = np.array(self.f._bounds)[:, 0]
         self.upper_bounds = np.array(self.f._bounds)[:, 1]
 
+    def to(self, device):
+        """Moves the internal BoTorch function and object state to the specified device."""
+        device = torch.device(device)
+        self.device = device
+        # BoTorch functions are nn.Modules, so they support .to()
+        self.f.to(device) 
+        return self
 
     def simulate(self, n_samples):
         """
@@ -109,18 +122,18 @@ class SyntheticTestFun:
 
         dtype = torch.get_default_dtype()
         # convert bounds to torch tensors with correct dtype
-        lb = torch.tensor(self.lower_bounds, dtype=dtype)
-        ub = torch.tensor(self.upper_bounds, dtype=dtype)
+        lb = torch.tensor(self.lower_bounds, dtype=dtype, device=self.device)
+        ub = torch.tensor(self.upper_bounds, dtype=dtype, device=self.device)
 
         # draw uniform samples in [lb, ub] per-dimension
-        X = lb + (ub - lb) * torch.rand(n_samples, self.d, dtype=dtype)
+        X = lb + (ub - lb) * torch.rand(n_samples, self.d, dtype=dtype, device=self.device)
 
         # tensor management
         Y = self.f.forward(X)
         if isinstance(Y, torch.Tensor):
-            Y = Y.to(dtype=dtype)
+            Y = Y.to(dtype=dtype, device=self.device)
         else:
-            Y = torch.tensor(np.asarray(Y), dtype=dtype)
+            Y = torch.tensor(np.asarray(Y), dtype=dtype, device=self.device)
 
         # shape management
         Y = Y.reshape(-1)

@@ -173,7 +173,7 @@ def optimization_metrics(data_exactgp, data_additivegp, data_sobolgp, kappas, da
     ax.set_title(f"Exploration vs. Exploitation", fontsize=14, fontweight="bold")
     ax.set_xlabel("Iterations")
     ax.set_ylabel("Scores")
-    ax.set_ylim(global_min, 1.1)
+    ax.set_ylim(global_min, 1.05)
     ax.legend(loc="lower right")
     
     output_dir = os.path.join('output', 'neurostim_experiments', dataset)
@@ -552,7 +552,6 @@ def partition_metrics(data, dataset_type, subject_idx, kappa_idx=2, figsize_per_
     fig.savefig(outpath)
     plt.close(fig)
 
-
 def set_experiment(dataset_type):
 
     options = {}
@@ -631,11 +630,11 @@ if __name__ == '__main__':
             './output/neurostim_experiments/spinal/spinal_neuralSobolGP_budget64_20reps_wbaseline.npz',
             ]
 
-    d_simple = load_results(files_nhp[0])
-    d_additive = load_results(files_nhp[1])
-    d_sobol = load_results(files_nhp[2])
+    #d_simple = load_results(files_spinal[0])
+    #d_additive = load_results(files_spinal[1])
+    d_sobol = load_results(files_spinal[2])
 
-    #optimization_metrics(d_simple, d_additive, d_sobol, [-2, 3, -2], dataset='5d_rat')
+    #optimization_metrics(d_simple, d_additive, d_sobol, kappas=[-2, -2, -1], dataset='spinal')
     
-    partition_metrics(d_sobol, 'nhp', 1, -1)
+    partition_metrics(d_sobol, 'spinal', 8, -1)
     #plot_kappas(files_spinal, 'spinal')

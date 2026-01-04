@@ -11,9 +11,75 @@ from gpytorch.mlls import ExactMarginalLogLikelihood
 from botorch.models.gpytorch import GPyTorchModel
 from botorch.posteriors import GPyTorchPosterior
 
-class ExactGPModel(gpytorch.models.ExactGP):
+
+### Model utils ###
+
+def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
+    """
+    Train an ExactGP + Likelihood model.
+
+    Args:
+        gp: ExactGP model
+        likelihood: gpytorch.likelihoods.GaussianLikelihood
+        train_x: torch.Tensor (n, d)
+        train_y: torch.Tensor (n,)
+        n_iter: int, number of training iterations
+        lr: float, learning rate
+
+    Returns:
+        gp (trained), likelihood (trained), mean_epoch_loss (float)
+    """
+
+    # training inputs alignmnet
+    gp.set_train_data(inputs=train_x, targets=train_y, strict=False)
+
+    gp.train()
+    gp.likelihood.train()
+
+    optimizer = torch.optim.Adam(gp.parameters(), lr=lr)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(gp.likelihood, gp)
+
+    epoch_losses = []
+    for i in range(n_iter):
+        optimizer.zero_grad()
+        output = gp(train_x)
+        loss = -mll(output, train_y)
+
+        if loss.dim !=0:
+            loss = loss.sum()
+
+        loss.backward()
+        optimizer.step()
+        epoch_losses.append(loss.item())
+
+    mean_loss = float(np.mean(epoch_losses))
+    return gp, gp.likelihood, mean_loss
+
+def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
+    """
+    Grid-search UCB maximizer.
+    Returns: new_x (1 x d tensor), ucb_value (float), idx (int)
+    UCB = mean + kappa * std
+    """
+    gp_model.eval()
+    gp_likelihood.eval()
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        post = gp_likelihood(gp_model(grid_points))
+        mean = post.mean           # shape (n_points,)
+        var = post.variance
+        std = var.clamp_min(0.0).sqrt()
+        ucb = mean + kappa_val * std
+
+    best_idx = torch.argmax(ucb).item()
+    best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
+    return best_x, ucb[best_idx].item(), best_idx
+
+
+### Model classes ###
+
+class ExactGP(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood):
-        super(ExactGPModel, self).__init__(train_x, train_y, likelihood)
+        super(ExactGP, self).__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
         self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=train_x.shape[-1]))
         self.likf = likelihood
@@ -24,120 +90,22 @@ class ExactGPModel(gpytorch.models.ExactGP):
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-class BaseGP(gpytorch.models.ExactGP):
-    def __init__(self, train_x, train_y, likelihood, kernel=gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims= 5), neural=False):
-        super(BaseGP, self).__init__(train_x, train_y, likelihood)
+class AdditiveGP(gpytorch.models.ExactGP):
 
-        input_dim = train_x[0].shape[-1]
-
-        self.mean_module = gpytorch.means.ZeroMean()
-        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=input_dim)) if not neural else kernel
-        self.likf = likelihood
-        self.name = 'BaseGP'
-
-    @property
-    def num_outputs(self):
-        return 1
-
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
-class SimpleGP(gpytorch.models.ExactGP):
-    def __init__(self, train_x, train_y, likelihood, lengthscale_prior=None, n_dims=5):
-        super(SimpleGP, self).__init__(train_x, train_y, likelihood)
-
-        scale_prior = gpytorch.priors.SmoothedBoxPrior(a=math.log(0.01**2),b= math.log(100.0**2), sigma=0.01)
-        matk= gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims= n_dims, lengthscale_prior= lengthscale_prior) 
-        matk_scaled = gpytorch.kernels.ScaleKernel(matk, outputscale_prior= scale_prior)
-        matk_scaled.base_kernel.lengthscale = [1.0]*n_dims
-        matk_scaled.outputscale=[1.0]
-
-        self.mean_module = gpytorch.means.ZeroMean()
-        self.covar_module = matk_scaled
-        self.name = 'VanillaGPBO'
-
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
-class TemporoSpatialGP(gpytorch.models.ExactGP):
-
-    def __init__(self, train_x, train_y, likelihood, lengthscale_prior = None, 
-                temp_dims=3, spatial_dims=2):
-        super().__init__(train_x, train_y, likelihood)
-
-        scale_prior = gpytorch.priors.SmoothedBoxPrior(a=math.log(0.01**2),b= math.log(100.0**2), sigma=0.01)
-        
-        self.temporal_kernel = gpytorch.kernels.ScaleKernel(
-                                gpytorch.kernels.MaternKernel( 
-                                nu=2.5, 
-                                batch_shape=torch.Size([temp_dims]),
-                                ard_num_dims=1, 
-                                lengthscale_prior= lengthscale_prior),
-                                outputscale_prior= scale_prior)
-        self.temporal_kernel.base_kernel.lengthscale = [1.0]*temp_dims
-        self.temporal_kernel.outputscale=torch.tensor([1.0]*temp_dims)
-        self.temporal_dims= temp_dims
-        self.spatial_dims=spatial_dims
-
-        self.spatial_kernel = gpytorch.kernels.ScaleKernel(
-                                gpytorch.kernels.MaternKernel(
-                                nu=2.5, 
-                                ard_num_dims=spatial_dims, 
-                                active_dims=[3, 4],
-                                lengthscale_prior= lengthscale_prior),
-                                outputscale_prior=scale_prior)
-        self.spatial_kernel.base_kernel.lengthscale = [1.0]*spatial_dims
-        self.spatial_kernel.outputscale=[1.0]
-
-        self.mean_module = gpytorch.means.ZeroMean()
-        self.likelihood = likelihood
-        self.name = 'TemporoSpatialGPv2'
-
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-
-        x_temporal = x[:, :self.temporal_dims]
-        batched_dims_of_x = x_temporal.mT.unsqueeze(-1)
-        temporal_covar_batches = self.temporal_kernel(batched_dims_of_x)
-        temporal_covar = temporal_covar_batches.sum(dim=-3)
-        covar_x = temporal_covar + self.spatial_kernel(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-  
-class AdditiveKernelGP(gpytorch.models.ExactGP):
-
-    def __init__(self, X_train, y_train, likelihood, lengthscale_prior=None, n_dims=5, neural=False):
+    def __init__(self, X_train, y_train, likelihood):
         super().__init__(X_train, y_train, likelihood)
-
-        if neural:
-            scale_prior = gpytorch.priors.SmoothedBoxPrior(a=math.log(0.01**2),b= math.log(100.0**2), sigma=0.01)
-
-            self.covar_module = gpytorch.kernels.ScaleKernel(
-                                    gpytorch.kernels.MaternKernel(
-                                        nu=2.5,
-                                        batch_shape=torch.Size([n_dims]),
-                                        ard_num_dims=1,
-                                        lengthscale_prior=lengthscale_prior),
-                                    outputscale_prior=scale_prior)
-            self.covar_module.base_kernel.lengthscale = [1.0] * n_dims
-            self.covar_module.outputscale = [1.0]
-
-        else:
-            input_dim = X_train.shape[-1]
-            self.covar_module = gpytorch.kernels.ScaleKernel(
-                                    gpytorch.kernels.MaternKernel(
-                                        nu=2.5,
-                                        batch_shape=torch.Size([input_dim]),
-                                        ard_num_dims=1,
-                                    )
-            )
+        input_dim = X_train.shape[-1]
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+                                gpytorch.kernels.MaternKernel(
+                                    nu=2.5,
+                                    batch_shape=torch.Size([input_dim]),
+                                    ard_num_dims=1,
+                                )
+        )
 
         self.mean_module = gpytorch.means.ConstantMean()
         self.likelihood = likelihood
-        self.name = 'GPYTorchAdditiveGP'
+        self.name = 'AdditiveGP'
 
     @property
     def num_outputs(self):
@@ -147,251 +115,258 @@ class AdditiveKernelGP(gpytorch.models.ExactGP):
         mean = self.mean_module(X)
         batched_dimensions_of_X = X.mT.unsqueeze(-1)  # Now a d x n x 1 tensor
         covar = self.covar_module(batched_dimensions_of_X).sum(dim=-3)
-        return gpytorch.distributions.MultivariateNormal(mean, covar) 
-    
-class GeneticAdditiveGP(gpytorch.models.ExactGP):
-    def __init__(self, X_train, y_train, likelihood, lengthscale_prior=None, d=5, 
-                 num_models=3, budget=200):
-        super().__init__(X_train, y_train, likelihood)
+        return gpytorch.distributions.MultivariateNormal(mean, covar)
 
-        self.acceptance_prob = lambda x: (0.6 + 0.4*(x / budget))
-        self.lengthscale_prior = lengthscale_prior
-        self.scale_prior = gpytorch.priors.SmoothedBoxPrior(a=math.log(0.01**2),b= math.log(100.0**2), sigma=0.01)
+class MHGP(gpytorch.models.ExactGP):
 
-        self.n_dims = d
-        self.num_models= num_models
-        self.partitions = self.create_partitions()
-        self.models = self.initialize_submodels()
-        self.name = 'GeneticAdditiveGP'
+    def __init__(self, train_x, train_y, likelihood, partition = None, history = None, sobol=None, epsilon=8e-2):
 
-    def create_partitions(self):
+        super().__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ZeroMean() 
+        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
+        self.history = history if history else [self.partition_to_key(self.partition)] 
+        self.sobol = sobol
+        self.name = 'MHGP'
+        self.n_dims = train_x.shape[-1]
+        self.epsilon = 0.08 # - 0.02 * min(1.0, (self.n_dims**2 / 30.0))
+        self.split_bias = 0.7
+        self.max_attempts = self.bell_number(self.n_dims)
 
-        partitions = [[random.sample(range(0, self.n_dims), int(self.n_dims // 2))] for i in range(self.num_models)]
-        for p in partitions:
-            p.append([x for x in range(self.n_dims) if x not in p[0]])
+        #build covar_module based on partition
+        self._build_covar()
 
-        print(f'These are the initial partitions: {partitions}')
-        return partitions
-    
-    def initialize_submodels(self):
-
-        models = []
-        for partition in self.partitions:
-            kernel = self.create_kernel(partition)
-            model = BaseGP(self.train_inputs, self.train_targets, self.likelihood, kernel)
-            model.covar_module = kernel
-            models.append(model)
-
-        return models
-    
-    def create_kernel(self, partition):
+    def _build_covar(self):
 
         kernels = []
-        for dims in partition:
-            kernel = gpytorch.kernels.ScaleKernel(
-                        gpytorch.kernels.MaternKernel(
-                            mu=2.5,
-                            ard_num_dims=len(dims),
-                            active_dims=dims,
-                            lengthscale_prior = self.lengthscale_prior),
-                            outputscale_prior=self.scale_prior)
-            kernel.base_kernel.lengthscale = [1.0]*len(dims)
-            kernel.outputscale=[1.0]
-            kernels.append(kernel)
+        for group in self.partition:
 
-        combined_kernel = sum(kernels[1:], start=kernels[0]) ### TODO: Parallelization
-        return combined_kernel
+            ard_dims = len(group)
 
-    def forward(self, x):
+            base_kernel = gpytorch.kernels.MaternKernel(
+                nu = 2.5,
+                ard_num_dims = ard_dims,
+                active_dims = group,
+            )
 
-        means = 0.0
-        covars = 0.0
-        for model in self.models:
-            pred = model.forward(x)
-            means += pred.mean
-            covars += pred.covariance_matrix
+            scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel)
 
-        means /= self.num_models
-        covars += torch.eye(covars.size(0), device='cuda')*1e-3
-        covars /= self.num_models
+            kernels.append(scaled_kernel)
 
-        return gpytorch.distributions.MultivariateNormal(means, covars)
+        self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)
 
-    def simple_partitioning(self, model_idx):
+    def partition_to_key(self, partition):
+        return tuple(sorted(tuple(sorted(sub)) for sub in partition))
+
+    def check_history(self, new_partition):
+        """
+        Return True if the canonical key for new_partition is already in history.
+        """
+        key = self.partition_to_key(new_partition)
+        return key in self.history
+    
+    def update_partition(self, new_partition):
+
+        # normalize indices to ints
+        new_key = self.partition_to_key(new_partition)
+        current_key = self.partition_to_key(self.partition)
+        # avoid unnecessary rebuilds:
+        if new_partition == current_key:
+            return
+        self.partition = [list(grp) for grp in new_key]
+        self._build_covar()
+    
+    def sobol_partitioning(self, interactions):
         
-        new_partition = copy.deepcopy(self.partitions[model_idx])
-        old_partition = self.partitions[model_idx]
+        old_partition = self.partition
+        has_candidate = False
+        attempts = 0
 
-        sampling_prob = 0.01
-        sampling_prob_inv = 0.00
+        if len(self.history) == self.max_attempts:
+            return old_partition
 
-        if random.random() < 0.5:
-            #Split strategy
+        while not has_candidate and attempts < (self.max_attempts + 5):
 
-            splitted_subset = new_partition[random.randint(0, len(new_partition) - 1)]
+            new_partition = copy.deepcopy(self.partition)
+            
+            # Split strategy
+            if random.random() < self.split_bias:
 
-            if len(splitted_subset) > 1:
-
-                splitted_dim = np.random.choice(splitted_subset)
-                splitted_subset.remove(splitted_dim)
-                new_partition.append([splitted_dim.astype(int)])
-
-                sampling_prob =  (1 / len(self.partitions)) * (1 / len(splitted_subset))
-                sampling_prob_inv = (1 / math.comb(len(self.partitions)+1, 2))
-        
-        else:
-            #Merge strategy
-
-            if len(new_partition) > 1:
-
-                robber_idx, robbed_idx = random.sample(range(len(new_partition)), 2)
-
+                robbed_idx = random.randint(0, len(new_partition) - 1)
                 robbed_subset = new_partition[robbed_idx]
-                robber_subset = new_partition[robber_idx]
 
-                new_partition.remove(robbed_subset)
-                new_partition.remove(robber_subset)
-                new_partition.append(robbed_subset + robber_subset)
+                if len(robbed_subset) > 1:
 
-                sampling_prob =  (1 / math.comb(len(self.partitions), 2))
-                sampling_prob_inv = (1 / len(self.partitions)-1) * (1 / len(robbed_subset))
+                    victim = np.random.choice(robbed_subset) #, random.randint(1, len(splitted_subset) - 1))
+                    robbed_subset.remove(victim)
+                    new_partition[robbed_idx] = robbed_subset # to fix split duplicate singletons issue
+                    new_partition.append([victim.astype(int)]) 
+                
+                    if (not self.check_history(new_partition)) and self.are_additive(victim, robbed_subset, interactions):
 
-        proposed_model = copy.deepcopy(self.models[model_idx])
-        proposed_kernel = self.create_kernel(new_partition)
-        proposed_model.covar_module = proposed_kernel
+                        has_candidate = True
+                        return new_partition
+                else:
+                    attempts+=1
 
-        proposal_ratio = sampling_prob_inv / sampling_prob
+            # Merge strategy
+            else:
+                
+                if len(new_partition) > 1:
+
+                    robber_idx, robbed_idx = random.sample(range(len(new_partition)), 2)
+
+                    robbed_subset = new_partition[robbed_idx]
+                    robber_subset = new_partition[robber_idx]
+
+                    new_partition.remove(robbed_subset)
+                    new_partition.remove(robber_subset)
+                    new_partition.append(robbed_subset + robber_subset)
+
+                    all_additive = True
+                    for victim in robbed_subset:
+                            additive = self.are_additive(victim, robber_subset, interactions)
+                            if not additive:
+                                all_additive = False
+                                break
+                    
+                    has_candidate = all_additive
+                    if has_candidate and (not self.check_history(new_partition)):
+                        return new_partition
+ 
+            attempts +=1
+
+        #print(f'Number of attempts exceedded')
+        return old_partition
+
+    def bell_number(self, n):
+        bell = [[0]*(n+1) for _ in range(n+1)]
+        bell[0][0] = 1
+        for i in range(1, n+1):
+            bell[i][0] = bell[i-1][i-1]
+            for j in range(1, i+1):
+                bell[i][j] = bell[i-1][j-1] + bell[i][j-1]
+        return bell[n][0]
+
+    def are_additive(self, individual, set, interactions):
+
+        for evaluator in set:
+
+            i = min(evaluator, individual)
+            j = max(evaluator, individual)
+
+            if interactions[j] > self.epsilon:
+                return False
         
-        return proposed_model, new_partition, proposal_ratio
+        return True
+        
+    def calculate_acceptance(self, proposed_model, device='cpu'):
 
-    def calculate_acceptance(self, curr_model, proposed_model, proposal_ratio):
+        self.train()
+        self.likelihood.train()
+        proposed_model.train()
+        proposed_model.likelihood.train()
 
-        mll_curr = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, curr_model)
-        mll_proposed = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, proposed_model)
+        mll_curr = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
+        mll_proposed = gpytorch.mlls.ExactMarginalLogLikelihood(proposed_model.likelihood, proposed_model)
+        train_inputs = tuple(t.to(device) for t in self.train_inputs)
 
-        curr_evidence = -mll_curr(curr_model(curr_model.train_inputs[0]), curr_model.train_targets)
-        proposed_evidence = -mll_proposed(proposed_model(proposed_model.train_inputs[0]), proposed_model.train_targets)
+        curr_evidence = mll_curr(self(*train_inputs), self.train_targets)
+        proposed_evidence = mll_proposed(proposed_model(proposed_model.train_inputs[0]), proposed_model.train_targets)
 
-        #print(f'Proposal ratio: {proposal_ratio} and evidence ratio: {proposed_evidence / curr_evidence}')
-
-        acceptance = min(1, abs(proposal_ratio) * (proposed_evidence / curr_evidence))
+        acceptance = min(1.0, proposed_evidence / (curr_evidence + 1e-9))
 
         return acceptance
+    
+    def metropolis_hastings(self, interactions, device='cpu'):
 
-    def metropolis_hastings(self, iter, partition_strategy):
-
-        models = []
-        model_updates = torch.zeros((self.num_models), device='cuda')
-
-        for i in range(self.num_models):
-
-            current_model = self.models[i]
-            proposed_model, new_partition, proposal_prob = partition_strategy(i)
-            if proposal_prob == 0.0:
-                models.append(current_model)
-            else:
-                proposed_model.cuda()
-                proposed_model.likf.cuda()
-                self.train_submodel(proposed_model)
-
-                acceptance_ratio = self.calculate_acceptance(current_model, proposed_model, proposal_prob)
-                if self.acceptance_prob(iter) < acceptance_ratio:
-                    print(f'Update for {i}-th model accepted! Genetics propose to partition {new_partition} from {self.partitions[i]} with acceptance {acceptance_ratio}')
-                    models.append(proposed_model)
-                    self.partitions[i] = new_partition
-                    model_updates[i] = 1
-                else:
-                    models.append(current_model)
-            
-        self.models = models
-        return model_updates
-
-    def propose_candidate(self, ch2xy, kappa):
+        # update sobol interactions from surrogate model training
+        new_partition = self.sobol_partitioning(interactions)
+        if new_partition == self.partition:
+            return self.partition
+        proposed_model = MHGP(self.train_inputs[0], self.train_targets, gpytorch.likelihoods.GaussianLikelihood(), 
+                              partition=new_partition, history=self.history, sobol=self.sobol)
+        proposed_model.to(device)
+        proposed_model.likelihood.to(device)
+        proposed_model, proposed_model.likelihood, _ = optimize(proposed_model, proposed_model.train_inputs[0], proposed_model.train_targets)
         
-        candidates = []
-        for model in self.models:
+        acceptance_ratio = self.calculate_acceptance(proposed_model)
 
-            model.eval()
-            model.likf.eval()
+        if acceptance_ratio >= 1.0:
+            #print(f'Update for model accepted! Genetics propose to partition {new_partition} from {self.partition} with acceptance {acceptance_ratio}')
+            self.history.append(self.partition_to_key(new_partition))
+            return new_partition
 
-            with torch.no_grad():
-                X_test = ch2xy
-                observed_pred = model.likf(model.forward(X_test))
-
-            MapPrediction = observed_pred.mean
-            VariancePrediction = observed_pred.variance
-
-            AcquisitionMap = MapPrediction + kappa*torch.nan_to_num(torch.sqrt(VariancePrediction)) # UCB acquisition
-            NextQuery= torch.where(AcquisitionMap.reshape(len(AcquisitionMap))==torch.max(AcquisitionMap.reshape(len(AcquisitionMap))))
-            NextQuery = NextQuery[0][np.random.randint(len(NextQuery[0]))] if len(NextQuery[0]) > 1 else NextQuery[0][0] # Multiple maximums case
-
-            candidates.append(NextQuery)
-
-        best_val = float('-inf')
-        best_candidate = candidates[0]
-
-        self.eval()
-        self.likelihood.eval()
-        with torch.no_grad():
-            X_test = ch2xy
-            observed_pred = self.likelihood(self.forward(X_test))
-        MapPrediction = observed_pred.mean
-        VariancePrediction = observed_pred.variance
-        AcquisitionMap = MapPrediction + kappa*torch.nan_to_num(torch.sqrt(VariancePrediction)) # UCB acquisition
+        else: 
+            return self.partition 
         
-        for candidate in candidates:
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-            acq_val = AcquisitionMap[candidate.item()]
-            if acq_val > best_val:
-                best_candidate = candidate
-                best_val = acq_val
+class SobolGP(gpytorch.models.ExactGP):
 
-        return best_candidate
+    """
+    Exact GP that composes an additive kernel according to `partition`.
+    - partition: list of lists of integer dimension indices, e.g. [[0,2],[1,3]]
+    - sobol: an associated Sobol object (optional)
+    - epsilon: additivity threshold (kept as attribute)
+    """
+    def __init__(self, train_x, train_y, likelihood, partition=None, history = None, sobol=None, epsilon=8e-2):
+        super(SobolGP, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ZeroMean()
+        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
+        self.history = history if history else None
+        self.sobol = sobol
+        self.n_dims = train_x.shape[-1]
+        self.epsilon = 0.08 #- 0.02 * min(1.0, (self.n_dims**2 / 30.0))
+        self.name = 'SobolGP'
+        # build covar_module based on partition
+        self._build_covar()
 
-    def train_submodels(self, n_iters=50):
+    def _build_covar(self):
 
-        l = 0.0
+        kernels = []
+        for group in self.partition:
 
-        for model in self.models:
-            model.train()
-            model.likf.train()
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-            mll = gpytorch.mlls.ExactMarginalLogLikelihood(model.likf, model)
-            for _ in range(n_iters):
+            ard_dims = len(group)
 
-                output = model(model.train_inputs[0])
-                loss = -mll(output, model.train_targets)
-                l += loss
-                loss.backward()
-                optimizer.step()
+            base_kernel = gpytorch.kernels.MaternKernel(
+                nu = 2.5,
+                ard_num_dims = ard_dims,
+                active_dims = group,
+            )
 
-        return l / self.num_models
+            scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel)
 
-    def train_submodel(self, submodel, n_iters=50):
+            kernels.append(scaled_kernel)
 
-        submodel.train()
-        submodel.likf.train()
-        optimizer = torch.optim.Adam(submodel.parameters(), lr=0.001)
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(submodel.likf, submodel)
-        for _ in range(n_iters):
+        self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)
 
-            output = submodel(submodel.train_inputs[0])
-            loss = -mll(output, submodel.train_targets)
-            loss.backward()
-            optimizer.step()
+    def update_partition(self, new_partition):
 
-    def cuda_submodels(self):
+        # normalize indices to ints
+        new_partition = [list(map(int, grp)) for grp in new_partition if len(grp) > 0]
+        # avoid unnecessary rebuilds:
+        if new_partition == self.partition:
+            return
+        self.partition = new_partition
+        self._build_covar()
 
-        for model in self.models:
-            model.cuda()
-            model.likf.cuda()
+    def reconfigure_space(self, surrogate, surrogate_likelihood):
+    
+        # update Sobol interactions based on new surrogate train data
+        interactions = self.sobol.method(surrogate.train_inputs[0], surrogate.train_targets, surrogate)
+        new_partition = self.sobol.update_partition(interactions)
+        #self.update_partition(new_partition)
 
-    def set_train_data_submodels(self, x, y):
+        return interactions, new_partition
 
-        self.set_train_data(x,y, strict=False)
-        for model in self.models:
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-            model.set_train_data(x, y, strict=False)
 
 class WrappedModel(GPyTorchModel):
     _num_outputs = 1
