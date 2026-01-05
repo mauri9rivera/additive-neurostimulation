@@ -33,7 +33,10 @@ from models.gaussians import *
 from models.sobols import *
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="SALib.util")
-warnings.filterwarnings("ignore", category=UserWarning, module="SALib")
+warnings.filterwarnings(
+    "ignore", 
+    message="The balance properties of Sobol' points require n to be a power of 2."
+)
 
 ### Runners ###
 
@@ -130,7 +133,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=20, kappa=1.0
             y_pred = post.mean.cpu()
             ss_res = torch.sum((y_true - y_pred) ** 2)
             ss_tot = torch.sum((y_true - y_true.mean()) ** 2)
-            r2_score = np.clip(1 - ss_res / ss_tot, 0.0, 1.0)
+            r2_score = np.clip(1 - (ss_res / ss_tot), 0.0, 1.0)
             r_squared.append(r2_score.item())
 
         # Exploration and Exploitation scores (normalized)
@@ -292,7 +295,7 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
             y_pred = post.mean.cpu()
             ss_res = torch.sum((y_true - y_pred) ** 2)
             ss_tot = torch.sum((y_true - y_true.mean()) ** 2)
-            r2_score = np.clip(1 - ss_res / ss_tot, 0.0, 1.0)
+            r2_score = np.clip(1 - (ss_res / ss_tot), 0.0, 1.0)
             r_squared.append(r2_score.item())
 
         # Exploration and Exploitation scores (normalized) 
@@ -1057,4 +1060,7 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    main()
+    #main()
+    f_obj = SyntheticTestFun('michalewicz', 2, noise=False, negate=True)
+    #results = run_bo(f_obj, ExactGP, n_iter=50, kappa=5.0)
+    optimization_metrics(f_obj, [1.0,1.0,1.0], 50, 1, devices=['cpu', 'cuda:0', 'cuda:1'])
