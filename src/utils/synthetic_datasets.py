@@ -265,7 +265,6 @@ class TwoBlobs(BaseTestProblem):
         self.categorical_inds = []
         self._bounds = [(0.0, 10.0) for _ in range(self.d)] # bounds on original domain
 
-
         # initialize BaseTestProblem / nn.Module internals
         super().__init__(noise_std, negate)
 

@@ -637,5 +637,5 @@ def benchmark_queries():
             print(f"{N:<5} | {mode:<20} | {avg_time:.4f}")
 
 if __name__ == "__main__":
-    #benchmark_dimensions()
-    benchmark_queries()
+    benchmark_dimensions()
+    #benchmark_queries()

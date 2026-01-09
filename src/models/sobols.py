@@ -67,7 +67,7 @@ class Sobol:
       update_partition(interactions) -> partition (list of list of dims)
     """
 
-    def __init__(self, f_obj, epsilon=8e-2, method='scipy', M=2048, B=128):
+    def __init__(self, f_obj, t, method='scipy', M=2048, B=128):
         """
         f_obj: SyntheticTestFun object for the test function to optimize
         epsilon: threshold for high-order sobol interactions
@@ -75,7 +75,7 @@ class Sobol:
         M: number of monte-carlo samples for sobol metamodel
         method: string representing the Sobol global sensitivity analysis method to use.
         """
-        self.epsilon = 0.08 # - 0.02 * min(1.0, (d**2 / 30.0))
+        self.epsilon = np.clip(0.08*(0.998**t), 0.05, 0.08)
         self.B = B
         self.M = M
         self.problem = self._build_problem(f_obj)
@@ -89,7 +89,6 @@ class Sobol:
             'asm': self.interactions_asm
         }
         self.method = method_map[method]
-
 
     def _build_problem(self, f_obj):
         """
@@ -115,6 +114,10 @@ class Sobol:
         self.device = torch.device(device)
         return self
 
+    def update_eps(self, t):
+
+        self.epsilon = np.clip(0.08*(0.998**t), 0.05, 0.08)
+
     def interactions_wirthl(self, train_x, train_y, metamodel):
         """
         Calculate higher-order Sobol indices using GP metamodel as described in the paper
@@ -130,6 +133,7 @@ class Sobol:
         """
 
         #problem vars
+        self.update_eps(train_x.shape[0])
         d = self.problem['num_vars']
         self.NZ = train_x.shape[0] 
         
@@ -245,6 +249,7 @@ class Sobol:
         """
 
         #problem vars
+        self.update_eps(train_x.shape[0])
         d = self.problem['num_vars']
         self.NZ = train_x.shape[0]
         
@@ -653,7 +658,7 @@ class Sobol:
 
     def update_partition(self, interactions):
         """
-        Partition dimensions using a greedy algorithm based on 2nd-order interactions.
+        Partition dimensions using a greedy algorithm based on high-order interactions.
 
         Inputs:
         - interactions: numpy array (1, d) matrix with high-order Sobol indices.

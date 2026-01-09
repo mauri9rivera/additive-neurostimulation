@@ -3,7 +3,7 @@ import torch
 import random
 import copy
 import numpy as np
-
+import math
 
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from botorch.models.gpytorch import GPyTorchModel
@@ -52,12 +52,22 @@ def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
     mean_loss = float(np.mean(epoch_losses))
     return gp, gp.likelihood, mean_loss
 
-def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
+def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points, mode='normal'):
     """
     Grid-search UCB maximizer.
     Returns: new_x (1 x d tensor), ucb_value (float), idx (int)
     UCB = mean + kappa * std
     """
+
+    if mode == 'normal':
+        pass
+    elif mode == 'exponential_decay':
+        t = gp_model.train_inputs[0].shape[0]
+        kappa_val *= math.exp(-0.05*t)
+    elif mode == 'log_growth':
+        t = gp_model.train_inputs[0].shape[0]
+        kappa_val = math.log((kappa_val**2)*t)
+
     gp_model.eval()
     gp_likelihood.eval()
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
@@ -309,14 +319,13 @@ class SobolGP(gpytorch.models.ExactGP):
     - sobol: an associated Sobol object (optional)
     - epsilon: additivity threshold (kept as attribute)
     """
-    def __init__(self, train_x, train_y, likelihood, partition=None, history = None, sobol=None, epsilon=8e-2):
+    def __init__(self, train_x, train_y, likelihood, partition=None, history = None, sobol=None):
         super(SobolGP, self).__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ZeroMean()
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
         self.history = history if history else None
         self.sobol = sobol
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.08 #- 0.02 * min(1.0, (self.n_dims**2 / 30.0))
         self.name = 'SobolGP'
         # build covar_module based on partition
         self._build_covar()

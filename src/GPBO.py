@@ -63,8 +63,8 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=20, kappa=1.0
     grid_min = grid_y.min().item()
 
     # Initiate training set
-    sobol = Sobol(f_obj).to(device)
     n_init = f_obj.d*3
+    sobol = Sobol(f_obj, n_init).to(device)
     true_best = grid_y.max().item() #f_obj.f.optimal_value
     train_x_cpu = torch.from_numpy(sobol_sampler.sample(sobol.problem, n_init, calc_second_order=False)).float()
     train_x = train_x_cpu.to(device)
@@ -238,8 +238,8 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
     grid_min = grid_y.min().item()
     
     # Initiate training set
-    sobol = Sobol(f_obj)
     n_init = f_obj.d*3
+    sobol = Sobol(f_obj, n_init)
     true_best = grid_y.max().item() #f_obj.f.optimal_value  
     train_x_cpu = torch.from_numpy(sobol_sampler.sample(sobol.problem, n_init, calc_second_order=False)).float()
     train_x = train_x_cpu.to(device)
@@ -1060,7 +1060,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    #main()
-    f_obj = SyntheticTestFun('michalewicz', 2, noise=False, negate=True)
-    #results = run_bo(f_obj, ExactGP, n_iter=50, kappa=5.0)
-    optimization_metrics(f_obj, [1.0,1.0,1.0], 50, 1, devices=['cpu', 'cuda:0', 'cuda:1'])
+    main()
