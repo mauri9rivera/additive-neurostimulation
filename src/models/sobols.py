@@ -298,30 +298,14 @@ class Sobol:
             # Extract components
             S1 = result.first_order     # (d,)
             ST = result.total_order     # (d,)
-            # S2 = res["S2"]    # (d, d) -- available if needed
-
-            #print(f'confidence interval: {result.bootstrap().total_order.confidence_interval}')
 
             S1_boot[b] = S1
             ST_boot[b] = ST
-            high_boot[b] = ST - S1     # higher-order index
+            high_boot[b] = np.clip(ST - S1, 0.0, 1.0)     # higher-order index
 
 
         # ---- Aggregation over bootstrap ----
         high_mean = high_boot.mean(axis=0)
-        high_var = high_boot.var(axis=0, ddof=1)
-        S1_tot = S1_boot.mean(axis=0)
-        ST_tot = ST_boot.mean(axis=0)
-
-        #print(f'predicted S1: {S1_tot} and predicted S_total: {ST_tot}')
-
-        # 95% CI
-        lower = np.percentile(high_boot, 2.5, axis=0)
-        upper = np.percentile(high_boot, 97.5, axis=0)
-        CI = np.vstack([lower, upper]).T
-
-        #print(f'Results for interactions of Saltelli-scipy (SobolGP) method\n')
-        #print(f'Higher order interactions: {high_mean} with var: {high_var}')
 
         return high_mean
 

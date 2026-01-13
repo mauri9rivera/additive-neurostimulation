@@ -63,7 +63,7 @@ def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points, mode='normal')
         pass
     elif mode == 'exponential_decay':
         t = gp_model.train_inputs[0].shape[0]
-        kappa_val *= math.exp(-0.05*t)
+        kappa_val *= math.exp(-0.005*t)
     elif mode == 'log_growth':
         t = gp_model.train_inputs[0].shape[0]
         kappa_val = math.log((kappa_val**2)*t)
