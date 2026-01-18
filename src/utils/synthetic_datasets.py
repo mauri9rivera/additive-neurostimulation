@@ -1,7 +1,7 @@
 import random
 import numpy as np
 from botorch.test_functions.synthetic import (
-    Hartmann, Ackley, Griewank, Michalewicz, Rosenbrock, Shekel, Rastrigin, Levy
+    Hartmann, Ackley, Griewank, Michalewicz, Rosenbrock, Shekel, Rastrigin, Levy, StyblinskiTang
 )
 from botorch.test_functions.base import BaseTestProblem
 from botorch.test_functions.sensitivity_analysis import Ishigami, Gsobol, Morris
@@ -50,7 +50,7 @@ class SyntheticTestFun:
                 if d not in [6, 8, 15]:
                     raise ValueError("The GSobol function needs to be a 6, 8, or 15 dimensional")
                 if d == 6:
-                    a=[0, 0.5, 3, 9, 99, 99]
+                    a=[0, 0.5, 0.5, 99, 99, 99]
                 elif d == 8:
                     a= [0, 1, 4.5, 9, 99, 99, 99, 99] 
                 elif d == 15: 
@@ -93,9 +93,11 @@ class SyntheticTestFun:
                 # Note: Need to negate to turn into maximization
                 self.f = Levy(d, noise_std=noise, negate=negate)
             case 'shekel':
-                # Note: Need to negate to turn into maximization
+                # Note: Need to negate to turn into maximizationblin
                 self.f = Shekel(m=5, negate=True)
                 self.d = 4
+            case 'styblinski':
+                self.f = StyblinskiTang(d, noise_std=noise, negate=negate)
             case _:
 
                 raise ValueError("Wrong synthetic function name.")

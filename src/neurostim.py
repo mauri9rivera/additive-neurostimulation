@@ -15,6 +15,7 @@ import time
 from gpytorch.models.exact_gp import GPInputWarning
 import scipy.io
 import pickle
+import math
 
 from botorch.acquisition import UpperConfidenceBound
 from botorch.optim import optimize_acqf
@@ -37,7 +38,6 @@ from sklearn.model_selection import train_test_split
 ### MODULES HANDLING ###
 # If the package structure differs you may need to adjust PYTHONPATH or the imports below
 #from models.gaussians import AdditiveKernelGP, BaseGP, WrappedModel, ExactGPModel
-from utils.synthetic_datasets import *
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="SALib.util")
 
@@ -98,6 +98,15 @@ class Sobol:
 
         return problem
 
+    def bell_number(self, n):
+        bell = [[0]*(n+1) for _ in range(n+1)]
+        bell[0][0] = 1
+        for i in range(1, n+1):
+            bell[i][0] = bell[i-1][i-1]
+            for j in range(1, i+1):
+                bell[i][j] = bell[i-1][j-1] + bell[i][j-1]
+        return bell[n][0]
+
     def update_interactions(self, train_x, train_y, simulator, likelihood):
         """
         train_x: Tensor (n, d) or array
@@ -110,88 +119,98 @@ class Sobol:
         """
 
         
-        # train surrogate model
+        # Retrain the surrogate model
         simulator, likelihood, _ = optimize(simulator, train_x, train_y,)
 
-        try:
+        n, d = train_x.shape
+        
+        # Determine number of Monte Carlo samples
+        N = self.n_sobol_samples or (n // (2 * (d + 2)))
+        N = max(N, 2048)
+        
+        # Generate Saltelli samples
+        param_values = sobol_sampler.sample(self.problem, N, calc_second_order=True, skip_values=N*2)
+        param_values = np.asarray(param_values, dtype=np.float32)
+        
+        M = param_values.shape[0] // (2 * d + 2)  # Actual number of MC samples per matrix
+        
+        # Split Saltelli samples into matrices A, B, and hybrid matrices
+        # Saltelli sequence: [A, B, AB_1, AB_2, ..., AB_d, BA_1, BA_2, ..., BA_d]
+        A = param_values[:M]  # First M samples
+        B = param_values[M:2*M]  # Next M samples
+        
+        # Extract hybrid matrices A_B_i and B_A_i
+        A_B = {}  # A with i-th column from B
+        B_A = {}  # B with i-th column from A
+        
+        for i in range(d):
+            start_idx = 2*M + i*M
+            A_B[i] = param_values[start_idx:start_idx + M]
+            
+            start_idx = 2*M + d*M + i*M  
+            B_A[i] = param_values[start_idx:start_idx + M]
+        
+        # Convert to torch tensors
+        device = train_x.device
+        dtype = train_x.dtype
+        
+        A_tensor = torch.tensor(A, device=device, dtype=dtype)
+        B_tensor = torch.tensor(B, device=device, dtype=dtype)
+        
+        # Evaluate GP at all points
+        simulator.eval()
+        likelihood.eval()
+        
+        with torch.no_grad():
+            # Evaluate at A and B
+            pred_A = likelihood(simulator(A_tensor)).mean.cpu().numpy().flatten()
+            pred_B = likelihood(simulator(B_tensor)).mean.cpu().numpy().flatten()
+            
+            # Evaluate at hybrid matrices
+            pred_A_B = {}
+            pred_B_A = {}
+            
+            for i in range(d):
+                A_B_tensor = torch.tensor(A_B[i], device=device, dtype=dtype)
+                B_A_tensor = torch.tensor(B_A[i], device=device, dtype=dtype)
+                
+                pred_A_B[i] = likelihood(simulator(A_B_tensor)).mean.cpu().numpy().flatten()
+                pred_B_A[i] = likelihood(simulator(B_A_tensor)).mean.cpu().numpy().flatten()
+        
+        # Calculate variance term V[fGP_N([A B])]
+        all_preds = np.concatenate([pred_A, pred_B])
+        V = np.var(all_preds)
+        
+        # Calculate first order indices S_i (needed for second order)
+        S_i = np.zeros(d)
+        for i in range(d):
+            numerator = np.mean(pred_B * (pred_A_B[i] - pred_A))
+            S_i[i] = numerator / V
+        
+        # Calculate second order indices S_ij using Equation (20) from the paper
+        interactions = np.zeros((d, d))
+        
+        for i in range(d):
+            for j in range(d):
+                if i != j:  # Second order indices are for i ≠ j
+                    # Equation (20): S_ij = [1/M * sum(fGP(B_A_i) * fGP(A_B_j) - fGP(A) * fGP(B))] / V - S_i - S_j
+                    term1 = np.mean(pred_B_A[i] * pred_A_B[j] - pred_A * pred_B)
+                    S_ij = (term1 / V) - S_i[i] - S_i[j]
+                    interactions[i, j] = max(S_ij, 0)  # Sobol indices should be non-negative
+                else:
+                    # Diagonal elements are not second-order indices (set to 0)
+                    interactions[i, j] = 1.0
+        
+        # Make symmetric (S_ij = S_ji in Sobol decomposition)
+        for i in range(d):
+            for j in range(i+1, d):
+                avg = (interactions[i, j] + interactions[j, i]) / 2
+                interactions[i, j] = avg
+                interactions[j, i] = avg
+        
+        return interactions
 
-            # Convert to numpy
-            if isinstance(train_x, torch.Tensor):
-                x = train_x.detach().cpu().numpy()
-            else:
-                x = np.asarray(train_x)
-
-            if isinstance(train_y, torch.Tensor):
-                y = train_y.detach().cpu().numpy()
-            else:
-                y = np.asarray(train_y)
-
-            # Flatten y
-            y = y.reshape(-1)
-
-            n, d = x.shape
-
-            # Determine how many samples to use
-            N = self.n_sobol_samples or (n // (2 * (d + 2)))
-            N = max(N, 128)
-
-            # Generate Saltelli samples
-            param_values = sobol_sampler.sample(self.problem, N, calc_second_order=True, skip_values=N*2)
-
-            # Evaluate simulator at param_values
-            param_values = np.asarray(param_values, dtype=np.float32)
-            m_total = param_values.shape[0]
-            y_s_list = []
-            batch_size = 2048
-
-            simulator.eval(), likelihood.eval()
-            with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                for start in range(0, m_total, batch_size):
-                    end = min(start + batch_size, m_total)
-                    batch_np = param_values[start:end]
-                    batch_t = torch.from_numpy(batch_np).float()
-                    post = likelihood(simulator(batch_t))
-                    y_s_list.append(post.mean.cpu().numpy())
-
-            y_s = np.concatenate(y_s_list, axis=0)
-
-            if np.var(y_s) < 1e-12 or np.unique(y_s).size <= 1:
-                # Option A: return zero interactions (no interactions found)
-                d = self.problem['num_vars']
-                S2_sym = np.zeros((d, d), dtype=float)
-                np.fill_diagonal(S2_sym, 0.0)
-                self.interactions = S2_sym
-                return S2_sym
-
-
-            # Analyze with SALib
-            Si = salib_sobol.analyze(
-                self.problem, y_s,
-                calc_second_order=True, print_to_console=False
-            )
-
-            if 'S2' not in Si:
-                raise RuntimeError("SALib did not return 'S2'. Ensure calc_second_order=True.")
-
-            # Build symmetric interactions matrix
-            S2 = np.asarray(Si['S2'], dtype=float)
-            S2 = np.nan_to_num(S2, nan=0.0)
-            S2 = np.clip(S2, a_min=0.0, a_max=None)
-
-            # Symmetrize and zero diagonal
-            #S2_sym = 0.5 * (S2 + S2.T)
-            np.fill_diagonal(S2, 1.0)
-            self.interactions = S2
-            return S2
-
-
-        except Exception as e:
-            print("compute_interactions: EXCEPTION:", e)
-            traceback.print_exc(file=sys.stdout)
-            # re-raise so the Future contains the exception (better than returning None)
-            raise
-
-    def update_partition(self):
+    def update_partition(self, interactions):
         """
         Partition dimensions using a greedy algorithm based on 2nd-order interactions.
 
@@ -222,7 +241,7 @@ class Sobol:
                 for x in sub:
                     if modif:
                         break
-                    if self.interactions[x, e] > self.epsilon:
+                    if interactions[e, x] > self.epsilon:
                         additive = False
                         sub.append(e)
                         modif = True
@@ -282,16 +301,18 @@ class ExactGP(gpytorch.models.ExactGP):
 class neuralMHGP(gpytorch.models.ExactGP):
 
     def __init__(self, train_x, train_y, likelihood, lengthscale_prior, outputscale_prior, 
-                 partition = None, sobol=None, epsilon=5e-2):
+                 partition = None, sobol=None, history = None, epsilon=5e-2):
 
         super().__init__(train_x, train_y, likelihood)
         self.n_dims = train_x.shape[-1]
         self.mean_module = gpytorch.means.ZeroMean() 
-        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
+        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
+        self.history = history if history else [self.partition_to_key(self.partition)] 
         self.sobol = sobol
         self.name = 'neuralMHGP'
         self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
         self.split_bias = 0.7
+        self.max_attempts = self.bell_number(self.n_dims)
 
         #build covar_module based on partition
         self.lengthscale_prior = lengthscale_prior
@@ -322,8 +343,23 @@ class neuralMHGP(gpytorch.models.ExactGP):
         self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)
 
     def partition_to_key(self, partition):
-        # Convert to a hashable, sorted tuple of tuples
-        return [list(map(int, grp)) for grp in partition if len(grp) > 0] #tuple(sorted(tuple(sorted(sub)) for sub in partition))
+        return tuple(sorted(tuple(sorted(sub)) for sub in partition))
+
+    def check_history(self, new_partition):
+        """
+        Return True if the canonical key for new_partition is already in history.
+        """
+        key = self.partition_to_key(new_partition)
+        return key in self.history
+
+    def bell_number(self, n):
+        bell = [[0]*(n+1) for _ in range(n+1)]
+        bell[0][0] = 1
+        for i in range(1, n+1):
+            bell[i][0] = bell[i-1][i-1]
+            for j in range(1, i+1):
+                bell[i][j] = bell[i-1][j-1] + bell[i][j-1]
+        return bell[n][0]
 
     def update_partition(self, new_partition):
 
@@ -341,22 +377,27 @@ class neuralMHGP(gpytorch.models.ExactGP):
         has_candidate = False
         attempts = 0
 
-        while not has_candidate and attempts < 50:
+        if len(self.history) == self.max_attempts:
+            return old_partition
+
+        while not has_candidate and attempts < (self.max_attempts + 5):
 
             new_partition = copy.deepcopy(self.partition)
             
             # Split strategy
             if random.random() < self.split_bias:
 
-                robbed_subset = list(new_partition[random.randint(0, len(new_partition) - 1)])
+                robbed_idx = random.randint(0, len(new_partition) - 1)
+                robbed_subset = new_partition[robbed_idx]
 
                 if len(robbed_subset) > 1:
 
                     victim = np.random.choice(robbed_subset) #, random.randint(1, len(splitted_subset) - 1))
                     robbed_subset.remove(victim)
+                    new_partition[robbed_idx] = robbed_subset
                     new_partition.append([victim.astype(int)]) 
                 
-                    if self.are_additive(victim, robbed_subset, interactions):
+                    if (not self.check_history(new_partition)) and self.are_additive(victim, robbed_subset, interactions):
 
                         has_candidate = True
                         return new_partition
@@ -383,12 +424,12 @@ class neuralMHGP(gpytorch.models.ExactGP):
                                 break
                     
                     has_candidate = all_additive
-                    if has_candidate:
+                    if has_candidate and (not self.check_history(new_partition)):
                         return new_partition
                     
             attempts +=1
 
-        print(f'Number of attempts exceedded')
+        #print(f'Number of attempts exceedded')
         return old_partition
 
     def are_additive(self, individual, set, interactions):
@@ -417,16 +458,16 @@ class neuralMHGP(gpytorch.models.ExactGP):
         curr_evidence = -mll_curr(self(*train_inputs), self.train_targets)
         proposed_evidence = -mll_proposed(proposed_model(proposed_model.train_inputs[0]), proposed_model.train_targets)
 
-        acceptance = min(1, (proposed_evidence / curr_evidence))
+        acceptance = min(1.0, proposed_evidence / (curr_evidence + 1e-9))
 
         return acceptance
         
-    def reconfigure_space(self, surrogate, surrogate_likelihood, device=DEVICE):
+    def metropolis_hastings(self, interactions, device=DEVICE):
 
         # update sobol interactions from surrogate model training
-        self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
-        interactions = self.sobol.interactions
         new_partition = self.sobol_partitioning(interactions)
+        if new_partition == self.partition:
+            return self.partition
         proposed_model = neuralMHGP(self.train_inputs[0], self.train_targets, gpytorch.likelihoods.GaussianLikelihood(), 
                               partition=new_partition)
         proposed_model.to(device)
@@ -435,12 +476,13 @@ class neuralMHGP(gpytorch.models.ExactGP):
         
         acceptance_ratio = self.calculate_acceptance(proposed_model)
 
-        if acceptance_ratio >= 0.9:
-            print(f'Update for model accepted! Genetics propose to partition {new_partition} from {self.partition} with acceptance {acceptance_ratio}')
-            self.update_partition(new_partition)
-            #partition_key, self.history()
-        
-        return interactions
+        if acceptance_ratio >= 1.0:
+            #print(f'Update for model accepted! Genetics propose to partition {new_partition} from {self.partition} with acceptance {acceptance_ratio}')
+            self.history.append(self.partition_to_key(new_partition))
+            return new_partition
+
+        else: 
+            return self.partition 
         
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -456,11 +498,12 @@ class neuralSobolGP(gpytorch.models.ExactGP):
     - epsilon: additivity threshold (kept as attribute)
     """
     def __init__(self, train_x, train_y, likelihood, lengthscale_prior, outputscale_prior, 
-                 partition=None, sobol=None, epsilon=5e-2):
+                 partition=None, history = None, sobol=None, epsilon=5e-2):
         super(neuralSobolGP, self).__init__(train_x, train_y, likelihood)
         self.n_dims = train_x.shape[-1]
         self.mean_module = gpytorch.means.ZeroMean()
-        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
+        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
+        self.history = history if history else None
         self.sobol = sobol
         self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
         self.name = 'neuralSobolGP'
@@ -504,11 +547,11 @@ class neuralSobolGP(gpytorch.models.ExactGP):
     def reconfigure_space(self, surrogate, surrogate_likelihood):
     
         # update Sobol interactions based on new surrogate train data
-        self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
-        new_partition = self.sobol.update_partition()
+        interactions = self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
+        new_partition = self.sobol.update_partition(interactions)
         self.update_partition(new_partition)
 
-        return self.sobol.interactions
+        return interactions, new_partition
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -539,6 +582,60 @@ def method_C(X, groups, D):
 
 
 ### --- Data processing methods --- ###
+
+def sort_valid_5drats(resp, param, ch2xy):
+
+    resp_mu = np.mean(resp,axis=2)
+    resp_sigma = np.std(resp, axis=2)
+    #std_map = np.std(resp, axis=(0, 2)) Current method considers mean std w/in repetitions. Change this for global
+    val_pw = np.unique(param[:,0])
+    val_freq = np.unique(param[:,1])
+    val_duration = np.unique(param[:,2])
+    mean_map = np.zeros((resp.shape[1],len(val_pw),len(val_freq),len(val_duration),8,4))
+    std_map = np.zeros((resp.shape[1],len(val_pw),len(val_freq),len(val_duration),8,4))
+
+    for e in range(resp.shape[1]):
+        for i in range(len(param)):
+
+            idx_pw = np.where(np.isclose(val_pw, param[i, 0]))[0][0]
+            idx_freq = np.where(np.isclose(val_freq, param[i, 1]))[0][0]
+            idx_duration = np.where(np.isclose(val_duration, param[i, 2]))[0][0]
+
+            x_ch = int(ch2xy[i,3]) -1
+            y_ch = int(ch2xy[i,4]) -1 
+
+            mean_map[e, idx_pw, idx_freq, idx_duration, x_ch, y_ch] = resp_mu[i,e]
+            std_map[e, idx_pw, idx_freq, idx_duration, x_ch, y_ch] = resp_sigma[i,e]
+
+    n_cond, n_emgs, n_reps = resp.shape
+    valid_resp = np.zeros_like(resp, dtype=np.int64)
+    for i in range(n_cond):
+        # find indices in the map corresponding to this condition
+        idx_pw = np.where(np.isclose(val_pw, param[i, 0]))[0][0]
+        idx_freq = np.where(np.isclose(val_freq, param[i, 1]))[0][0]
+        idx_duration = np.where(np.isclose(val_duration, param[i, 2]))[0][0]
+        x_ch = int(ch2xy[i, 3]) - 1
+        y_ch = int(ch2xy[i, 4]) - 1
+
+        for j in range(n_emgs):
+
+            # extract mean/std vectors for this condition
+            mean_vec = mean_map[j, idx_pw, idx_freq, idx_duration, x_ch, y_ch] #np.mean(resp_mu, axis=0)[j]   # shape (1,)
+            std_vec = std_map[j, idx_pw, idx_freq, idx_duration, x_ch, y_ch] #std_map[j] 
+
+            deviation = resp[i, j, :] - mean_vec
+            valid_mask = np.abs(deviation) <= 3*std_vec
+
+            #print(f'mean_vec: {mean_vec} and std_vec: {std_vec}')
+            deviation = np.abs(resp[i, j, :] - mean_vec)
+            #print(f'deviation: {deviation}')
+            valid_mask = deviation <= 2*std_vec
+            if np.all(~valid_mask):
+                print(f'issue with stim {i} on emg {j}: {3*std_vec} is higher than |{deviation}| so gives invalid mask: {valid_mask}')
+                
+            valid_resp[i, j, :] = valid_mask.astype(np.int64)
+
+    return valid_resp
 
 def set_experiment(dataset_type):
 
@@ -884,10 +981,9 @@ def load_data2(dataset_type, m_i):
         resp = data['emg_response']
         param = data['stim_combinations']
         ch2xy = param[:, [0,1,2,5,6]]
-        peak_resp = resp[:, :, :, 2].transpose((2, 1, 0)) # resp[:, :, :, 0] for unormalized response
-        resp_mean = np.mean(resp[:, :, :, 2], axis=0).transpose((1, 0))
-
-        sorted_isvalid = peak_resp + 1e-7
+        peak_resp = resp[:, :, :, 2].transpose((2, 1, 0)) # resp[:, :, :, 0] for unormalized response ; (nb_reps, nb_emgs, params) to (params, nb_emgs, nb_reps)
+        resp_mean = np.mean(resp[:, :, :,2], axis=0).transpose((1, 0)) #(params, nb_emgs)
+        sorted_isvalid = sort_valid_5drats(peak_resp, param, ch2xy)
 
         subject = {
             'emgs': emgs,
@@ -1336,7 +1432,6 @@ def neurostim_bo(dataset, model_cls, kappas):
 
     for s_idx in range(nSubjects):
 
-        print(f'subject {s_idx + 1} \ {nSubjects}')
         subject = load_data2(dataset, s_idx) 
         subject['ch2xy'] = torch.tensor(subject['ch2xy'], device=device)
 
@@ -1375,6 +1470,9 @@ def neurostim_bo(dataset, model_cls, kappas):
 
 
                 for rep_i in range(nRep):
+
+                    print(f'subject {s_idx + 1} \ {nSubjects} | emg: {e_i} | kappa {kappa} | {rep_i+1} / {nRep}')
+
                     
                     # maximum response obtained in this round, used to normalize all responses between zero and one.
                     MaxSeenResp=0
@@ -1393,23 +1491,30 @@ def neurostim_bo(dataset, model_cls, kappas):
                         # Query selection
                         if q>=nrnd:
                             # Max of acquisition map
+                        
                             AcquisitionMap = ymu + kappa*torch.nan_to_num(torch.sqrt(ys2)) # UCB acquisition
                             Next_Elec= torch.where(AcquisitionMap.reshape(len(AcquisitionMap))==torch.max(AcquisitionMap.reshape(len(AcquisitionMap))))
                             Next_Elec = Next_Elec[0][np.random.randint(len(Next_Elec))]  if len(Next_Elec[0]) > 1 else Next_Elec[0][0]
                             P_test[rep_i][q][0]= Next_Elec
+                            #except:
+                                #print(f'AcquisitionMap: {AcquisitionMap}')
+                                #print(f'Next_Elect: {torch.where(AcquisitionMap.reshape(len(AcquisitionMap))==torch.max(AcquisitionMap.reshape(len(AcquisitionMap))))}')
+                                #print(f'ymu: {observed_pred.mean}')
+                                #print(f'model and likelihood? model: {model} likelihood: {likf}')
                         else:
                             P_test[rep_i][q][0]= int(order_this[q])
                         query_elec = P_test[rep_i][q][0]
 
                         # Read response
-                        try:
-                            valid_resp= torch.tensor(subject['sorted_resp'][int(query_elec)][e_i][subject['sorted_isvalid'][int(query_elec)][e_i]!=0])
-                            r_i= np.random.randint(len(valid_resp))
-                        except:
-                            print(f'This is valid response: {valid_resp} queried at {q} | emg = {e_i} | nrep {rep_i} | k = {k_idx}')
-                            print(f'Redo strategy to handle 5d_rat')
-                            exit(1)
-                        test_respo= valid_resp[r_i]
+                        sample_resp = torch.tensor(subject['sorted_resp'][int(query_elec)][e_i][subject['sorted_isvalid'][int(query_elec)][e_i]!=0])
+                        if len(sample_resp) == 0:
+                            sample_resp = torch.tensor(subject['sorted_resp'][int(query_elec)][e_i])
+                            valid_responses = subject['sorted_isvalid'][int(query_elec)][e_i]
+                            print(f'sample_response: {sample_resp} \n valid_responses: {valid_responses} \n and query_elec: {query_elec}\n')
+                            test_respo = 1e-9
+                        else:
+                            test_respo = sample_resp[np.random.randint(len(sample_resp))]
+                       
                         std = (0.02 * torch.mean(test_respo)).clamp(min=0.0)   
                         noise = torch.randn((), device=test_respo.device, dtype=test_respo.dtype) * std
                         test_respo = test_respo + noise
@@ -1471,12 +1576,15 @@ def neurostim_bo(dataset, model_cls, kappas):
 
                         # Pending Sobol job fetch
                         if space_reconfiguration is not None and space_reconfiguration.done():
-                            try:
-                                interactions = space_reconfiguration.result()
-                                space_reconfiguration = None
-                            except Exception as e:
-                                space_reconfiguration = None
-                                print(f'[Sobol] background job failed: {e}')
+                            interactions = space_reconfiguration.result()
+                            if model.name == 'neuralMHGP':
+                                new_partition = model.metropolis_hastings(interactions)
+                            else:
+                                new_partition = sobol.update_partition(interactions)
+                            
+                            model.update_partition(new_partition)
+                            space_reconfiguration = None
+                           
                             
                         #Update partitions every 10 queries
                         if model.name in ['neuralSobolGP', 'neuralMHGP']:
@@ -1485,14 +1593,12 @@ def neurostim_bo(dataset, model_cls, kappas):
                             sobol_interactions[rep_i, q] = interactions.copy()
 
                             if q % 10 == 1:
-
                                 if space_reconfiguration is None or space_reconfiguration.done():
-                                    
                                     try:
 
                                         surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_prior= prior_lik)
                                         surrogate = ExactGP(x, y, surrogate_likelihood, priorbox, outputscale_priorbox)
-                                        space_reconfiguration = executor.submit(model.reconfigure_space, surrogate, surrogate_likelihood)
+                                        space_reconfiguration = executor.submit(sobol.update_interactions, x, y, surrogate, surrogate_likelihood)
                                 
                                     except Exception as e:
                                         space_reconfiguration = None
@@ -1620,7 +1726,7 @@ def main(argv=None):
 
 if __name__ == '__main__':
         
-    #neurostim_bo('5d_rat', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
+    neurostim_bo('5d_rat', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
     #main()
 
-    sobol_interactions('5d_rat', surrogate='pce')
+    #sobol_interactions('5d_rat', surrogate='pce')

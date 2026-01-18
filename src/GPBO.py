@@ -88,7 +88,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=20, kappa=1.0
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
     model = model_cls(train_x, train_y, likelihood).to(device)
     model.sobol = sobol
-    interactions = None
+    interactions = np.zeros(f_obj.d, dtype=float)
     # main optimization loop
     for i in range(n_iter - n_init):
 
@@ -393,7 +393,8 @@ def run_single_optm(model_label, model_cls, kappa, rep, device,
             'regrets': res['regrets'],
             'exploration': res['exploration'],
             'exploitation': res['exploitation'],
-            'r2': res['r2']
+            'r2': res['r2'],
+            'sobol_interactions': None if model_label not in ['SobolGP', 'MHGP'] else res['sobol_interactions']
         })
     except Exception as e:
         print(f"FAILED: {model_label} rep {rep} on {device}: {e}")
@@ -565,15 +566,13 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
 
     for model_cls, color, label, kappa in model_specs:
         data_list = raw_results[label]
-        if not data_list:
-            print(f"Warning: No results for {label}")
-            continue
             
         # Stack results
         all_regrets = np.array([d['regrets'] for d in data_list])
         all_explore = np.array([d['exploration'] for d in data_list])
         all_exploit = np.array([d['exploitation'] for d in data_list])
         all_r2 = np.array([d['r2'] for d in data_list])
+        all_surrogate_sobols = np.array([d['sobol_interactions'] for d in data_list]) if label == 'SobolGP' else None
 
         # Averages
         mean_explore = np.mean(all_explore, axis=0)
@@ -588,6 +587,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
             'R2': mean_r2,
             'color': color,
             'kappa': kappa,
+            'surrogate_sobols': all_surrogate_sobols
         }
 
         # Confidence Interval
@@ -641,11 +641,10 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
     print(f"Saved performance plot to {perf_path}")
 
     # ----------------------
-    # Figure 2: Regrets (log scale) with CI shading
+    # Figure 2: Regrets (log scale) 
     # ----------------------
     fig2, ax2 = plt.subplots(figsize=(12, 5))
 
-    iterations = np.arange(1, n_iter)
     eps = 1e-12  # small positive to avoid log(0)
     global_min, global_max = float('inf'), 0.0
 
@@ -689,6 +688,74 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
     plt.close(fig2)
     print(f"Saved regret plot to {regrets_path}")
 
+    # ----------------------
+    # Figure 3: Sobol interaction tracers (per Dimension)
+    # ----------------------
+
+    # --- 1) Get True Sobol Interactions (Variable-wise) ---
+    sobols = sobol_sensitivity(f_obj, n_samples=20000) 
+    sobols = np.nan_to_num(np.asarray(sobols['ST'] - sobols['S1'], dtype=float)).flatten()
+    d = f_obj.d
+    plt.figure(figsize=(9, 5))
+    color = 'green'
+
+    nrows = d
+    fig2, axes = plt.subplots(nrows, 1, figsize=(8, 3*nrows + 1), squeeze=False)
+    axes_flat = axes.flatten()
+    
+    labels = ['True Interaction', 'Additivity Threshold', 'Predicted Interaction']
+    x_full = np.arange(1, n_iter + 1)
+    threshold = 0.10
+
+    for i in range(d):
+        ax = axes_flat[i]
+
+        # Plot true as horizontal black line
+        true_val = float(sobols[i])
+        true_label = ax.plot(x_full, [true_val]*x_full.shape[0], color='black', linestyle='--', linewidth=1.2)
+        threshold_label = ax.plot(x_full, [threshold]*x_full.shape[0], color='red', linestyle='--', linewidth=1.2)
+
+        # Estimated sobol interaction curve
+        surrogate_mean = []
+        for surrogate_sobol_trace in metrics['SobolGP']['surrogate_sobols']:
+            
+            trace_per_dim = [0.0] * f_obj.d*3 # Init assumption
+            
+            for t_step in range(len(surrogate_sobol_trace)):
+
+                if surrogate_sobol_trace[t_step] is None:
+                    trace_per_dim.append(float(0.0))
+                    
+                else:
+                    val_vector = np.asarray(surrogate_sobol_trace[t_step]).flatten()
+                    trace_per_dim.append(float(val_vector[i]))
+            
+            trace_per_dim = np.asarray(trace_per_dim, dtype=float)
+            surrogate_mean.append(trace_per_dim)
+            ax.plot(x_full, trace_per_dim[:len(x_full)], color=color, linestyle='-', alpha=0.1)
+
+        surrogate_mean = np.asarray(surrogate_mean)
+        surrogate_mean = np.mean(surrogate_mean, axis=0)
+        prediction_label = ax.plot(x_full, surrogate_mean[:len(x_full)], color=color, linestyle='-')
+
+        ax.set_ylim(-0.05, 1.1)
+        ax.set_xlim(1, n_iter)
+        ax.set_title(f'Dimension {i+1}')
+        ax.grid(True, linestyle='--', linewidth=0.4)
+
+    # Title and Saving
+    raw_title = f'Sobol Indices Traces for {f_obj.d}d-{f_obj.name} | SobolGP (kappa={kappa})'
+    wrapped_title = textwrap.fill(raw_title, width=80)
+
+    fig2.suptitle(wrapped_title, fontsize=14)
+    fig2.legend(handles=[true_label[0], threshold_label[0], prediction_label[0]], labels=labels, loc="upper right", bbox_to_anchor=(0.98, 0.98))
+    plt.tight_layout()
+
+    sobol_fname = f'partitions_{f_obj.d}d-{f_obj.name}_kappa{kappa}.svg'
+    outpath = os.path.join(output_dir, sobol_fname)
+    fig2.savefig(outpath)
+    plt.close(fig2)
+
     # Return numeric results and paths
     return {
         'metrics': metrics,
@@ -697,7 +764,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
         'regrets_path': regrets_path
     }
 
-def partition_reconstruction(f_obj, n_iter=200, n_reps=10, n_sobol=10, kappa=1.0, threshold=0.08, save=False, verbose=False):
+def partition_reconstruction(f_obj, n_iter=200, n_reps=10, n_sobol=10, kappa=1.0, threshold=0.05, save=False, verbose=False, device='cpu'):
     """
     Compute and plot how well partition_updates reconstruct the true Sobol interaction structure.
     
@@ -712,7 +779,7 @@ def partition_reconstruction(f_obj, n_iter=200, n_reps=10, n_sobol=10, kappa=1.0
     
     # --- 1) Get True Sobol Interactions (Variable-wise) ---
     sobols = sobol_sensitivity(f_obj, n_samples=10000) 
-    sobols = np.nan_to_num(np.asarray(sobols['ST'] - sobols['S1'], dtype=float)).flatten() # Ensure shape (d,)
+    sobols = np.nan_to_num(np.asarray(sobols['ST'] - sobols['S1'], dtype=float)).flatten()
     d = f_obj.d
     surrogate_sobols = []
     plt.figure(figsize=(9, 5))
@@ -720,13 +787,14 @@ def partition_reconstruction(f_obj, n_iter=200, n_reps=10, n_sobol=10, kappa=1.0
 
     for rep in range(n_reps):
         # Removed model_cls arg
-        results = run_partitionbo(f_obj,
+        results = run_partitionbo(f_obj.to(device),
                             model_cls=SobolGP, # or pass the actual class if strictly needed by internal logic
                             n_iter=n_iter,
                             n_sobol=n_sobol,
                             kappa=kappa,
                             save=False,
-                            verbose=verbose)
+                            verbose=verbose,
+                            device=device)
         
         surrogate_sobols.append(results['sobol_interactions'])
 
@@ -763,11 +831,11 @@ def partition_reconstruction(f_obj, n_iter=200, n_reps=10, n_sobol=10, kappa=1.0
             
             trace_per_dim = np.asarray(trace_per_dim, dtype=float)
             surrogate_mean.append(trace_per_dim)
-            ax.plot(x_full, trace_per_dim, color=color, linestyle='-', alpha=0.1)
+            ax.plot(x_full, trace_per_dim[:len(x_full)], color=color, linestyle='-', alpha=0.1)
 
         surrogate_mean = np.asarray(surrogate_mean)
         surrogate_mean = np.mean(surrogate_mean, axis=0)
-        prediction_label = ax.plot(x_full, surrogate_mean, color=color, linestyle='-')
+        prediction_label = ax.plot(x_full, surrogate_mean[:len(x_full)], color=color, linestyle='-')
 
         ax.set_ylim(-0.05, 1.1)
         ax.set_xlim(1, n_iter)
@@ -926,7 +994,7 @@ def main(argv=None):
             kappas = args.kappas
             result = optimization_metrics(f_obj, kappas, n_iter=args.n_iter, n_reps=args.n_reps, devices=device_list)
         elif args.method == 'partition_reconstruction':
-            result = partition_reconstruction(f_obj, model_cls, n_iter=args.n_iter, n_reps= args.n_reps, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose)
+            result = partition_reconstruction(f_obj, SobolGP, n_iter=args.n_iter, n_reps= args.n_reps, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose, device=args.device)
         else:
             raise ValueError('Unsupported method')
 
@@ -941,4 +1009,3 @@ def main(argv=None):
 if __name__ == '__main__':
 
     main()
-

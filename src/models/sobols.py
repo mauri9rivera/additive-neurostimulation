@@ -75,7 +75,7 @@ class Sobol:
         M: number of monte-carlo samples for sobol metamodel
         method: string representing the Sobol global sensitivity analysis method to use.
         """
-        self.epsilon = np.clip(0.08*(0.998**t), 0.05, 0.08)
+        self.epsilon = 0.10 #np.clip(0.05*(0.998**t), 0.03, 0.08)
         self.B = B
         self.M = M
         self.problem = self._build_problem(f_obj)
