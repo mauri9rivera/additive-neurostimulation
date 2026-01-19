@@ -299,9 +299,9 @@ class Sobol:
             S1 = result.first_order     # (d,)
             ST = result.total_order     # (d,)
 
-            S1_boot[b] = S1
-            ST_boot[b] = ST
-            high_boot[b] = np.clip(ST - S1, 0.0, 1.0)     # higher-order index
+            S1_boot[b] = np.clip(S1, 0.0, 1.0)
+            ST_boot[b] = np.clip(ST, 0.0, 1.0)
+            high_boot[b] = 1 - (S1 / (ST + 1e-9)) #np.clip(ST - S1, 0.0, 1.0)     # higher-order index
 
 
         # ---- Aggregation over bootstrap ----
