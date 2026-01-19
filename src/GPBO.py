@@ -779,7 +779,7 @@ def partition_reconstruction(f_obj, n_iter=200, n_reps=10, n_sobol=10, kappa=1.0
     
     # --- 1) Get True Sobol Interactions (Variable-wise) ---
     sobols = sobol_sensitivity(f_obj, n_samples=10000) 
-    sobols = np.nan_to_num(np.asarray( 1 - (np.clip(sobols['ST'], 0.0, 1.0) - np.clip(sobols['S1'], 0.0, 1.0)), dtype=float)).flatten()
+    sobols = np.nan_to_num(np.asarray( 1 - (np.clip(sobols['S1'], 0.0, 1.0) / np.clip(sobols['ST'], 0.0, 1.0)), dtype=float)).flatten()
     d = f_obj.d
     surrogate_sobols = []
     plt.figure(figsize=(9, 5))
