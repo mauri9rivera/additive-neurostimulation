@@ -40,7 +40,7 @@ warnings.filterwarnings(
 
 ### Runners ###
 
-def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=20, kappa=1.0, save=False, verbose=False,  device='cpu'):
+def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0, save=False, verbose=False,  device='cpu'):
     """
     Returns the same metrics as run_bo, plus:
       - partition_updates: list of partition structures (list of lists) when updates occurred
@@ -66,7 +66,10 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=20, kappa=1.0
     n_init = np.clip(f_obj.d*3, 1, 20)
     sobol = Sobol(f_obj, n_init).to(device)
     true_best = grid_y.max().item() #f_obj.f.optimal_value
-    train_x_cpu = torch.from_numpy(sobol_sampler.sample(sobol.problem, n_init, calc_second_order=False)).float()
+    sampler = qmc.LatinHypercube(d=f_obj.d)
+    sample = sampler.random(n=n_init)
+    sample_scaled = qmc.scale(sample, lower.cpu(), upper.cpu())
+    train_x_cpu = torch.from_numpy(sample_scaled).float()
     train_x = train_x_cpu.to(device)
     train_y = f_obj.f.forward(train_x)
     best_observed = train_y.max().item()
@@ -163,7 +166,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=20, kappa=1.0
         
 
         # Submit a new Sobol background job every n_sobol iterations (if none pending)
-        if (i % n_sobol) == 0:
+        if  i > n_sobol: #(i % n_sobol) == 0:
             if space_reconfiguration is None or space_reconfiguration.done():
                 try:
                     surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
@@ -228,9 +231,11 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
     
     # Initiate training set
     n_init = np.clip(f_obj.d*3, 1, 20)
-    sobol = Sobol(f_obj, n_init)
     true_best = grid_y.max().item() #f_obj.f.optimal_value  
-    train_x_cpu = torch.from_numpy(sobol_sampler.sample(sobol.problem, n_init, calc_second_order=False)).float()
+    sampler = qmc.LatinHypercube(d=f_obj.d)
+    sample = sampler.random(n=n_init)
+    sample_scaled = qmc.scale(sample, lower.cpu(), upper.cpu())
+    train_x_cpu = torch.from_numpy(sample_scaled).float()
     train_x = train_x_cpu.to(device)
     train_y = f_obj.f.forward(train_x)
     best_observed = train_y.max().item()
@@ -694,7 +699,9 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
 
     # --- 1) Get True Sobol Interactions (Variable-wise) ---
     sobols = sobol_sensitivity(f_obj, n_samples=20000) 
-    sobols = np.nan_to_num(np.asarray(sobols['ST'] - sobols['S1'], dtype=float)).flatten()
+    norm_factor = np.sum(sobols['ST'])
+    sobols = np.asarray(1 - (np.clip(sobols['S1'], 0.0, 1.0) / np.clip(sobols['ST'], 0.0, 1.0)) )
+    #sobols = np.nan_to_num(np.asarray( 1 - (np.clip(sobols['S1'], 0.0, 1.0) / np.clip(sobols['ST'], 0.0, 1.0)), dtype=float)).flatten()
     d = f_obj.d
     plt.figure(figsize=(9, 5))
     color = 'green'
@@ -705,7 +712,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
     
     labels = ['True Interaction', 'Additivity Threshold', 'Predicted Interaction']
     x_full = np.arange(1, n_iter + 1)
-    threshold = 0.10
+    threshold = 0.05
 
     for i in range(d):
         ax = axes_flat[i]
@@ -719,7 +726,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
         surrogate_mean = []
         for surrogate_sobol_trace in metrics['SobolGP']['surrogate_sobols']:
             
-            trace_per_dim = [0.0] * f_obj.d*3 # Init assumption
+            trace_per_dim = [1.0] * f_obj.d*3 # Init assumption
             
             for t_step in range(len(surrogate_sobol_trace)):
 
@@ -1008,4 +1015,10 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    main()
+
+    #main()
+    f_ishigami = SyntheticTestFun('ishigami', 3, False, False)
+    f_hartmann = SyntheticTestFun('hartmann', 6, False, False)
+    #run_partitionbo(f_ishigami, SobolGP, 100, 10, 1.0, 'cuda:1')
+    optimization_metrics(f_hartmann, [9.0, 9.0, 7.0], 150, 8, devices=['cpu', 'cuda:0', 'cuda:1'])
+    

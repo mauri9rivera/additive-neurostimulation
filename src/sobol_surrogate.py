@@ -198,6 +198,7 @@ def run_test_surrogate(f_ob, M, B, n_iter, method, NZ=None):
         method=method,
     )
 
+
 if __name__ == "__main__":
 
     f_ob = SyntheticTestFun('ishigami', 3, False, False)
@@ -215,8 +216,12 @@ if __name__ == "__main__":
 
 
     #test_surrogate(f_ob, 4096, 1024, 100, 'sampler', 'scipy')
-    test_surrogate(f_ob, 4096, 1024, 100, 'gp', 'scipy')
-    test_surrogate(f_ob, 4096, 1024, 100, 'sampler', 'scipy')
+    test_surrogate(f_ob, 4096, 1024, 30, 'gp', 'scipy')
+    test_surrogate(f_ob, 4096, 1024, 30, 'gp', 'scipy')
+    test_surrogate(f_ob, 4096, 1024, 30, 'gp', 'scipy')
+    test_surrogate(f_ob, 4096, 1024, 30, 'gp', 'scipy')
+    test_surrogate(f_ob, 4096, 1024, 30, 'gp', 'scipy')
+    #test_surrogate(f_ob, 4096, 1024, 100, 'sampler', 'scipy')
     #test_surrogate(f_ob, 2048, 8, 100, 'deriv')
     #test_surrogate(f_ob, 4096, 256, 60, 'asm')
 

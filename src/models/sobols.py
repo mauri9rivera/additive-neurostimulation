@@ -67,7 +67,7 @@ class Sobol:
       update_partition(interactions) -> partition (list of list of dims)
     """
 
-    def __init__(self, f_obj, t, method='scipy', M=2048, B=128):
+    def __init__(self, f_obj, t, method='scipy', M=2048, B=4):
         """
         f_obj: SyntheticTestFun object for the test function to optimize
         epsilon: threshold for high-order sobol interactions
@@ -75,7 +75,7 @@ class Sobol:
         M: number of monte-carlo samples for sobol metamodel
         method: string representing the Sobol global sensitivity analysis method to use.
         """
-        self.epsilon = 0.10 #np.clip(0.05*(0.998**t), 0.03, 0.08)
+        self.epsilon = 0.25 #0.20 #np.clip(0.05*(0.998**t), 0.03, 0.08)
         self.B = B
         self.M = M
         self.problem = self._build_problem(f_obj)
@@ -271,38 +271,37 @@ class Sobol:
         ]
 
         metamodel.eval(); metamodel.likelihood.eval()
-        # Define Wrapper Function
+       
         def gp_mean_wrapper(x_np):
             
-            x_tens = torch.tensor(np.transpose(x_np), device=device, dtype=dtype) # Convert Scipy's numpy input to Torch tensor
+            x_tens = torch.tensor(np.transpose(x_np), device=device, dtype=dtype) 
             with torch.no_grad():
                 output = metamodel.likelihood(metamodel(x_tens))
                 mean_pred = output.mean
-            return mean_pred.cpu().numpy().reshape(-1) # Return numpy array to Scipy
+            return mean_pred.cpu().numpy().reshape(-1)
 
 
         # ---- Bootstrap storage ----
         S1_boot = np.zeros((self.B, d))
-        ST_boot = np.zeros((self.B, d))
+        ST_boot_norm = np.zeros((self.B, d))
         high_boot = np.zeros((self.B, d))
-
 
         for b in range(self.B):
 
             result = scipy_sobol(
             func=gp_mean_wrapper, 
-            n=self.B, 
+            n=self.M, 
             dists=dists, 
             )
 
             # Extract components
-            S1 = result.first_order     # (d,)
-            ST = result.total_order     # (d,)
+            S1 = np.clip(result.first_order, 0, 1)
+            ST = np.clip(result.total_order, 0, np.inf)
 
-            S1_boot[b] = np.clip(S1, 0.0, 1.0)
-            ST_boot[b] = np.clip(ST, 0.0, 1.0)
-            high_boot[b] = 1 - (S1 / (ST + 1e-9)) #np.clip(ST - S1, 0.0, 1.0)     # higher-order index
-
+            norm_factor = np.sum(ST)
+            S1_boot[b] = S1 #/ norm_factor
+            ST_boot_norm[b] = ST / norm_factor
+            high_boot[b] = 1 - (S1_boot[b] / ST_boot_norm[b]) #ST_boot_norm[b] - S1_boot[b]     # higher-order index
 
         # ---- Aggregation over bootstrap ----
         high_mean = high_boot.mean(axis=0)
