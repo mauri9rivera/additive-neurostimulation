@@ -1,27 +1,17 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, LogFormatterMathtext
-import textwrap
 import sys
 import os
 import torch
 import gpytorch
-import datetime
-import random
-import copy
 import argparse
-import ast
 import time
-from gpytorch.models.exact_gp import GPInputWarning
 import scipy.io
 import pickle
 import math
 
-from botorch.acquisition import UpperConfidenceBound
-from botorch.optim import optimize_acqf
-
 from SALib.analyze import sobol as salib_sobol
-from SALib.sample import saltelli
 from SALib.sample import sobol as sobol_sampler
 
 from concurrent.futures import ThreadPoolExecutor
@@ -32,1213 +22,13 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import Ridge
-from sklearn.model_selection import train_test_split
-
 
 ### MODULES HANDLING ###
-# If the package structure differs you may need to adjust PYTHONPATH or the imports below
-#from models.gaussians import AdditiveKernelGP, BaseGP, WrappedModel, ExactGPModel
+from utils.neurostim_datasets import *
+from models.gaussians import NeuralSobolGP, NeuralAdditiveGP, NeuralExactGP, optimize, maximize_acq
+from models.sobols import NeuralSobol
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="SALib.util")
-
-# CUDA device?
-DEVICE = torch.device('cpu') # torch.device("cuda:1" if torch.cuda.is_available() else "cpu") #?#
-
-
-### --- neural GP classes --- ###
-
-class Sobol:
-    """
-    Uses SALib to compute variance-based Sobol indices (including second-order),
-    and produce a partition based on thresholds of interaction strength.
-
-    Attributes:
-      epsilon : float threshold on |S2_ij| above which we consider (i,j) interacting
-      problem : dict for SALib problem definition (names, bounds, etc.)
-        Initialized when first compute_interactions is called.
-
-    Methods:
-      compute_interactions(train_x, train_y) -> interactions matrix (d x d numpy)
-      update_partition(interactions) -> partition (list of list of dims)
-    """
-
-    def __init__(self, dataset_type, epsilon=5e-2, n_sobol_samples=None):
-        """
-        epsilon: threshold for second-order interactions
-        n_sobol_samples: number of base samples N used by SALib's Saltelli sampler.
-            If None, some default (e.g. 1024) will be chosen.
-        """
-        self.n_sobol_samples = n_sobol_samples
-        self.problem = self._build_problem(dataset_type)  # to be set up when know input bounds and d
-        self.interactions = None
-
-    def _build_problem(self, dataset_type): 
-        """
-        Build SALib 'problem' dict from data array x_np shape (n, d).
-        Uses per-dimension observed min/max as bounds (assumes uniform marginals).
-        """
-        if dataset_type == '5d_rat':
-            d = 5
-            bounds =  [[100, 400], [100, 400], [20, 200], [0, 7], [0, 3] ]
-        elif dataset_type in ['spinal', 'rat']:
-            bounds = [[0, 7], [0, 7]]
-            d = 2
-        elif dataset_type == 'nhp':
-            d = 2
-            bounds = [[0, 9], [0, 9]]
-        else:
-            d = 2
-        problem = {
-            'num_vars': int(d),
-            'names': np.array([f"x{i}" for i in range(d)]),
-            'bounds': np.asarray(bounds)
-        }
-
-        self.epsilon = 0.05 #- 0.02 * min(1.0, (d**2 / 40.0))
-
-        return problem
-
-    def bell_number(self, n):
-        bell = [[0]*(n+1) for _ in range(n+1)]
-        bell[0][0] = 1
-        for i in range(1, n+1):
-            bell[i][0] = bell[i-1][i-1]
-            for j in range(1, i+1):
-                bell[i][j] = bell[i-1][j-1] + bell[i][j-1]
-        return bell[n][0]
-
-    def update_interactions(self, train_x, train_y, simulator, likelihood):
-        """
-        train_x: Tensor (n, d) or array
-        train_y: Tensor or array (n,) or (n,1)
-        simulator: a trained ExactGP model
-        likelihood: corresponding GPyTorch likelihood
-
-        Returns:
-          interactions: numpy array (d, d), symmetric, with entries S2[i,j]
-        """
-
-        
-        # Retrain the surrogate model
-        simulator, likelihood, _ = optimize(simulator, train_x, train_y,)
-
-        n, d = train_x.shape
-        
-        # Determine number of Monte Carlo samples
-        N = self.n_sobol_samples or (n // (2 * (d + 2)))
-        N = max(N, 2048)
-        
-        # Generate Saltelli samples
-        param_values = sobol_sampler.sample(self.problem, N, calc_second_order=True, skip_values=N*2)
-        param_values = np.asarray(param_values, dtype=np.float32)
-        
-        M = param_values.shape[0] // (2 * d + 2)  # Actual number of MC samples per matrix
-        
-        # Split Saltelli samples into matrices A, B, and hybrid matrices
-        # Saltelli sequence: [A, B, AB_1, AB_2, ..., AB_d, BA_1, BA_2, ..., BA_d]
-        A = param_values[:M]  # First M samples
-        B = param_values[M:2*M]  # Next M samples
-        
-        # Extract hybrid matrices A_B_i and B_A_i
-        A_B = {}  # A with i-th column from B
-        B_A = {}  # B with i-th column from A
-        
-        for i in range(d):
-            start_idx = 2*M + i*M
-            A_B[i] = param_values[start_idx:start_idx + M]
-            
-            start_idx = 2*M + d*M + i*M  
-            B_A[i] = param_values[start_idx:start_idx + M]
-        
-        # Convert to torch tensors
-        device = train_x.device
-        dtype = train_x.dtype
-        
-        A_tensor = torch.tensor(A, device=device, dtype=dtype)
-        B_tensor = torch.tensor(B, device=device, dtype=dtype)
-        
-        # Evaluate GP at all points
-        simulator.eval()
-        likelihood.eval()
-        
-        with torch.no_grad():
-            # Evaluate at A and B
-            pred_A = likelihood(simulator(A_tensor)).mean.cpu().numpy().flatten()
-            pred_B = likelihood(simulator(B_tensor)).mean.cpu().numpy().flatten()
-            
-            # Evaluate at hybrid matrices
-            pred_A_B = {}
-            pred_B_A = {}
-            
-            for i in range(d):
-                A_B_tensor = torch.tensor(A_B[i], device=device, dtype=dtype)
-                B_A_tensor = torch.tensor(B_A[i], device=device, dtype=dtype)
-                
-                pred_A_B[i] = likelihood(simulator(A_B_tensor)).mean.cpu().numpy().flatten()
-                pred_B_A[i] = likelihood(simulator(B_A_tensor)).mean.cpu().numpy().flatten()
-        
-        # Calculate variance term V[fGP_N([A B])]
-        all_preds = np.concatenate([pred_A, pred_B])
-        V = np.var(all_preds)
-        
-        # Calculate first order indices S_i (needed for second order)
-        S_i = np.zeros(d)
-        for i in range(d):
-            numerator = np.mean(pred_B * (pred_A_B[i] - pred_A))
-            S_i[i] = numerator / V
-        
-        # Calculate second order indices S_ij using Equation (20) from the paper
-        interactions = np.zeros((d, d))
-        
-        for i in range(d):
-            for j in range(d):
-                if i != j:  # Second order indices are for i ≠ j
-                    # Equation (20): S_ij = [1/M * sum(fGP(B_A_i) * fGP(A_B_j) - fGP(A) * fGP(B))] / V - S_i - S_j
-                    term1 = np.mean(pred_B_A[i] * pred_A_B[j] - pred_A * pred_B)
-                    S_ij = (term1 / V) - S_i[i] - S_i[j]
-                    interactions[i, j] = max(S_ij, 0)  # Sobol indices should be non-negative
-                else:
-                    # Diagonal elements are not second-order indices (set to 0)
-                    interactions[i, j] = 1.0
-        
-        # Make symmetric (S_ij = S_ji in Sobol decomposition)
-        for i in range(d):
-            for j in range(i+1, d):
-                avg = (interactions[i, j] + interactions[j, i]) / 2
-                interactions[i, j] = avg
-                interactions[j, i] = avg
-        
-        return interactions
-
-    def update_partition(self, interactions):
-        """
-        Partition dimensions using a greedy algorithm based on 2nd-order interactions.
-
-        Inputs:
-        - interactions: numpy array (d, d) symmetric matrix with 2nd-order Sobol indices.
-                        Only the upper diagonal is needed but full symmetric is expected.
-        Output:
-        - partitions: list of lists, each sublist contains indices belonging to a partition.
-        """
-        d = self.problem['num_vars']
-
-        # initialize stack of dimensions
-        S = list(range(d))
-
-        # P will hold the partitions
-        P = []
-        # seed P with first element
-        P.append([S.pop()])
-
-        while S:
-            e = S.pop()
-            additive = True
-            modif = False
-
-            for sub in P:
-                if modif:
-                    break
-                for x in sub:
-                    if modif:
-                        break
-                    if interactions[e, x] > self.epsilon:
-                        additive = False
-                        sub.append(e)
-                        modif = True
-
-            if additive:
-                P.append([e])
-
-        return P
-
-class AdditiveGP(gpytorch.models.ExactGP):
-    def __init__(self, train_x, train_y, likelihood, lengthscale_prior, outputscale_prior):
-        super().__init__(train_x, train_y, likelihood)
-        self.n_dims = train_x.shape[-1]
-
-        kernel = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.MaternKernel(
-                nu=2.5, ard_num_dims = self.n_dims, batch_shape=torch.Size([self.n_dims]),
-                lengthscale_prior = lengthscale_prior  
-            ),
-            outputscale_prior=outputscale_prior
-        )
-        kernel.base_kernel.lengthscale = [1.0] * self.n_dims
-        kernel.outputscale = [1.0]
-        self.covar_module = kernel       
-
-        self.mean_module = gpytorch.means.ZeroMean()
-        self.name = 'AdditiveGP'
-
-    def forward(self, X):
-        mean = self.mean_module(X)
-        batched_dimensions_of_X = X.mT.unsqueeze(-1)  # Now a d x n x 1 tensor
-        covar = self.covar_module(batched_dimensions_of_X).sum(dim=-3)
-        return gpytorch.distributions.MultivariateNormal(mean, covar) 
-
-class ExactGP(gpytorch.models.ExactGP):
-    def __init__(self, train_x, train_y, likelihood, lengthscale_prior, outputscale_prior):
-        super(ExactGP, self).__init__(train_x, train_y, likelihood)
-        self.mean_module = gpytorch.means.ZeroMean()
-        self.n_dims = train_x.shape[-1]
-        kernel = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.MaternKernel(
-                nu=2.5, ard_num_dims = self.n_dims,
-                lengthscale_prior = lengthscale_prior  
-            ),
-            outputscale_prior=outputscale_prior
-        )
-        kernel.base_kernel.lengthscale = [1.0] * self.n_dims
-        kernel.outputscale = [1.0]
-        self.covar_module = kernel
-        self.name = 'ExactGP'
-
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
-class neuralMHGP(gpytorch.models.ExactGP):
-
-    def __init__(self, train_x, train_y, likelihood, lengthscale_prior, outputscale_prior, 
-                 partition = None, sobol=None, history = None, epsilon=5e-2):
-
-        super().__init__(train_x, train_y, likelihood)
-        self.n_dims = train_x.shape[-1]
-        self.mean_module = gpytorch.means.ZeroMean() 
-        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
-        self.history = history if history else [self.partition_to_key(self.partition)] 
-        self.sobol = sobol
-        self.name = 'neuralMHGP'
-        self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
-        self.split_bias = 0.7
-        self.max_attempts = self.bell_number(self.n_dims)
-
-        #build covar_module based on partition
-        self.lengthscale_prior = lengthscale_prior
-        self.outputscale_prior = outputscale_prior
-        self._build_covar()
-
-    def _build_covar(self):
-
-
-        kernels = []
-        for group in self.partition:
-
-            ard_dims = len(group)
-
-            base_kernel = gpytorch.kernels.MaternKernel(
-                nu = 2.5,
-                batch_shape=torch.Size([self.n_dims]),
-                ard_num_dims = ard_dims,
-                active_dims = group,
-                lengthscale_prior = self.lengthscale_prior
-            )
-
-            base_kernel.lengthscale = torch.ones(ard_dims)
-            scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel, outputscale_prior=self.outputscale_prior)
-            scaled_kernel.outputscale = torch.tensor(1.0)
-            kernels.append(scaled_kernel)
-
-        self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)
-
-    def partition_to_key(self, partition):
-        return tuple(sorted(tuple(sorted(sub)) for sub in partition))
-
-    def check_history(self, new_partition):
-        """
-        Return True if the canonical key for new_partition is already in history.
-        """
-        key = self.partition_to_key(new_partition)
-        return key in self.history
-
-    def bell_number(self, n):
-        bell = [[0]*(n+1) for _ in range(n+1)]
-        bell[0][0] = 1
-        for i in range(1, n+1):
-            bell[i][0] = bell[i-1][i-1]
-            for j in range(1, i+1):
-                bell[i][j] = bell[i-1][j-1] + bell[i][j-1]
-        return bell[n][0]
-
-    def update_partition(self, new_partition):
-
-        # normalize indices to ints
-        new_partition = self.partition_to_key(new_partition)
-        # avoid unnecessary rebuilds:
-        if new_partition == self.partition:
-            return
-        self.partition = new_partition
-        self._build_covar()
-    
-    def sobol_partitioning(self, interactions):
-        
-        old_partition = self.partition
-        has_candidate = False
-        attempts = 0
-
-        if len(self.history) == self.max_attempts:
-            return old_partition
-
-        while not has_candidate and attempts < (self.max_attempts + 5):
-
-            new_partition = copy.deepcopy(self.partition)
-            
-            # Split strategy
-            if random.random() < self.split_bias:
-
-                robbed_idx = random.randint(0, len(new_partition) - 1)
-                robbed_subset = new_partition[robbed_idx]
-
-                if len(robbed_subset) > 1:
-
-                    victim = np.random.choice(robbed_subset) #, random.randint(1, len(splitted_subset) - 1))
-                    robbed_subset.remove(victim)
-                    new_partition[robbed_idx] = robbed_subset
-                    new_partition.append([victim.astype(int)]) 
-                
-                    if (not self.check_history(new_partition)) and self.are_additive(victim, robbed_subset, interactions):
-
-                        has_candidate = True
-                        return new_partition
-
-            # Merge strategy
-            else:
-                
-                if len(new_partition) > 1:
-
-                    robber_idx, robbed_idx = random.sample(range(len(new_partition)), 2)
-
-                    robbed_subset = new_partition[robbed_idx]
-                    robber_subset = new_partition[robber_idx]
-
-                    new_partition.remove(robbed_subset)
-                    new_partition.remove(robber_subset)
-                    new_partition.append(robbed_subset + robber_subset)
-
-                    all_additive = True
-                    for victim in robbed_subset:
-                            additive = self.are_additive(victim, robber_subset, interactions)
-                            if not additive:
-                                all_additive = False
-                                break
-                    
-                    has_candidate = all_additive
-                    if has_candidate and (not self.check_history(new_partition)):
-                        return new_partition
-                    
-            attempts +=1
-
-        #print(f'Number of attempts exceedded')
-        return old_partition
-
-    def are_additive(self, individual, set, interactions):
-
-        for evaluator in set:
-
-            i = min(evaluator, individual)
-            j = max(evaluator, individual)
-
-            if interactions[j][i] > self.epsilon:
-                return False
-        
-        return True
-      
-    def calculate_acceptance(self, proposed_model):
-
-        self.eval()
-        self.likelihood.eval()
-        proposed_model.eval()
-        proposed_model.likelihood.eval()
-
-        mll_curr = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
-        mll_proposed = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, proposed_model)
-        train_inputs = tuple(t.to(DEVICE) for t in self.train_inputs)
-
-        curr_evidence = -mll_curr(self(*train_inputs), self.train_targets)
-        proposed_evidence = -mll_proposed(proposed_model(proposed_model.train_inputs[0]), proposed_model.train_targets)
-
-        acceptance = min(1.0, proposed_evidence / (curr_evidence + 1e-9))
-
-        return acceptance
-        
-    def metropolis_hastings(self, interactions, device=DEVICE):
-
-        # update sobol interactions from surrogate model training
-        new_partition = self.sobol_partitioning(interactions)
-        if new_partition == self.partition:
-            return self.partition
-        proposed_model = neuralMHGP(self.train_inputs[0], self.train_targets, gpytorch.likelihoods.GaussianLikelihood(), 
-                              partition=new_partition)
-        proposed_model.to(device)
-        proposed_model.likelihood.to(device)
-        proposed_model, proposed_model.likelihood, _ = optimize(proposed_model, proposed_model.train_inputs[0], proposed_model.train_targets, n_iter=20, lr=0.01)
-        
-        acceptance_ratio = self.calculate_acceptance(proposed_model)
-
-        if acceptance_ratio >= 1.0:
-            #print(f'Update for model accepted! Genetics propose to partition {new_partition} from {self.partition} with acceptance {acceptance_ratio}')
-            self.history.append(self.partition_to_key(new_partition))
-            return new_partition
-
-        else: 
-            return self.partition 
-        
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
-class neuralSobolGP(gpytorch.models.ExactGP):
-
-    """
-    Exact GP that composes an additive kernel according to `partition`.
-    - partition: list of lists of integer dimension indices, e.g. [[0,2],[1,3]]
-    - sobol: an associated Sobol object (optional)
-    - epsilon: additivity threshold (kept as attribute)
-    """
-    def __init__(self, train_x, train_y, likelihood, lengthscale_prior, outputscale_prior, 
-                 partition=None, history = None, sobol=None, epsilon=5e-2):
-        super(neuralSobolGP, self).__init__(train_x, train_y, likelihood)
-        self.n_dims = train_x.shape[-1]
-        self.mean_module = gpytorch.means.ZeroMean()
-        self.partition = partition if partition is not None else [[i for i in range(train_x.shape[-1])]]
-        self.history = history if history else None
-        self.sobol = sobol
-        self.epsilon = 0.05 #- 0.02 * min(1.0, (self.n_dims**2 / 40.0))
-        self.name = 'neuralSobolGP'
-        # build covar_module based on partition
-        self.lengthscale_prior = lengthscale_prior
-        self.outputscale_prior = outputscale_prior
-        self._build_covar()
-
-    def _build_covar(self):
-
-        kernels = []
-        for group in self.partition:
-
-            ard_dims = len(group)
-
-            base_kernel = gpytorch.kernels.MaternKernel(
-                nu = 2.5,
-                #?# batch_shape=torch.Size([self.n_dims]),
-                ard_num_dims = ard_dims,
-                active_dims = group,
-                lengthscale_prior = self.lengthscale_prior
-            )
-            base_kernel.lengthscale = torch.ones(ard_dims)
-            scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel, outputscale_prior=self.outputscale_prior)
-            scaled_kernel.outputscale = torch.tensor(1.0)
-
-            kernels.append(scaled_kernel)
-
-        self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)
-
-    def update_partition(self, new_partition):
-
-        # normalize indices to ints
-        new_partition = [list(map(int, grp)) for grp in new_partition if len(grp) > 0]
-        # avoid unnecessary rebuilds:
-        if new_partition == self.partition:
-            return
-        self.partition = new_partition
-        self._build_covar()
-
-    def reconfigure_space(self, surrogate, surrogate_likelihood):
-    
-        # update Sobol interactions based on new surrogate train data
-        interactions = self.sobol.update_interactions(surrogate.train_inputs[0], surrogate.train_targets, surrogate, surrogate_likelihood)
-        new_partition = self.sobol.update_partition(interactions)
-        self.update_partition(new_partition)
-
-        return interactions, new_partition
-
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-
-### Method to speed up additiveGP cases with different partition sizes
-
-### batched full-D + per-batch lengthscale masking
-def method_C(X, groups, D):
-    G = len(groups)
-    base = gpytorch.kernels.MaternKernel(nu=2.5, batch_shape=torch.Size([G]), ard_num_dims=D).to(DEVICE)
-    # initialize lengthscale: for dims not in group, set large value
-    ls = torch.ones(G, D, device=DEVICE) * 0.5
-    for i,g in enumerate(groups):
-        mask = torch.ones(D, device=DEVICE) * 1e6  # very large for unused dims
-        mask[g] = 1.0
-        ls[i] = mask
-    base.lengthscale = ls
-    cov = gpytorch.kernels.ScaleKernel(base).to(DEVICE)
-    cov.outputscale = torch.ones(G, device=DEVICE)
-
-    #then you'd need to modify the forward method more or less like this
-    Xbat = X.unsqueeze(0).repeat(G, 1, 1)  # (G, n, D)
-    Kbat = cov(Xbat).evaluate()  # (G, n, n)
-    Ksum = Kbat.sum(dim=0)
-    return Ksum
-
-
-### --- Data processing methods --- ###
-
-def sort_valid_5drats(resp, param, ch2xy):
-
-    resp_mu = np.mean(resp,axis=2)
-    resp_sigma = np.std(resp, axis=2)
-    #std_map = np.std(resp, axis=(0, 2)) Current method considers mean std w/in repetitions. Change this for global
-    val_pw = np.unique(param[:,0])
-    val_freq = np.unique(param[:,1])
-    val_duration = np.unique(param[:,2])
-    mean_map = np.zeros((resp.shape[1],len(val_pw),len(val_freq),len(val_duration),8,4))
-    std_map = np.zeros((resp.shape[1],len(val_pw),len(val_freq),len(val_duration),8,4))
-
-    for e in range(resp.shape[1]):
-        for i in range(len(param)):
-
-            idx_pw = np.where(np.isclose(val_pw, param[i, 0]))[0][0]
-            idx_freq = np.where(np.isclose(val_freq, param[i, 1]))[0][0]
-            idx_duration = np.where(np.isclose(val_duration, param[i, 2]))[0][0]
-
-            x_ch = int(ch2xy[i,3]) -1
-            y_ch = int(ch2xy[i,4]) -1 
-
-            mean_map[e, idx_pw, idx_freq, idx_duration, x_ch, y_ch] = resp_mu[i,e]
-            std_map[e, idx_pw, idx_freq, idx_duration, x_ch, y_ch] = resp_sigma[i,e]
-
-    n_cond, n_emgs, n_reps = resp.shape
-    valid_resp = np.zeros_like(resp, dtype=np.int64)
-    for i in range(n_cond):
-        # find indices in the map corresponding to this condition
-        idx_pw = np.where(np.isclose(val_pw, param[i, 0]))[0][0]
-        idx_freq = np.where(np.isclose(val_freq, param[i, 1]))[0][0]
-        idx_duration = np.where(np.isclose(val_duration, param[i, 2]))[0][0]
-        x_ch = int(ch2xy[i, 3]) - 1
-        y_ch = int(ch2xy[i, 4]) - 1
-
-        for j in range(n_emgs):
-
-            # extract mean/std vectors for this condition
-            mean_vec = mean_map[j, idx_pw, idx_freq, idx_duration, x_ch, y_ch] #np.mean(resp_mu, axis=0)[j]   # shape (1,)
-            std_vec = std_map[j, idx_pw, idx_freq, idx_duration, x_ch, y_ch] #std_map[j] 
-
-            deviation = resp[i, j, :] - mean_vec
-            valid_mask = np.abs(deviation) <= 3*std_vec
-
-            #print(f'mean_vec: {mean_vec} and std_vec: {std_vec}')
-            deviation = np.abs(resp[i, j, :] - mean_vec)
-            #print(f'deviation: {deviation}')
-            valid_mask = deviation <= 2*std_vec
-            if np.all(~valid_mask):
-                print(f'issue with stim {i} on emg {j}: {3*std_vec} is higher than |{deviation}| so gives invalid mask: {valid_mask}')
-                
-            valid_resp[i, j, :] = valid_mask.astype(np.int64)
-
-    return valid_resp
-
-def set_experiment(dataset_type):
-
-    options = {}
-    if dataset_type == 'nhp':
-        options['noise_min']= 0.009 #Non-zero to avoid numerical instability
-        options['kappa']=7
-        options['rho_high']=3.0
-        options['rho_low']=0.1
-        options['nrnd']=1 #has to be >= 1
-        options['noise_max']=0.011
-        options['n_subjects']=4
-        options['n_queries']=96
-        options['n_emgs'] = [6, 8, 4, 4]
-        options['n_dims'] = 2
-    elif dataset_type == 'rat':
-        options['noise_min']=0.05
-        options['kappa']=3.8
-        options['rho_high']=8
-        options['rho_low']=0.001
-        options['nrnd']=1 #has to be >= 1
-        options['noise_max']=0.055
-        options['n_subjects']=6
-        options['n_queries']=32
-        options['n_emgs'] = [6, 7, 8, 6, 5, 8]
-        options['n_dims'] = 2
-    elif dataset_type == '5d_rat':
-        options['noise_min']=0.05
-        options['kappa']=3.8
-        options['rho_high']=8
-        options['rho_low']=0.001
-        options['nrnd']=1 #has to be >= 1
-        options['noise_max']=0.055
-        options['n_subjects']=3
-        options['n_queries']= 100
-        options['n_emgs'] = [5, 4, 4]
-        options['n_dims'] = 5
-    elif dataset_type == 'spinal':
-        options['noise_min']=0.05
-        options['kappa']=3.8
-        options['rho_high']=8
-        options['rho_low']=0.001
-        options['nrnd']=1 #has to be >= 1
-        options['noise_max']=0.055
-        options['n_subjects']=11
-        options['n_queries']=64
-        options['n_emgs'] = [8, 10, 10, 10, 10, 10, 10, 8, 8, 8, 8]
-        options['n_dims'] = 2
-    
-    options['device'] = DEVICE
-    options['n_reps'] = 20
-    options['n_rnd'] = 1
-
-    return options
-
-def load_data(dataset_type, m_i):
-
-    path_to_dataset = f'./datasets/{dataset_type}'
-
-    if dataset_type == '5d_rat':
-
-        emg_map = {
-            0: np.array(['extensor carpi radialis']),
-            1: np.array(['flexor carpi ulnaris']),
-            2: np.array(['triceps']),
-            3: np.array(['biceps']),
-            4: np.array(['extensor carpi radialis']),
-            5: np.array(['flexor carpi ulnaris']),
-
-        }
-        match m_i:
-            case 0 | 1 | 2 | 3:
-
-                data = scipy.io.loadmat(f'{path_to_dataset}/rData03_230724_4x4x3x32x8_ar.mat')['Data']
-                resp =  data[0][0][0]
-                param = data[0][0][1]
-                ch2xy = param[:, [0,1,2,5,6]]
-                peak_resp = torch.from_numpy(resp).float().to(DEVICE)
-                ch2xy = torch.from_numpy(ch2xy).float().to(DEVICE)
-                
-                subjet = {
-                    'emgs': emg_map[m_i],
-                    'nChan': 32,
-                    'sorted_respMean': peak_resp,
-                    'ch2xy': ch2xy,
-                    'dim_sizes': np.array([8, 4, 3, 4, 4]),
-                    'DimSearchSpace' : np.prod([8, 4, 3, 4, 4])
-                }
-            case 4 | 5:
-                
-                data = scipy.io.loadmat(f'{path_to_dataset}/5D_step4.mat')
-                resp = data['emg_response']
-                param = data['stim_combinations']
-                ch2xy = torch.from_numpy(param[:, [0,1,2,5,6]])
-                peak_resp = torch.from_numpy(resp[:, :, :, 0]).float().to(DEVICE)
-
-
-                subjet = {
-                    'emgs': emg_map[m_i],
-                    'nChan': 32,
-                    'sorted_respMean': peak_resp,
-                    'ch2xy': ch2xy,
-                    'dim_sizes': np.array([8, 4, 4, 4, 4]),
-                    'DimSearchSpace' : np.prod([8, 4, 4, 4, 4])
-                }
-                
-        return subjet
-    elif dataset_type=='nhp': # nhp dataset has 4 subjects
-        if m_i==0:
-            Cebus1_M1_190221 = scipy.io.loadmat(path_to_dataset+'/Cebus1_M1_190221.mat')
-            Cebus1_M1_190221= {'emgs': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][0][0],
-           'nChan': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][2][0][0],
-           'sorted_isvalid': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][8],
-           'sorted_resp': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][9],
-           'sorted_respMean': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][10],
-           'ch2xy': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][16],
-           'DimSearchSpace': 96},
-            SET=Cebus1_M1_190221[0]
-        if m_i==1:
-            Cebus2_M1_200123 = scipy.io.loadmat(path_to_dataset+'/Cebus2_M1_200123.mat')  
-            Cebus2_M1_200123= {'emgs': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][0][0],
-           'nChan': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][2][0][0],
-           'sorted_isvalid': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][8],
-           'sorted_resp': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][9],
-           'sorted_respMean': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][10],
-           'ch2xy': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][16],
-           'DimSearchSpace': 96}
-            SET=Cebus2_M1_200123
-        if m_i==2:    
-            Macaque1_M1_181212 = scipy.io.loadmat(path_to_dataset+'/Macaque1_M1_181212.mat')
-            Macaque1_M1_181212= {'emgs': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][0][0],
-           'nChan': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][2][0][0],
-           'sorted_isvalid': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][8],
-           'sorted_resp': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][9],              
-           'sorted_respMean': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][15],
-           'ch2xy': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][14],
-           'DimSearchSpace': 96}            
-            SET=Macaque1_M1_181212
-        if m_i==3:    
-            Macaque2_M1_190527 = scipy.io.loadmat(path_to_dataset+'/Macaque2_M1_190527.mat')
-            Macaque2_M1_190527= {'emgs': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][0][0],
-           'nChan': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][2][0][0],
-           'sorted_isvalid': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][8],
-           'sorted_resp': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][9],              
-           'sorted_respMean': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][15],
-           'ch2xy': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][14],
-           'DimSearchSpace': 96}
-            SET=Macaque2_M1_190527
-        return SET
-    elif dataset_type=='rat':  # rat dataset has 6 subjects
-        if m_i==0:
-            rat1_M1_190716 = scipy.io.loadmat(path_to_dataset+'/rat1_M1_190716.mat')
-            rat1_M1_190716= {'emgs': rat1_M1_190716['rat1_M1_190716'][0][0][0][0],
-           'nChan': rat1_M1_190716['rat1_M1_190716'][0][0][2][0][0],
-           'sorted_isvalid': rat1_M1_190716['rat1_M1_190716'][0][0][8],
-           'sorted_resp': rat1_M1_190716['rat1_M1_190716'][0][0][9],              
-           'sorted_respMean': rat1_M1_190716['rat1_M1_190716'][0][0][15],
-           'ch2xy': rat1_M1_190716['rat1_M1_190716'][0][0][14],
-           'DimSearchSpace': 32}            
-            return rat1_M1_190716
-        if m_i==1:
-            rat2_M1_190617 = scipy.io.loadmat(path_to_dataset+'/rat2_M1_190617.mat')
-            rat2_M1_190617= {'emgs': rat2_M1_190617['rat2_M1_190617'][0][0][0][0],
-           'nChan': rat2_M1_190617['rat2_M1_190617'][0][0][2][0][0],
-           'sorted_isvalid': rat2_M1_190617['rat2_M1_190617'][0][0][8],
-           'sorted_resp': rat2_M1_190617['rat2_M1_190617'][0][0][9],              
-           'sorted_respMean': rat2_M1_190617['rat2_M1_190617'][0][0][15],
-           'ch2xy': rat2_M1_190617['rat2_M1_190617'][0][0][14],
-           'DimSearchSpace': 32}         
-            return rat2_M1_190617          
-        if m_i==2:
-            rat3_M1_190728 = scipy.io.loadmat(path_to_dataset+'/rat3_M1_190728.mat')
-            rat3_M1_190728= {'emgs': rat3_M1_190728['rat3_M1_190728'][0][0][0][0],
-           'nChan': rat3_M1_190728['rat3_M1_190728'][0][0][2][0][0],
-           'sorted_isvalid': rat3_M1_190728['rat3_M1_190728'][0][0][8],
-           'sorted_resp': rat3_M1_190728['rat3_M1_190728'][0][0][9],              
-           'sorted_respMean': rat3_M1_190728['rat3_M1_190728'][0][0][15],
-           'ch2xy': rat3_M1_190728['rat3_M1_190728'][0][0][14],
-           'DimSearchSpace': 32}           
-            return rat3_M1_190728                       
-        if m_i==3:
-            rat4_M1_191109 = scipy.io.loadmat(path_to_dataset+'/rat4_M1_191109.mat')
-            rat4_M1_191109= {'emgs': rat4_M1_191109['rat4_M1_191109'][0][0][0][0],
-           'nChan': rat4_M1_191109['rat4_M1_191109'][0][0][2][0][0],
-           'sorted_isvalid': rat4_M1_191109['rat4_M1_191109'][0][0][8],
-           'sorted_resp': rat4_M1_191109['rat4_M1_191109'][0][0][9],              
-           'sorted_respMean': rat4_M1_191109['rat4_M1_191109'][0][0][15],
-           'ch2xy': rat4_M1_191109['rat4_M1_191109'][0][0][14],
-           'DimSearchSpace': 32}            
-            return rat4_M1_191109                       
-        if m_i==4:
-            rat5_M1_191112 = scipy.io.loadmat(path_to_dataset+'/rat5_M1_191112.mat')
-            rat5_M1_191112= {'emgs': rat5_M1_191112['rat5_M1_191112'][0][0][0][0],
-           'nChan': rat5_M1_191112['rat5_M1_191112'][0][0][2][0][0],
-           'sorted_isvalid': rat5_M1_191112['rat5_M1_191112'][0][0][8],
-           'sorted_resp': rat5_M1_191112['rat5_M1_191112'][0][0][9],              
-           'sorted_respMean': rat5_M1_191112['rat5_M1_191112'][0][0][15],
-           'ch2xy': rat5_M1_191112['rat5_M1_191112'][0][0][14],
-           'DimSearchSpace': 32}
-                       
-            return rat5_M1_191112                      
-        if m_i==5:
-            rat6_M1_200218 = scipy.io.loadmat(path_to_dataset+'/rat6_M1_200218.mat')        
-            rat6_M1_200218= {'emgs': rat6_M1_200218['rat6_M1_200218'][0][0][0][0],
-           'nChan': rat6_M1_200218['rat6_M1_200218'][0][0][2][0][0],
-           'sorted_isvalid': rat6_M1_200218['rat6_M1_200218'][0][0][8],
-           'sorted_resp': rat6_M1_200218['rat6_M1_200218'][0][0][9],              
-           'sorted_respMean': rat6_M1_200218['rat6_M1_200218'][0][0][15],
-           'ch2xy': rat6_M1_200218['rat6_M1_200218'][0][0][14],
-           'DimSearchSpace': 32}          
-            return rat6_M1_200218               
-    elif dataset_type=='spinal':
-        
-        specific_subject = None
-        match m_i:
-            case 0:
-                specific_subject = 'rat0_C5_500uA.pkl'
-            case 1:
-                specific_subject = 'rat1_C5_500uA.pkl'
-            case 2:
-                specific_subject = 'rat1_C5_700uA.pkl'
-            case 3:
-                specific_subject = 'rat1_midC4_500uA.pkl'
-            case 4:
-                specific_subject = 'rat2_C4_300uA.pkl'
-            case 5:
-                specific_subject = 'rat2_C5_300uA.pkl'
-            case 6:
-                specific_subject = 'rat2_C6_300uA.pkl'
-            case 7:
-                specific_subject = 'rat3_C4_300uA.pkl'
-            case 8:
-                specific_subject = 'rat3_C5_200uA.pkl'
-            case 9:
-                specific_subject = 'rat3_C5_350uA.pkl'
-            case 10:
-                specific_subject = 'rat3_C6_300uA.pkl'
-        
-         #load data
-        with open(path_to_dataset + specific_subject, "rb") as f:
-            data = pickle.load(f)
-        
-        ch2xy, emgs = data['ch2xy'], data['emgs']
-        evoked_emg, filtered_emg = data['evoked_emg'], data['filtered_emg']
-        maps = data['map']
-        parameters = data['parameters']
-        resp_region = data['resp_region']
-        response = data['reponse']
-        fs = data['sampFreqEMG']
-        sorted_evoked = data['sorted_evoked']
-        sorted_filtered = data['sorted_filtered']
-        sorted_resp = data['sorted_resp']
-        sorted_isvalid = data['sorted_isvalid']
-        sorted_respMean = data['sorted_respMean']
-        sorted_respSD = data['sorted_resp_SD']
-        stim_channel = data['stim_channel']
-        stimProfile=data['stimProfile']
-        n_muscles = emgs.shape[0]
-
-        #Computing baseline for filtered signal
-        nChan = parameters['nChan'][0]
-        where_zero = np.where(abs(stimProfile) > 10**(-50))[0][0]
-        window_size = int(fs * 35 * 10**(-3))
-        baseline = []
-        for iChan in nChan:
-            reps = np.where(stim_channel == iChan + 1)[0]
-            n_rep = len(reps)
-            mean_baseline = np.mean(sorted_filtered[iChan, :, :n_rep, 0 : where_zero], axis=-1)
-            baseline.append(mean_baseline)
-        baseline = np.stack(baseline, axis=0)
-
-        #remove baseline from filtered signal
-        sorted_filtered[:, :, :n_rep, :] = sorted_filtered[:, :, :n_rep, :] - baseline[..., np.newaxis]
-        sorted_resp = np.nanmax(sorted_filtered[:, :, :n_rep, int(resp_region[0]): int(resp_region[1])], axis=-1)
-        masked_resp = np.ma.masked_where(sorted_isvalid[:, :, :n_rep] == 0, sorted_resp)
-        sorted_respMean = masked_resp.mean(axis=-1)
-
-         # compute baseline for evoked signal
-        baseline = []
-        for iChan in range(nChan):
-            reps = np.where(stim_channel == iChan + 1)[0]
-            n_rep = len(reps)
-            # Compute mean over the last dimension (time), across those repetitions
-            mean_baseline = np.mean(sorted_evoked[iChan, :, :n_rep, 0 : where_zero], axis=-1)
-            baseline.append(mean_baseline)
-        baseline = np.stack(baseline, axis=0)  # shape: (nChan, nSamples)
-        
-        #remove baseline from evoked signal
-        sorted_evoked[:, :, :n_rep, :] = sorted_evoked[:, :, :n_rep, :] - baseline[..., np.newaxis]
-        sorted_resp = np.nanmax(sorted_evoked[:,:,:n_rep,int(resp_region[0]) :int(resp_region[1])], axis=-1)
-        masked_resp = np.ma.masked_where(sorted_isvalid[:,:,:n_rep] == 0, sorted_resp)
-
-        subject = {
-            'emgs': emgs,
-            'nChan': 64,
-            'DimSearchSpace': 64,
-            'sorted_respMean': sorted_respMean,
-            'ch2xy': ch2xy,
-            'dim_sizes': np.array([8, 4, 3, 4, 4]),
-            'evoked_emg': evoked_emg, 'filtered_emg':filtered_emg, 'sorted_resp': sorted_resp,  
-            'sorted_isvalid': sorted_isvalid, 'sorted_respSD': sorted_respSD,
-            'sorted_filtered': sorted_filtered, 'stim_channel': stim_channel, 'fs': fs,
-        'parameters': parameters, 'n_muscles': n_muscles, 'maps': maps,
-        'resp_region': resp_region, 'stimProfile': stimProfile,  'baseline' : baseline    
-        }
-        
-        return subject
-        
-    else:
-        raise ValueError('The dataset type should be 5d_rat, nhp or rat' )
-
-def load_data2(dataset_type, m_i):
-    '''
-    Input: 
-        - dataset_type: str characterizing the modality of the experiment
-        - m_i: int of subject
-
-    Output:
-        - dictionary of neurostimulation data
-    
-        Important: sorted response shape: (nChan, nEmgs, nReps)
-    '''
-    path_to_dataset = f'./datasets/{dataset_type}'
-    if dataset_type == '5d_rat':
-        
-        match m_i:
-            case 0:
-                data = scipy.io.loadmat(f'{path_to_dataset}/BCI00_5D.mat')
-                emgs = ['left extensor carpi radialis', 'biceps', 'triceps',
-                                 'left flexor carpi ulnaris', 'unknown']
-                dim_sizes = np.array([8, 4, 4, 4, 4])
-            case 1:
-                data = scipy.io.loadmat(f'{path_to_dataset}/rCer1.5_5D.mat')
-                emgs = ['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
-                                 'left biceps']
-                dim_sizes = np.array([8, 4, 4, 4, 4])
-            case 2:
-                data = scipy.io.loadmat(f'{path_to_dataset}/rData03_5D.mat')
-                emgs = ['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
-                                    'left pectoralis']
-                dim_sizes = np.array([8, 4, 3, 4, 4])
-
-        resp = data['emg_response']
-        param = data['stim_combinations']
-        ch2xy = param[:, [0,1,2,5,6]]
-        peak_resp = resp[:, :, :, 2].transpose((2, 1, 0)) # resp[:, :, :, 0] for unormalized response ; (nb_reps, nb_emgs, params) to (params, nb_emgs, nb_reps)
-        resp_mean = np.mean(resp[:, :, :,2], axis=0).transpose((1, 0)) #(params, nb_emgs)
-        sorted_isvalid = sort_valid_5drats(peak_resp, param, ch2xy)
-
-        subject = {
-            'emgs': emgs,
-            'nChan': 32,
-            'sorted_resp': peak_resp,
-            'sorted_respMean': resp_mean,
-            'sorted_isvalid': sorted_isvalid, 
-            'ch2xy': ch2xy,
-            'dim_sizes': dim_sizes,
-            'DimSearchSpace' : np.prod(dim_sizes)
-        }                
-        return subject  
-    elif dataset_type=='nhp':
-        if m_i==0:
-            data = scipy.io.loadmat(path_to_dataset+'/Cebus1_M1_190221.mat')['Cebus1_M1_190221'][0][0]
-        elif m_i==1:
-            data = scipy.io.loadmat(path_to_dataset+'/Cebus2_M1_200123.mat')['Cebus2_M1_200123'][0][0]
-        elif m_i==2:    
-            data = scipy.io.loadmat(path_to_dataset+'/Macaque1_M1_181212.mat')['Macaque1_M1_181212'][0][0]
-        elif m_i==3:
-            data  = scipy.io.loadmat(path_to_dataset+'/Macaque2_M1_190527.mat')['Macaque2_M1_190527'][0][0]
-
-        if m_i >= 2:
-            #macaques
-            mapping = {
-                'emgs': 0, 'emgsabr': 1, 'nChan': 2, 'stimProfile': 3, 'stim_channel': 4, 
-                'evoked_emg': 5, 'response': 6, 'isvalid': 7, 'sorted_isvalid': 8, 'sorted_resp': 9, 
-                'sorted_evoked': 10, 'sampFreqEMG': 11, 'resp_region': 12, 'map': 13, 'ch2xy': 14, 
-                'sorted_respMean': 15, 'sorted_respSD': 16
-            }
-        else:
-            # cebus
-            mapping = {
-                'emgs': 0, 'emgsabr': 1, 'nChan': 2, 'stimProfile': 3, 'stim_channel': 4, 
-                'evoked_emg': 5, 'response': 6, 'isvalid': 7, 'sorted_isvalid': 8, 'sorted_resp': 9, 
-                'sorted_respMean': 10, 'sorted_respSD': 11, 'sorted_evoked': 12, 'sampFreqEMG': 13, 
-                'resp_region': 14, 'map': 15, 'ch2xy': 16
-            }
-
-        nChan = data[mapping['nChan']][0][0]
-
-        rN = data[mapping['sorted_isvalid']]
-        j1, j2, j3 = rN.shape[0], rN.shape[1], rN[0][0].shape[0]
-        sorted_isvalid = np.stack([np.squeeze(rN[i, j]) for i in range(j1) for j in range(j2)], axis=0)
-        sorted_isvalid = sorted_isvalid.reshape(j1, j2, j3)
-
-        ch2xy = data[mapping['ch2xy']] - 1
-        se = data[mapping['sorted_evoked']]
-        i1, i2, i3, i4 = se.shape[0], se.shape[1], se[0][0].shape[0], se[0][0].shape[1]
-        sorted_evoked = np.stack([np.squeeze(se[i, j]) for i in range(i1) for j in range(i2)], axis=0)
-        sorted_evoked = sorted_evoked.reshape(i1, i2, i3, i4)
-        sorted_filtered = sorted_evoked
-
-        stim_channel = data[mapping['stim_channel']]
-        if stim_channel.shape[0] == 1:
-            stim_channel = stim_channel[0]
-
-        fs = data[mapping['sampFreqEMG']][0][0]
-        resp_region = data[mapping['resp_region']][0]
-
-        stimProfile = data[mapping['stimProfile']][0]
-        
-        # compute baseline
-        where_zero = np.where(abs(stimProfile) > 10**(-50))[0][0]
-        window_size = int(fs * 30 * 10**(-3))
-        baseline = []
-        for iChan in range(nChan):
-            reps = np.where(stim_channel == iChan + 1)[0]
-            n_rep = len(reps)
-            # Compute mean over the last dimension (time), across those repetitions
-            mean_baseline = np.mean(sorted_filtered[iChan, :, :n_rep, where_zero - window_size : where_zero], axis=-1)
-            baseline.append(mean_baseline)
-        
-        baseline = np.stack(baseline, axis=0)  # shape: (nChan, nSamples)
-        
-        sorted_filtered = sorted_filtered - baseline[..., np.newaxis]
-        sorted_resp = np.max(sorted_filtered[:,:,:n_rep,resp_region[0]:resp_region[1]], axis=-1)
-
-        # Create a masked array where invalid points are masked
-        masked_resp = np.ma.masked_where(sorted_isvalid == 0, sorted_resp)
-        
-        # Compute the mean over the last axis, ignoring masked (invalid) values
-        sorted_respMean = masked_resp.mean(axis=-1)
-
-        emgs = data[0][0]
-
-        return {
-        'emgs': emgs,
-        'nChan': nChan, 
-        'sorted_isvalid': sorted_isvalid,
-        'sorted_resp': sorted_resp,
-        'sorted_respMean': sorted_respMean,
-        'ch2xy': ch2xy,
-        'DimSearchSpace': 96
-        }
-    elif dataset_type=='rat':  # rat dataset has 6 subjects
-        if m_i==0:
-            data = scipy.io.loadmat(path_to_dataset+'/rat1_M1_190716.mat')['rat1_M1_190716'][0][0]
-        elif m_i==1:
-            data = scipy.io.loadmat(path_to_dataset+'/rat2_M1_190617.mat')['rat2_M1_190617'][0][0]     
-        elif m_i==2:
-            data = scipy.io.loadmat(path_to_dataset+'/rat3_M1_190728.mat')['rat3_M1_190728'][0][0]                  
-        elif m_i==3:
-            data = scipy.io.loadmat(path_to_dataset+'/rat4_M1_191109.mat')['rat4_M1_191109'][0][0]                  
-        elif m_i==4:
-            data = scipy.io.loadmat(path_to_dataset+'/rat5_M1_191112.mat')['rat5_M1_191112'][0][0]                  
-        elif m_i==5:
-            data = scipy.io.loadmat(path_to_dataset+'/rat6_M1_200218.mat')['rat6_M1_200218'][0][0]   
-
-        mapping = {
-                'emgs': 0, 'emgsabr': 1, 'nChan': 2, 'stimProfile': 3, 'stim_channel': 4, 
-                'evoked_emg': 5, 'response': 6, 'isvalid': 7, 'sorted_isvalid': 8, 'sorted_resp': 9, 
-                'sorted_evoked': 10, 'sampFreqEMG': 11, 'resp_region': 12, 'map': 13, 'ch2xy': 14, 
-                'sorted_respMean': 15, 'sorted_respSD': 16
-            }
-        
-        nChan = data[mapping['nChan']][0][0]
-
-        rN = data[mapping['sorted_isvalid']]
-        j1, j2, j3 = rN.shape[0], rN.shape[1], rN[0][0].shape[0]
-        sorted_isvalid = np.stack([np.squeeze(rN[i, j]) for i in range(j1) for j in range(j2)], axis=0)
-        sorted_isvalid = sorted_isvalid.reshape(j1, j2, j3)
-
-        ch2xy = data[mapping['ch2xy']] - 1
-        se = data[mapping['sorted_evoked']]
-        i1, i2, i3, i4 = se.shape[0], se.shape[1], se[0][0].shape[0], se[0][0].shape[1]
-        sorted_evoked = np.stack([np.squeeze(se[i, j]) for i in range(i1) for j in range(i2)], axis=0)
-        sorted_evoked = sorted_evoked.reshape(i1, i2, i3, i4)
-        sorted_filtered = sorted_evoked
-
-        stim_channel = data[mapping['stim_channel']]
-        if stim_channel.shape[0] == 1:
-            stim_channel = stim_channel[0]
-
-        fs = data[mapping['sampFreqEMG']][0][0]
-        resp_region = data[mapping['resp_region']][0]
-
-        stimProfile = data[mapping['stimProfile']][0]
-        
-        # compute baseline
-        where_zero = np.where(abs(stimProfile) > 10**(-50))[0][0]
-        window_size = int(fs * 30 * 10**(-3))
-        baseline = []
-        for iChan in range(nChan):
-            reps = np.where(stim_channel == iChan + 1)[0]
-            n_rep = len(reps)
-            # Compute mean over the last dimension (time), across those repetitions
-            mean_baseline = np.mean(sorted_filtered[iChan, :, :n_rep, where_zero - window_size : where_zero], axis=-1)
-            baseline.append(mean_baseline)
-        
-        baseline = np.stack(baseline, axis=0)  # shape: (nChan, nSamples)
-        
-        sorted_filtered = sorted_filtered - baseline[..., np.newaxis]
-        sorted_resp = np.max(sorted_filtered[:,:,:n_rep,resp_region[0]:resp_region[1]], axis=-1)
-        # Create a masked array where invalid points are masked
-        masked_resp = np.ma.masked_where(sorted_isvalid == 0, sorted_resp)
-        
-        # Compute the mean over the last axis, ignoring masked (invalid) values
-        sorted_respMean = masked_resp.mean(axis=-1)
-
-        emgs = data[0][0]
-
-        return {
-        'emgs': emgs,
-        'nChan': nChan, 
-        'sorted_isvalid': sorted_isvalid,
-        'sorted_resp': sorted_resp,
-        'sorted_respMean': sorted_respMean,
-        'ch2xy': ch2xy,
-        'DimSearchSpace': 32
-        } 
-    elif dataset_type =='spinal':
-
-        subject_map = {
-            0: 'rat0_C5_500uA.pkl', 1: 'rat1_C5_500uA.pkl', 2: 'rat1_C5_700uA.pkl', 3: 'rat1_midC4_500uA.pkl',
-            4: 'rat2_C4_300uA.pkl', 5: 'rat2_C5_300uA.pkl', 6: 'rat2_C6_300uA.pkl', 7: 'rat3_C4_300uA.pkl',
-            8: 'rat3_C5_200uA.pkl', 9: 'rat3_C5_350uA.pkl', 10: 'rat3_C6_300uA.pkl' 
-        }
-        
-        #load data
-        with open(f'{path_to_dataset}/{subject_map[m_i]}', "rb") as f:
-            data = pickle.load(f)
-        
-        ch2xy, emgs = data['ch2xy'], data['emgs']
-        evoked_emg, filtered_emg = data['evoked_emg'], data['filtered_emg']
-        maps = data['map']
-        parameters = data['parameters']
-        resp_region = data['resp_region']
-        fs = data['sampFreqEMG']
-        sorted_evoked = data['sorted_evoked']
-        sorted_filtered = data['sorted_filtered']
-        sorted_resp = data['sorted_resp']
-        sorted_isvalid = data['sorted_isvalid']
-        sorted_respMean = data['sorted_respMean']
-        sorted_respSD = data['sorted_respSD']
-        stim_channel = data['stim_channel']
-        stimProfile=data['stimProfile']
-        n_muscles = emgs.shape[0]
-
-        #?# We are removing lots of reps here print(f'sorted response: {sorted_resp.shape}') 
-        #Computing baseline for filtered signal
-        nChan = parameters['nChan'][0]
-        where_zero = np.where(abs(stimProfile) > 10**(-50))[0][0]
-        window_size = int(fs * 35 * 10**(-3))
-        baseline = []
-        n_rep = 10000 # First, determine n_reps global
-        for iChan in range(nChan):
-            reps= np.where(stim_channel == iChan + 1)[0]
-            if len(reps) < n_rep:
-                n_rep = len(reps)
-        for iChan in range(nChan):
-            mean_baseline = np.mean(sorted_filtered[iChan, :, :n_rep, 0 : where_zero], axis=-1)
-            baseline.append(mean_baseline)
-        
-        baseline = np.stack(baseline, axis=0)
-
-        #remove baseline from filtered signal
-        sorted_filtered[:, :, :n_rep, :] = sorted_filtered[:, :, :n_rep, :] - baseline[..., np.newaxis]
-        sorted_resp = np.nanmax(sorted_filtered[:, :, :n_rep, int(resp_region[0]): int(resp_region[1])], axis=-1)
-        masked_resp = np.ma.masked_where(sorted_isvalid[:, :, :n_rep] == 0, sorted_resp)
-        sorted_respMean = masked_resp.mean(axis=-1)
-
-         # compute baseline for evoked signal
-        baseline = []
-        for iChan in range(nChan):
-            # Compute mean over the last dimension (time), across those repetitions
-            mean_baseline = np.mean(sorted_evoked[iChan, :, :n_rep, 0 : where_zero], axis=-1)
-            baseline.append(mean_baseline)
-        baseline = np.stack(baseline, axis=0)  # shape: (nChan, nSamples)
-        
-        #remove baseline from evoked signal
-        sorted_evoked[:, :, :n_rep, :] = sorted_evoked[:, :, :n_rep, :] - baseline[..., np.newaxis]
-        sorted_resp = np.nanmax(sorted_evoked[:,:,:n_rep,int(resp_region[0]) :int(resp_region[1])], axis=-1)
-        masked_resp = np.ma.masked_where(sorted_isvalid[:,:,:n_rep] == 0, sorted_resp)
-
-        #mask sorted_isvalid by n_rep
-        sorted_isvalid = sorted_isvalid[:, :, :n_rep]
-
-        subject = {
-            'emgs': emgs,
-            'nChan': 64,
-            'DimSearchSpace': 64,
-            'sorted_respMean': sorted_respMean,
-            'ch2xy': ch2xy,
-            'evoked_emg': evoked_emg, 'filtered_emg':filtered_emg, 'sorted_resp': sorted_resp,  
-            'sorted_isvalid': sorted_isvalid, 'sorted_respSD': sorted_respSD,
-            'sorted_filtered': sorted_filtered, 'stim_channel': stim_channel, 'fs': fs,
-        'parameters': parameters, 'n_muscles': n_muscles, 'maps': maps,
-        'resp_region': resp_region, 'stimProfile': stimProfile,  'baseline' : baseline    
-        }
-        
-        return subject   
-    else:
-        raise ValueError('The dataset type should be 5d_rat, nhp, rat or spinal' )
-        
 
 ### Method to calculate true Sobol Interactions
 
@@ -1343,75 +133,15 @@ def sobol_interactions(dataset_type, surrogate='rf', N=4096):
             print(f"x{i} & x{j}: Avg S2 = {overall_avg[i,j]:.4f}")
 
 
-### --- BO methods --- ###   
+### --- BO methods --- ###
 
-def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points):
-        """
-        Grid-search UCB maximizer.
-        Returns: new_x (1 x d tensor), ucb_value (float), idx (int)
-        UCB = mean + kappa * std
-        """
-        gp_model.eval()
-        gp_likelihood.eval()
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            post = gp_likelihood(gp_model(grid_points))
-            mean = post.mean           # shape (n_points,)
-            var = post.variance
-            std = var.clamp_min(0.0).sqrt()
-            ucb = mean + kappa_val * std
-
-        best_idx = torch.argmax(ucb).item()
-        best_x = grid_points[best_idx].unsqueeze(0)  # keep shape (1, d)
-        return best_x, ucb[best_idx].item(), best_idx
-
-def optimize(gp, train_x, train_y, n_iter=10, lr=0.1):
-    """
-    Train an ExactGP + Likelihood model.
-
-    Args:
-        gp: ExactGP model
-        likelihood: gpytorch.likelihoods.GaussianLikelihood
-        train_x: torch.Tensor (n, d)
-        train_y: torch.Tensor (n,)
-        n_iter: int, number of training iterations
-        lr: float, learning rate
-
-    Returns:
-        gp (trained), likelihood (trained), mean_epoch_loss (float)
-    """
-
-    # training inputs alignmnet
-    gp.set_train_data(inputs=train_x, targets=train_y, strict=False)
-
-    gp.train()
-    gp.likelihood.train()
-
-    optimizer = torch.optim.Adam(gp.parameters(), lr=lr)
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(gp.likelihood, gp)
-
-    epoch_losses = []
-    for i in range(n_iter):
-        optimizer.zero_grad()
-        output = gp(train_x)
-        loss = -mll(output, train_y)
-
-        if loss.dim() !=0:
-            loss = loss.sum()
-
-        loss.backward()
-        optimizer.step()
-        epoch_losses.append(loss.item())
-
-    mean_loss = float(np.mean(epoch_losses))
-    return gp, gp.likelihood, mean_loss
-
-def neurostim_bo(dataset, model_cls, kappas):
+def neurostim_bo(dataset, model_cls, kappas, device='cpu'):
 
     np.random.seed(0)
 
     # Experiment parameters initialization
     options = set_experiment(dataset)
-    device = options['device']
+    device = torch.device(device)
     nRep = options['n_reps']
     nrnd = options['n_rnd']
     nSubjects = options['n_subjects']
@@ -1425,7 +155,6 @@ def neurostim_bo(dataset, model_cls, kappas):
     Q = torch.zeros((nSubjects,max(nEmgs),len(kappas),nRep, MaxQueries), device=device)
     Train_time = torch.zeros((nSubjects,max(nEmgs), len(kappas),nRep, MaxQueries), device=device)
     Cum_train =  torch.zeros((nSubjects,max(nEmgs), len(kappas),nRep, MaxQueries), device=device)
-    PARTITIONS = np.empty((nSubjects,max(nEmgs),len(kappas),nRep, MaxQueries), dtype=object)
     RSQ = torch.zeros((nSubjects,max(nEmgs), len(kappas), nRep), device=device)
     REGRETS = torch.zeros((nSubjects,max(nEmgs), len(kappas), nRep, MaxQueries), device=device)
     SOBOLS = np.empty((nSubjects,max(nEmgs),len(kappas),nRep, MaxQueries), dtype=object)
@@ -1450,7 +179,7 @@ def neurostim_bo(dataset, model_cls, kappas):
 
                 prior_lik= gpytorch.priors.SmoothedBoxPrior(a=options['noise_min']**2,b= options['noise_max']**2, sigma=0.01) # gaussian noise variance
                 likf= gpytorch.likelihoods.GaussianLikelihood(noise_prior= prior_lik)
-                likf.initialize(noise=torch.tensor(1.0, device=DEVICE, dtype=torch.get_default_dtype()))
+                likf.initialize(noise=torch.tensor(1.0, device=device, dtype=torch.get_default_dtype()))
 
                 if device =='cuda':
                     likf=likf.cuda()
@@ -1464,7 +193,6 @@ def neurostim_bo(dataset, model_cls, kappas):
                 P_test =  torch.zeros((nRep, MaxQueries, 2), device=device) #storing all queries
                 train_time = torch.zeros((nRep, MaxQueries), device=device)
                 cum_time = torch.zeros((nRep, MaxQueries), device=device)
-                partitions = np.empty((nRep, MaxQueries), dtype=object)
                 regret = np.empty((nRep, MaxQueries), dtype=np.float32)
                 sobol_interactions = np.empty((nRep, MaxQueries), dtype=object)
 
@@ -1482,7 +210,7 @@ def neurostim_bo(dataset, model_cls, kappas):
                     P_max=[]
 
                     
-                    executor = ThreadPoolExecutor(max_workers=2)
+                    executor = ThreadPoolExecutor(max_workers=4)
                     space_reconfiguration = None
                     interactions = None
 
@@ -1532,13 +260,10 @@ def neurostim_bo(dataset, model_cls, kappas):
                         # Model initialization and model update
                         if q == 0:
                             model = model_cls(x, y, likf, priorbox, outputscale_priorbox)
-                            if model.name in ['neuralSobolGP', 'neuralMHGP']:
-                                sobol = Sobol(dataset)
-                                model.sobol = sobol #Initialize sobol
-                                surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_prior= prior_lik)
-                                surrogate_likelihood.initialize(noise=torch.tensor(1.0, device=device, dtype=torch.get_default_dtype()))
-                                surrogate = ExactGP(x, y, surrogate_likelihood, priorbox, outputscale_priorbox)
-                                interactions = model.sobol.update_interactions(x, y, surrogate, surrogate_likelihood)
+                            if model.name == 'NeuralSobolGP':
+                                sobol = NeuralSobol(dataset).to(device)
+                                model.sobol = sobol  # Initialize sobol
+                                interactions = np.zeros((ndims), dtype=float) #model.sobol.method(x, y, surrogate)
                         else:
                             model.set_train_data(x, y, strict=False)
 
@@ -1577,32 +302,19 @@ def neurostim_bo(dataset, model_cls, kappas):
                         # Pending Sobol job fetch
                         if space_reconfiguration is not None and space_reconfiguration.done():
                             interactions = space_reconfiguration.result()
-                            if model.name == 'neuralMHGP':
-                                new_partition = model.metropolis_hastings(interactions)
-                            else:
-                                new_partition = sobol.update_partition(interactions)
-                            
+                            new_partition = sobol.update_partition(interactions)
                             model.update_partition(new_partition)
                             space_reconfiguration = None
                            
                             
-                        #Update partitions every 10 queries
-                        if model.name in ['neuralSobolGP', 'neuralMHGP']:
-                            
-                            partitions[rep_i, q] = model.partition
+                        # Update partitions
+                        if model.name == 'NeuralSobolGP':
                             sobol_interactions[rep_i, q] = interactions.copy()
 
-                            if q % 10 == 1:
-                                if space_reconfiguration is None or space_reconfiguration.done():
-                                    try:
-
-                                        surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_prior= prior_lik)
-                                        surrogate = ExactGP(x, y, surrogate_likelihood, priorbox, outputscale_priorbox)
-                                        space_reconfiguration = executor.submit(sobol.update_interactions, x, y, surrogate, surrogate_likelihood)
-                                
-                                    except Exception as e:
-                                        space_reconfiguration = None
-                                        print(f"[Sobol] submit failed: {e}")
+                            if (space_reconfiguration is None or space_reconfiguration.done()) and (q > (MaxQueries // 4)):
+                                surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_prior=prior_lik)
+                                surrogate = NeuralExactGP(x, y, surrogate_likelihood, priorbox, outputscale_priorbox)
+                                space_reconfiguration = executor.submit(sobol.method, x, y, surrogate)
                             
 
                         # computation time calculations
@@ -1635,20 +347,18 @@ def neurostim_bo(dataset, model_cls, kappas):
                 PP_t[s_idx,e_i,k_idx]= MPm[perf_exploit.long().cpu()]/mMPm
                 Train_time[s_idx,e_i,k_idx] = train_time.mean(dim=0).detach().cpu()
                 Cum_train[s_idx, e_i, k_idx] = cum_time.mean(dim=0).detach().cpu()
-                PARTITIONS[s_idx,e_i,k_idx] = partitions
                 RSQ[s_idx,e_i,k_idx]=perf_rsq
-                REGRETS[s_idx,e_i,k_idx, :] = torch.log(torch.tensor(regret, dtype=torch.float32, device=DEVICE) + 1e-8) 
+                REGRETS[s_idx,e_i,k_idx, :] = torch.log(torch.tensor(regret, dtype=torch.float32, device=device) + 1e-8) 
                 SOBOLS[s_idx, e_i, k_idx] = sobol_interactions # mean_mats.mean(axis=0) #?# some mean operation
 
     # Saving variables
     output_dir = os.path.join('output', 'neurostim_experiments', dataset)
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'{dataset}_{model.name}_budget{MaxQueries}_{nRep}reps_wbaseline.npz'
+    fname = f'{dataset}_{model.name}_budget{MaxQueries}_{nRep}reps.npz'
     results_path = os.path.join(output_dir,fname)
     np.savez_compressed(results_path,
             RSQ=RSQ.cpu(), PP=PP.cpu(), PP_t=PP_t.cpu(), 
             kappas=np.array(kappas),
-            PARTITIONS = PARTITIONS,
             SOBOLS = SOBOLS,
             REGRETS = REGRETS.cpu(),
             Train_time = Train_time.cpu(),
@@ -1675,30 +385,40 @@ def _parse_list_of_ints(text):
     except Exception:
         raise argparse.ArgumentTypeError('Expected comma-separated list of ints (e.g. 1,2,3)')
 
+def _parse_list_of_strings(text):
+    if text is None:
+        return None
+    try:
+        return [x.strip() for x in text.split(',') if len(x.strip())]
+    except Exception:
+        raise argparse.ArgumentTypeError('Expected comma-separated list of strings')
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Refactored partitionGPBO runner with CLI options')
+    parser = argparse.ArgumentParser(description='Neurostimulation Bayesian Optimization runner with CLI options')
 
     # Dataset selection
     parser.add_argument('--dataset', type=str, default='5d_rat', help='Neurostimulation dataset type')
 
     # Model selection
-    parser.add_argument('--model_cls', type=str, default='ExactGPModel', help='Model class name (ExactGP, AdditiveGP, SobolGP, MHGP)')
-   
+    parser.add_argument('--model_cls', type=str, default='NeuralExactGP', help='Model class name (NeuralExactGP, NeuralAdditiveGP, NeuralSobolGP)')
+
     # Method-specific params
-    parser.add_argument('--kappas', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for kappa_search')
+    parser.add_argument('--kappas', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for experiments')
+
+    # Device selection
+    parser.add_argument('--device', type=str, default='cpu', help='Device for computation (e.g., cpu, cuda:0)')
+    parser.add_argument('--devices', type=_parse_list_of_strings, default=None, help='Comma-separated devices for parallel execution (e.g., cuda:0,cuda:1,cpu)')
 
     # Misc
     parser.add_argument('--list_models', action='store_true')
-    parser.add_argument('--list_methods', action='store_true')
 
     args = parser.parse_args(argv)
 
     # Allowed mappings (whitelist)
     model_map = {
-        'ExactGP': ExactGP,
-        'AdditiveGP': AdditiveGP,
-        'SobolGP': neuralSobolGP,
-        'MHGP': neuralMHGP,
+        'NeuralExactGP': NeuralExactGP,
+        'NeuralAdditiveGP': NeuralAdditiveGP,
+        'NeuralSobolGP': NeuralSobolGP,
     }
 
     if args.list_models:
@@ -1712,10 +432,12 @@ def main(argv=None):
 
     model_cls = model_map[args.model_cls]
 
+    # Determine device
+    device = args.devices[0] if args.devices else args.device
+
     # dispatch
     try:
-        result = neurostim_bo(args.dataset, model_cls, kappas=args.kappas)
-        
+        result = neurostim_bo(args.dataset, model_cls, kappas=args.kappas, device=device)
         print('Completed')
 
     except Exception as e:
@@ -1725,8 +447,6 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-        
-    neurostim_bo('5d_rat', ExactGP, kappas=[1.0, 3.0, 5.0, 7.0, 9.0, 11.0])
-    #main()
 
-    #sobol_interactions('5d_rat', surrogate='pce')
+    main()
+    #neurostim_bo('nhp', NeuralSobolGP, kappas=[3.0], device='cpu')

@@ -712,7 +712,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
     
     labels = ['True Interaction', 'Additivity Threshold', 'Predicted Interaction']
     x_full = np.arange(1, n_iter + 1)
-    threshold = 0.05
+    threshold = 0.25
 
     for i in range(d):
         ax = axes_flat[i]
@@ -1015,10 +1015,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-
-    #main()
-    f_ishigami = SyntheticTestFun('ishigami', 3, False, False)
-    f_hartmann = SyntheticTestFun('hartmann', 6, False, False)
-    #run_partitionbo(f_ishigami, SobolGP, 100, 10, 1.0, 'cuda:1')
-    optimization_metrics(f_hartmann, [9.0, 9.0, 7.0], 150, 8, devices=['cpu', 'cuda:0', 'cuda:1'])
-    
+    main()

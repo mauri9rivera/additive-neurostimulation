@@ -15,3 +15,7 @@ __pycache__/
 #data and output files
 output/
 datasets/
+
+#claudecode
+.claude
+CLAUDE.md

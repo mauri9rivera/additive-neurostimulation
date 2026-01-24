@@ -11,7 +11,7 @@ from botorch.models.gpytorch import GPyTorchModel
 
 ### Model utils ###
 
-def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
+def optimize(gp, train_x, train_y, n_iter=30, lr=0.01):
     """
     Train an ExactGP + Likelihood model.
 
@@ -373,7 +373,6 @@ class SobolGP(gpytorch.models.ExactGP):
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-
 class WrappedModel(GPyTorchModel):
     _num_outputs = 1
 
@@ -409,3 +408,116 @@ class WrappedModel(GPyTorchModel):
         self.train_x = new_train_x
         self.train_y = new_train_y
         self.model.set_train_data(new_train_x, new_train_y, strict=False)
+
+### Model for neurostimulation tasks ###
+class NeuralExactGP(gpytorch.models.ExactGP):                                                                                                                                                                  
+    """                                                                                                                                                                                                        
+    ExactGP variant for neurostimulation datasets with configurable priors.                                                                                                                                    
+    """                                                                                                                                                                                                        
+    def __init__(self, train_x, train_y, likelihood, lengthscale_prior=None, outputscale_prior=None):                                                                                                          
+        super(NeuralExactGP, self).__init__(train_x, train_y, likelihood)                                                                                                                                      
+        self.mean_module = gpytorch.means.ZeroMean()                                                                                                                                                           
+        self.n_dims = train_x.shape[-1]                                                                                                                                                                        
+        kernel = gpytorch.kernels.ScaleKernel(                                                                                                                                                                 
+            gpytorch.kernels.MaternKernel(                                                                                                                                                                     
+                nu=2.5, ard_num_dims=self.n_dims,                                                                                                                                                              
+                lengthscale_prior=lengthscale_prior                                                                                                                                                            
+            ),                                                                                                                                                                                                 
+            outputscale_prior=outputscale_prior                                                                                                                                                                
+        )                                                                                                                                                                                                      
+        kernel.base_kernel.lengthscale = [1.0] * self.n_dims                                                                                                                                                   
+        kernel.outputscale = [1.0]                                                                                                                                                                             
+        self.covar_module = kernel                                                                                                                                                                             
+        self.name = 'NeuralExactGP'                                                                                                                                                                            
+                                                                                                                                                                                                               
+    def forward(self, x):                                                                                                                                                                                      
+        mean_x = self.mean_module(x)                                                                                                                                                                           
+        covar_x = self.covar_module(x)                                                                                                                                                                         
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)                                                                                                                                      
+                                                                                                                                                                                                                                                                                                                                                                                                                            
+class NeuralAdditiveGP(gpytorch.models.ExactGP):                                                                                                                                                               
+    """                                                                                                                                                                                                        
+    AdditiveGP variant for neurostimulation datasets with configurable priors.                                                                                                                                 
+    """                                                                                                                                                                                                        
+    def __init__(self, train_x, train_y, likelihood, lengthscale_prior=None, outputscale_prior=None):                                                                                                          
+        super().__init__(train_x, train_y, likelihood)                                                                                                                                                         
+        self.n_dims = train_x.shape[-1]                                                                                                                                                                        
+                                                                                                                                                                                                               
+        kernel = gpytorch.kernels.ScaleKernel(                                                                                                                                                                 
+            gpytorch.kernels.MaternKernel(                                                                                                                                                                     
+                nu=2.5, ard_num_dims=self.n_dims, batch_shape=torch.Size([self.n_dims]),                                                                                                                       
+                lengthscale_prior=lengthscale_prior                                                                                                                                                            
+            ),                                                                                                                                                                                                 
+            outputscale_prior=outputscale_prior                                                                                                                                                                
+        )                                                                                                                                                                                                      
+        kernel.base_kernel.lengthscale = [1.0] * self.n_dims                                                                                                                                                   
+        kernel.outputscale = [1.0]                                                                                                                                                                             
+        self.covar_module = kernel                                                                                                                                                                             
+                                                                                                                                                                                                               
+        self.mean_module = gpytorch.means.ZeroMean()                                                                                                                                                           
+        self.name = 'NeuralAdditiveGP'                                                                                                                                                                         
+                                                                                                                                                                                                               
+    def forward(self, X):                                                                                                                                                                                      
+        mean = self.mean_module(X)                                                                                                                                                                             
+        batched_dimensions_of_X = X.mT.unsqueeze(-1)  # Now a d x n x 1 tensor                                                                                                                                 
+        covar = self.covar_module(batched_dimensions_of_X).sum(dim=-3)                                                                                                                                         
+        return gpytorch.distributions.MultivariateNormal(mean, covar)                                                                                                                                          
+                                                                                                                                                                                                                                                                                                                                                                                                                           
+class NeuralSobolGP(gpytorch.models.ExactGP):                                                                                                                                                                  
+    """                                                                                                                                                                                                        
+    SobolGP variant for neurostimulation datasets with configurable priors.                                                                                                                                    
+                                                                                                                                                                                                               
+    - partition: list of lists of integer dimension indices, e.g. [[0,2],[1,3]]                                                                                                                                
+    - sobol: an associated NeuralSobol object (optional)                                                                                                                                                       
+    - lengthscale_prior, outputscale_prior: GPyTorch priors for kernel hyperparameters                                                                                                                         
+    """                                                                                                                                                                                                        
+    def __init__(self, train_x, train_y, likelihood, lengthscale_prior=None, outputscale_prior=None,                                                                                                           
+                 partition=None, history=None, sobol=None):                                                                                                                                                    
+        super(NeuralSobolGP, self).__init__(train_x, train_y, likelihood)                                                                                                                                      
+        self.mean_module = gpytorch.means.ZeroMean()                                                                                                                                                           
+        self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]                                                                                                       
+        self.history = history if history else None                                                                                                                                                            
+        self.sobol = sobol                                                                                                                                                                                     
+        self.n_dims = train_x.shape[-1]                                                                                                                                                                        
+        self.name = 'NeuralSobolGP'                                                                                                                                                                            
+        self.lengthscale_prior = lengthscale_prior                                                                                                                                                             
+        self.outputscale_prior = outputscale_prior                                                                                                                                                             
+        # build covar_module based on partition                                                                                                                                                                
+        self._build_covar()                                                                                                                                                                                    
+                                                                                                                                                                                                               
+    def _build_covar(self):                                                                                                                                                                                    
+        kernels = []                                                                                                                                                                                           
+        for group in self.partition:                                                                                                                                                                           
+            ard_dims = len(group)                                                                                                                                                                              
+            base_kernel = gpytorch.kernels.MaternKernel(                                                                                                                                                       
+                nu=2.5,                                                                                                                                                                                        
+                ard_num_dims=ard_dims,                                                                                                                                                                         
+                active_dims=group,                                                                                                                                                                             
+                lengthscale_prior=self.lengthscale_prior                                                                                                                                                       
+            )                                                                                                                                                                                                  
+            scaled_kernel = gpytorch.kernels.ScaleKernel(                                                                                                                                                      
+                base_kernel,                                                                                                                                                                                   
+                outputscale_prior=self.outputscale_prior                                                                                                                                                       
+            )                                                                                                                                                                                                  
+            kernels.append(scaled_kernel)                                                                                                                                                                      
+        self.covar_module = gpytorch.kernels.AdditiveKernel(*kernels)                                                                                                                                          
+                                                                                                                                                                                                               
+    def update_partition(self, new_partition):                                                                                                                                                                 
+        # normalize indices to ints                                                                                                                                                                            
+        new_partition = [list(map(int, grp)) for grp in new_partition if len(grp) > 0]                                                                                                                         
+        # avoid unnecessary rebuilds:                                                                                                                                                                          
+        if new_partition == self.partition:                                                                                                                                                                    
+            return                                                                                                                                                                                             
+        self.partition = new_partition                                                                                                                                                                         
+        self._build_covar()                                                                                                                                                                                    
+                                                                                                                                                                                                               
+    def reconfigure_space(self, surrogate, surrogate_likelihood):                                                                                                                                              
+        # update Sobol interactions based on new surrogate train data                                                                                                                                          
+        interactions = self.sobol.method(surrogate.train_inputs[0], surrogate.train_targets, surrogate)                                                                                                        
+        new_partition = self.sobol.update_partition(interactions)                                                                                                                                              
+        return interactions, new_partition                                                                                                                                                                     
+                                                                                                                                                                                                               
+    def forward(self, x):                                                                                                                                                                                      
+        mean_x = self.mean_module(x)                                                                                                                                                                           
+        covar_x = self.covar_module(x)                                                                                                                                                                         
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x) 

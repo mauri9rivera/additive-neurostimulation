@@ -617,7 +617,7 @@ if __name__ == '__main__':
 
     files_nhp = ['./output/neurostim_experiments/nhp/nhp_ExactGP_budget96_20reps.npz',
              './output/neurostim_experiments/nhp/nhp_AdditiveGP_budget96_20reps.npz',
-             './output/neurostim_experiments/nhp/nhp_neuralSobolGP_budget96_20reps.npz',
+             './output/neurostim_experiments/nhp/nhp_NeuralSobolGP_budget96_20reps.npz',
     ]
 
     files_5d_rat = ['./output/neurostim_experiments/5d_rat/5d_rat_ExactGP_budget100_20reps.npz',
@@ -630,11 +630,11 @@ if __name__ == '__main__':
             './output/neurostim_experiments/spinal/spinal_neuralSobolGP_budget64_20reps_wbaseline.npz',
             ]
 
-    #d_simple = load_results(files_spinal[0])
-    #d_additive = load_results(files_spinal[1])
-    d_sobol = load_results(files_spinal[2])
+    d_simple = load_results(files_nhp[0])
+    d_additive = load_results(files_nhp[1])
+    d_sobol = load_results(files_nhp[2])
 
-    #optimization_metrics(d_simple, d_additive, d_sobol, kappas=[-2, -2, -1], dataset='spinal')
+    optimization_metrics(d_simple, d_additive, d_sobol, kappas=[-2, -2, 0], dataset='nhp')
     
-    partition_metrics(d_sobol, 'spinal', 8, -1)
+    #partition_metrics(d_sobol, 'spinal', 8, -1)
     #plot_kappas(files_spinal, 'spinal')

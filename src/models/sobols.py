@@ -664,3 +664,164 @@ class Sobol:
                 else:
                     P[0].append(x)
         return P
+
+class NeuralSobol:
+    """
+    Sobol sensitivity analyzer for neurostimulation datasets.
+
+    Uses scipy's sobol_indices to compute high-order Sobol interactions (S_T - S_1),
+    outputting a 1×d array instead of d×d second-order interactions.
+
+    Attributes:
+      epsilon : float threshold for 'additivity' interaction
+      problem : dict for SALib problem definition (names, bounds, etc.)
+      method: callable for computing high-order interactions (scipy by default)
+      M: int samples for sobol analysis
+      B: int bootstrap samples
+
+    Methods:
+      method(train_x, train_y, metamodel) -> interactions (1×d numpy array)
+      update_partition(interactions) -> partition (list of list of dims)
+    """
+
+    def __init__(self, dataset_type, M=2048, B=4):
+        """
+        Args:
+            dataset_type: string ('5d_rat', 'nhp', 'rat', 'spinal')
+            M: number of monte-carlo samples for sobol analysis
+            B: number of bootstrap samples
+        """
+        self.epsilon = 0.25
+        self.B = B
+        self.M = M
+        self.problem = self._build_problem(dataset_type)
+        self.device = torch.device("cpu")
+        # Default method is scipy
+        self.method = self.interactions_scipy
+
+    def _build_problem(self, dataset_type):
+        """
+        Build SALib 'problem' dict from dataset type with hardcoded bounds.
+        """
+        if dataset_type == '5d_rat':
+            d = 5
+            bounds = [[100, 400], [100, 400], [20, 200], [0, 7], [0, 3]]
+        elif dataset_type in ['spinal', 'rat']:
+            d = 2
+            bounds = [[0, 7], [0, 7]]
+        elif dataset_type == 'nhp':
+            d = 2
+            bounds = [[0, 9], [0, 9]]
+        else:
+            raise ValueError(f"Unknown dataset_type: {dataset_type}")
+
+        problem = {
+            'num_vars': int(d),
+            'names': np.array([f"x{i}" for i in range(d)]),
+            'bounds': np.asarray(bounds)
+        }
+        return problem
+
+    def to(self, device):
+        """
+        Sets the device for the Sobol analyzer and returns self.
+        This allows chaining: sobol = NeuralSobol(dataset).to(device)
+        """
+        self.device = torch.device(device)
+        return self
+
+    def update_eps(self, t):
+        """Update epsilon threshold based on iteration count."""
+        self.epsilon = np.clip(0.08 * (0.998 ** t), 0.05, 0.08)
+
+    def interactions_scipy(self, train_x, train_y, metamodel):
+        """
+        Calculate higher-order Sobol indices using GP metamodel and scipy's machinery.
+
+        Args:
+            train_x: Tensor (n, d) - training inputs
+            train_y: Tensor (n,) - training outputs
+            metamodel: trained ExactGP model
+
+        Returns:
+            high_mean: numpy array (d,) of high-order interactions (1 - S1/ST)
+        """
+        from scipy.stats import sobol_indices as scipy_sobol
+        from scipy.stats import uniform
+
+        # Update epsilon based on sample count
+        self.update_eps(train_x.shape[0])
+        d = self.problem['num_vars']
+
+        # Tensor converters
+        device = train_x.device
+        dtype = train_x.dtype
+
+        # Train the metamodel
+        metamodel, metamodel.likelihood, _ = optimize(metamodel, train_x, train_y)
+
+        # Define distributions for scipy
+        bounds = np.array(self.problem['bounds'], dtype=np.float32)
+        dists = [
+            uniform(loc=b[0], scale=b[1] - b[0])
+            for b in bounds
+        ]
+
+        metamodel.eval()
+        metamodel.likelihood.eval()
+
+        def gp_mean_wrapper(x_np):
+            x_tens = torch.tensor(np.transpose(x_np), device=device, dtype=dtype)
+            with torch.no_grad():
+                output = metamodel.likelihood(metamodel(x_tens))
+                mean_pred = output.mean
+            return mean_pred.cpu().numpy().reshape(-1)
+
+        # Bootstrap storage
+        S1_boot = np.zeros((self.B, d))
+        ST_boot_norm = np.zeros((self.B, d))
+        high_boot = np.zeros((self.B, d))
+
+        for b in range(self.B):
+            result = scipy_sobol(
+                func=gp_mean_wrapper,
+                n=self.M,
+                dists=dists,
+            )
+
+            # Extract components
+            S1 = np.clip(result.first_order, 0, 1)
+            ST = np.clip(result.total_order, 0, np.inf)
+
+            norm_factor = np.sum(ST)
+            S1_boot[b] = S1
+            ST_boot_norm[b] = ST / norm_factor
+            high_boot[b] = 1 - (S1_boot[b] / ST_boot_norm[b])
+
+        # Aggregation over bootstrap
+        high_mean = high_boot.mean(axis=0)
+
+        return high_mean
+
+    def update_partition(self, interactions):
+        """
+        Partition dimensions using a greedy algorithm based on high-order interactions.
+
+        Inputs:
+        - interactions: numpy array (d,) with high-order Sobol indices.
+        Output:
+        - partitions: list of lists, each sublist contains indices belonging to a partition.
+        """
+        d = self.problem['num_vars']
+
+        # P will hold the partitions
+        P = []
+        for x in range(d):
+            if interactions[x] < self.epsilon:
+                P.append([x])
+            else:
+                if len(P) == 0:
+                    P.append([x])
+                else:
+                    P[0].append(x)
+        return P
