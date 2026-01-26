@@ -10,21 +10,71 @@ from itertools import combinations
 from matplotlib import cm
 from matplotlib.colors import Normalize
 import textwrap
+from neurostim_datasets import *
 
+# Configuration map for each dataset: budget, model file names, and optional suffix
+DATASET_CONFIG = {
+    'nhp': {
+        'budget': 96,
+        'model_names': ['ExactGP', 'AdditiveGP', 'NeuralSobolGP'],
+        'suffix': '',
+        'n_emgs': [6, 8, 4, 4],
+    },
+    'rat': {
+        'budget': 32,
+        'model_names': ['NeuralExactGP', 'NeuralAdditiveGP', 'neuralSobolGP'],
+        'suffix': '',
+        'n_emgs': [6, 7, 8, 6, 5, 8],
+    },
+    '5d_rat': {
+        'budget': 100,
+        'model_names': ['ExactGP', 'AdditiveGP', 'neuralSobolGP'],
+        'suffix': '',
+        'n_emgs': [5, 4, 4],
+    },
+    'spinal': {
+        'budget': 64,
+        'model_names': ['ExactGP', 'AdditiveGP', 'neuralSobolGP'],
+        'suffix': '_wbaseline',
+        'n_emgs': [8, 10, 10, 10, 10, 10, 10, 8, 8, 8, 8],
+    },
+}
 
-DEVICE = 'cpu'
+def get_npz_files(dataset):
+    """
+    Construct the list of npz file paths for a given dataset based on DATASET_CONFIG.
+
+    Returns:
+        List of file paths in order: [ExactGP, AdditiveGP, SobolGP]
+    """
+    config = DATASET_CONFIG[dataset]
+    budget = config['budget']
+    model_names = config['model_names']
+    suffix = config['suffix']
+
+    base_dir = f'./output/neurostim_experiments/{dataset}'
+    npz_files = []
+    for model in model_names:
+        filename = f'{dataset}_{model}_budget{budget}_20reps{suffix}.npz'
+        npz_files.append(os.path.join(base_dir, filename))
+
+    return npz_files
 
 def load_results(filepath):
 
     data = np.load(filepath, allow_pickle=True)
     return data
 
-def plot_kappas(npz_files, dataset, show=True):
+def plot_kappas(dataset, show=True):
     """
-    Plot exploration (PP) and exploitation (PP_t) curves for each model/file in npz_files.
-    - npz_files: list of filepaths (expected order: ExactGP, AdditiveGP, SobolGP, MHGP).
-    - model_names: optional list of labels for legend (defaults to file basenames).
+    Plot exploration (PP) and exploitation (PP_t) curves for each model in the dataset.
+
+    Parameters:
+    - dataset: str, one of 'nhp', 'rat', '5d_rat', 'spinal'
     - show: whether to plt.show() at the end (useful=interactive). Always saves.
+
+    Files are automatically loaded from:
+        ./output/neurostim_experiments/{dataset}/{dataset}_{model}_budget{budget}_20reps{suffix}.npz
 
     Each npz is expected to contain at least:
       - PP      : ndarray (e.g. (nSubjects, nEmgs, n_kappas, nRep, MaxQueries)) or similar
@@ -32,21 +82,18 @@ def plot_kappas(npz_files, dataset, show=True):
       - kappas or kappa_vals or kappas_vals : 1D array of kappa values (length n_kappas)
 
     The function will average PP and PP_t across all axes except the kappa axis and the time axis
-    (time axis is assumed to be the last axis).E
+    (time axis is assumed to be the last axis).
     """
+    # Get file paths from config
+    npz_files = get_npz_files(dataset)
+    config = DATASET_CONFIG[dataset]
+    emg_map = config['n_emgs']
 
-    # colors for models in order: ExactGP, AdditiveGP, SobolGP, MHGP
-    default_colors = ['red', 'blue', 'green']
+    # colors for models in order: ExactGP, AdditiveGP, SobolGP
     model_names = ['ExactGP', 'AdditiveGP', 'SobolGP']
     cmap_list = [cm.tab10, cm.tab10, cm.tab10, cm.tab10]
-    emg_map = {
-        'nhp': [6, 8, 4, 4],
-        'rat': [6, 7, 8, 6, 5, 8],
-        '5d_rat': [1, 1, 1, 1],
-        'spinal': [8, 10, 10, 10, 10, 10, 10, 8, 8, 8, 8]
-    }
 
-    n = np.sum(emg_map[dataset])
+    n = np.sum(emg_map)
 
     # Prepare save dir
     save_dir=f'output/neurostim_experiments/{dataset}'
@@ -82,9 +129,9 @@ def plot_kappas(npz_files, dataset, show=True):
 
         for k_i in range(n_kappas):
             jj=0
-            for s_i in range(len(emg_map[dataset])):
+            for s_i in range(len(emg_map)):
 
-                for muscle in range(emg_map[dataset][s_i]):
+                for muscle in range(emg_map[s_i]):
 
                     explorations[k_i, jj, :] = np.mean(PP[s_i, muscle, k_i], axis=0)
                     exploitations[k_i, jj, :] = np.mean(PP_t[s_i, muscle, k_i], axis=0)
@@ -115,42 +162,60 @@ def plot_kappas(npz_files, dataset, show=True):
         plt.show()
     plt.close(fig)
 
-def optimization_metrics(data_exactgp, data_additivegp, data_sobolgp, kappas, dataset='nhp'):
+def optimization_metrics(kappas, dataset='nhp'):
     """
-    Plot mean PP_t and PP across subjects for two datafiles.
-    
+    Plot mean PP_t and PP across subjects for three models (ExactGP, AdditiveGP, SobolGP).
+
     Exploration (PP_t) will be filled, exploitation (PP) will be dotted.
-    
+
     Parameters:
-    - data1: first dataset dict (contains 'PP_t' and 'PP' arrays)
-    - data2: second dataset dict (contains 'PP_t' and 'PP' arrays)
-    - kappa: exploration-exploitation tradeoff parameter
-    - k_i: index for k_i dimension
+    - kappas: list of 3 kappa indices, one for each model [ExactGP_idx, AdditiveGP_idx, SobolGP_idx]
+    - dataset: str, one of 'nhp', 'rat', '5d_rat', 'spinal'
+
+    Files are automatically loaded from:
+        ./output/neurostim_experiments/{dataset}/{dataset}_{model}_budget{budget}_20reps{suffix}.npz
     """
-    datafiles = [data_exactgp, data_additivegp, data_sobolgp]
+    # Load data files automatically
+    npz_files = get_npz_files(dataset)
+    datafiles = [load_results(f) for f in npz_files]
     colors = ['red', 'blue', 'green']
     labels = ['ExactGP', 'AdditiveGP', 'SobolGP']
     
     fig, ax = plt.subplots(figsize=(10, 8))
 
     global_min = 1.0
-    
+    config = DATASET_CONFIG[dataset]
+    emg_map = config['n_emgs']
+
     # ---------- Figure 1: Exploration & Exploitation ----------
     for idx, data in enumerate(datafiles):
-        PP_t = data['PP_t']  # Shape: (n_subjects, ..., iterations, ...)
+        PP_t = data['PP_t']  # Shape: (n_subjects, n_emgs, n_kappas, n_reps, iterations)
         PP = data['PP']
 
-        n_subjects = PP_t.shape[0]
-        # Compute mean and std across subjects and repeats
+        n_iters = PP.shape[-1]
+        n_reps = PP.shape[3]
+        n_total_emgs = np.sum(emg_map)
 
-        mean_PP_t = PP_t[:, 0, kappas[idx], :, :].mean(axis=(0, 1))
-        std_PP_t = PP_t[:, 0, kappas[idx], :, :].std(axis=(0, 1))
-        
-        mean_PP = PP[:, 0, kappas[idx], :, :].mean(axis=(0, 1))
-        std_PP = PP[:, 0, kappas[idx], :, :].std(axis=(0, 1))
-        
+        # Collect valid entries only (matching plot_kappas logic)
+        explorations = np.zeros((n_total_emgs, n_reps, n_iters))
+        exploitations = np.zeros((n_total_emgs, n_reps, n_iters))
+
+        jj = 0
+        for s_i in range(len(emg_map)):
+            for muscle in range(emg_map[s_i]):
+                explorations[jj] = PP[s_i, muscle, kappas[idx]]
+                exploitations[jj] = PP_t[s_i, muscle, kappas[idx]]
+                jj += 1
+
+        # Compute mean and std across valid EMGs and repeats
+        mean_PP = explorations.mean(axis=(0, 1))
+        std_PP = explorations.std(axis=(0, 1))
+
+        mean_PP_t = exploitations.mean(axis=(0, 1))
+        std_PP_t = exploitations.std(axis=(0, 1))
+
         # 95% confidence interval
-        n_samples = n_subjects * PP_t.shape[3]
+        n_samples = n_total_emgs * n_reps
         conf_interval_PP_t = 1.96 * std_PP_t / np.sqrt(n_samples)
         conf_interval_PP = 1.96 * std_PP / np.sqrt(n_samples)
         
@@ -187,17 +252,29 @@ def optimization_metrics(data_exactgp, data_additivegp, data_sobolgp, kappas, da
 
     # ---------- Figure 2: Regrets ----------
     fig2, ax2 = plt.subplots(figsize=(10, 5))
-    
+
     for idx, data in enumerate(datafiles):
 
-        regret = data['REGRETS']  # Shape: (n_subjects, ..., iterations, ...)
+        regret = data['REGRETS']  # Shape: (n_subjects, n_emgs, n_kappas, n_reps, iterations)
 
-        mean_regret = regret[:, 0, kappas[idx], :, :].mean(axis=(0, 1))
-        std_regret = regret[:, 0, kappas[idx], :, :].std(axis=(0, 1))
-        
-        
+        n_iters = regret.shape[-1]
+        n_reps = regret.shape[3]
+        n_total_emgs = np.sum(emg_map)
+
+        # Collect valid entries only (matching plot_kappas logic)
+        regrets_valid = np.zeros((n_total_emgs, n_reps, n_iters))
+
+        jj = 0
+        for s_i in range(len(emg_map)):
+            for muscle in range(emg_map[s_i]):
+                regrets_valid[jj] = regret[s_i, muscle, kappas[idx]]
+                jj += 1
+
+        mean_regret = regrets_valid.mean(axis=(0, 1))
+        std_regret = regrets_valid.std(axis=(0, 1))
+
         # 95% confidence interval
-        n_samples = n_subjects * regret.shape[3]
+        n_samples = n_total_emgs * n_reps
         conf_interval_regret = 1.96 * std_regret / np.sqrt(n_samples)
         
         x_values = np.arange(mean_regret.shape[0])
@@ -552,89 +629,18 @@ def partition_metrics(data, dataset_type, subject_idx, kappa_idx=2, figsize_per_
     fig.savefig(outpath)
     plt.close(fig)
 
-def set_experiment(dataset_type):
-
-    options = {}
-    if dataset_type == 'nhp':
-        options['noise_min']= 0.009 #Non-zero to avoid numerical instability
-        options['kappa']=7
-        options['rho_high']=3.0
-        options['rho_low']=0.1
-        options['nrnd']=1 #has to be >= 1
-        options['noise_max']=0.011
-        options['n_subjects']=4
-        options['n_queries']=96
-        options['n_emgs'] = [6, 8, 4, 4]
-        options['n_dims'] = 2
-    elif dataset_type == 'rat':
-        options['noise_min']=0.05
-        options['kappa']=3.8
-        options['rho_high']=8
-        options['rho_low']=0.001
-        options['nrnd']=1 #has to be >= 1
-        options['noise_max']=0.055
-        options['n_subjects']=6
-        options['n_queries']=32
-        options['n_emgs'] = [6, 7, 8, 6, 5, 8]
-        options['n_dims'] = 2
-    elif dataset_type == '5d_rat':
-        options['noise_min']=0.05
-        options['kappa']=3.8
-        options['rho_high']=8
-        options['rho_low']=0.001
-        options['nrnd']=1 #has to be >= 1
-        options['noise_max']=0.055
-        options['n_subjects']=3
-        options['n_queries']= 100
-        options['n_emgs'] = [5, 4, 4]
-        options['n_dims'] = 5
-    elif dataset_type == 'spinal':
-        options['noise_min']=0.05
-        options['kappa']=3.8
-        options['rho_high']=8
-        options['rho_low']=0.001
-        options['nrnd']=1 #has to be >= 1
-        options['noise_max']=0.055
-        options['n_subjects']=11
-        options['n_queries']=64
-        options['n_emgs'] = [8, 10, 10, 10, 10, 10, 10, 8, 8, 8, 8]
-        options['n_dims'] = 2
-    
-    options['device'] = DEVICE
-    options['n_reps'] = 20
-    options['n_rnd'] = 1
-
-    return options
 
 
+if __name__ == '__main__':
 
-if __name__ == '__main__': 
 
-    files_rat = ['./output/neurostim_experiments/rat/rat_ExactGP_budget32_20reps.npz', #'./output/neurostim_experiments/rat/rat_ExactGP_budget32_20reps.npz',
-             './output/neurostim_experiments/rat/rat_AdditiveGP_budget32_20reps.npz',
-             './output/neurostim_experiments/rat/rat_neuralSobolGP_budget32_20reps.npz',
-    ]
+    # Plot optimization metrics for rat dataset
+    optimization_metrics(kappas=[2, 3, -1], dataset='rat')
 
-    files_nhp = ['./output/neurostim_experiments/nhp/nhp_ExactGP_budget96_20reps.npz',
-             './output/neurostim_experiments/nhp/nhp_AdditiveGP_budget96_20reps.npz',
-             './output/neurostim_experiments/nhp/nhp_NeuralSobolGP_budget96_20reps.npz',
-    ]
+    # Plot kappa comparison
+    #plot_kappas(dataset='rat')
 
-    files_5d_rat = ['./output/neurostim_experiments/5d_rat/5d_rat_ExactGP_budget100_20reps.npz',
-            './output/neurostim_experiments/5d_rat/5d_rat_AdditiveGP_budget100_20reps.npz',
-            './output/neurostim_experiments/5d_rat/5d_rat_neuralSobolGP_budget100_20reps.npz',
-    ]
-
-    files_spinal = ['./output/neurostim_experiments/spinal/spinal_ExactGP_budget64_20reps_wbaseline.npz',
-            './output/neurostim_experiments/spinal/spinal_AdditiveGP_budget64_20reps_wbaseline.npz',
-            './output/neurostim_experiments/spinal/spinal_neuralSobolGP_budget64_20reps_wbaseline.npz',
-            ]
-
-    d_simple = load_results(files_nhp[0])
-    d_additive = load_results(files_nhp[1])
-    d_sobol = load_results(files_nhp[2])
-
-    optimization_metrics(d_simple, d_additive, d_sobol, kappas=[-2, -2, 0], dataset='nhp')
-    
-    #partition_metrics(d_sobol, 'spinal', 8, -1)
-    #plot_kappas(files_spinal, 'spinal')
+    # Partition metrics (still requires loading data manually for SobolGP file)
+    # npz_files = get_npz_files('spinal')
+    # d_sobol = load_results(npz_files[2])
+    # partition_metrics(d_sobol, 'spinal', 8, -1)

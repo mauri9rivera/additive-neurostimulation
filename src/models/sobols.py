@@ -67,7 +67,7 @@ class Sobol:
       update_partition(interactions) -> partition (list of list of dims)
     """
 
-    def __init__(self, f_obj, t, method='scipy', M=2048, B=4):
+    def __init__(self, f_obj, method='scipy', M=1024, B=4):
         """
         f_obj: SyntheticTestFun object for the test function to optimize
         epsilon: threshold for high-order sobol interactions
@@ -684,7 +684,7 @@ class NeuralSobol:
       update_partition(interactions) -> partition (list of list of dims)
     """
 
-    def __init__(self, dataset_type, M=2048, B=4):
+    def __init__(self, dataset_type, M=1024, B=4):
         """
         Args:
             dataset_type: string ('5d_rat', 'nhp', 'rat', 'spinal')
@@ -730,10 +730,6 @@ class NeuralSobol:
         self.device = torch.device(device)
         return self
 
-    def update_eps(self, t):
-        """Update epsilon threshold based on iteration count."""
-        self.epsilon = np.clip(0.08 * (0.998 ** t), 0.05, 0.08)
-
     def interactions_scipy(self, train_x, train_y, metamodel):
         """
         Calculate higher-order Sobol indices using GP metamodel and scipy's machinery.
@@ -758,7 +754,7 @@ class NeuralSobol:
         dtype = train_x.dtype
 
         # Train the metamodel
-        metamodel, metamodel.likelihood, _ = optimize(metamodel, train_x, train_y)
+        metamodel, metamodel.likelihood, _ = optimize(metamodel, train_x, train_y, lr=0.1)
 
         # Define distributions for scipy
         bounds = np.array(self.problem['bounds'], dtype=np.float32)

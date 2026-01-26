@@ -700,7 +700,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
     # --- 1) Get True Sobol Interactions (Variable-wise) ---
     sobols = sobol_sensitivity(f_obj, n_samples=20000) 
     norm_factor = np.sum(sobols['ST'])
-    sobols = np.asarray(1 - (np.clip(sobols['S1'], 0.0, 1.0) / np.clip(sobols['ST'], 0.0, 1.0)) )
+    sobols = np.asarray(1 - (np.clip(sobols['S1'], 0.0, 1.0) / np.clip(sobols['ST']/norm_factor, 0.0, 1.0)) )
     #sobols = np.nan_to_num(np.asarray( 1 - (np.clip(sobols['S1'], 0.0, 1.0) / np.clip(sobols['ST'], 0.0, 1.0)), dtype=float)).flatten()
     d = f_obj.d
     plt.figure(figsize=(9, 5))
@@ -726,7 +726,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
         surrogate_mean = []
         for surrogate_sobol_trace in metrics['SobolGP']['surrogate_sobols']:
             
-            trace_per_dim = [1.0] * f_obj.d*3 # Init assumption
+            trace_per_dim = [0.0] * f_obj.d*3 # Init assumption
             
             for t_step in range(len(surrogate_sobol_trace)):
 
