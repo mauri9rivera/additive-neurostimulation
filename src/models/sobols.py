@@ -249,7 +249,7 @@ class Sobol:
         """
 
         #problem vars
-        self.update_eps(train_x.shape[0])
+        #self.update_eps(train_x.shape[0])
         d = self.problem['num_vars']
         self.NZ = train_x.shape[0]
         
@@ -746,7 +746,6 @@ class NeuralSobol:
         from scipy.stats import uniform
 
         # Update epsilon based on sample count
-        self.update_eps(train_x.shape[0])
         d = self.problem['num_vars']
 
         # Tensor converters

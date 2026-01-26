@@ -10,6 +10,7 @@ import time
 import scipy.io
 import pickle
 import math
+import gc
 
 from SALib.analyze import sobol as salib_sobol
 from SALib.sample import sobol as sobol_sampler
@@ -164,7 +165,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
         subject['ch2xy'] = torch.tensor(subject['ch2xy'], device=device)
 
         # "Ground truth" map
-        MPm = torch.tensor(subject['sorted_respMean'][:, emg_idx]).float()
+        MPm = torch.tensor(subject['sorted_respMean'][:, emg_idx], device=device).float()
         # Best known channel
         mMPm = torch.max(MPm)
 
@@ -253,7 +254,8 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
             # Model training
             model.train()
             likf.train()
-            model, likf, _ = optimize(model, x, y, lr=0.1)
+            model.to(device), likf.to(device)
+            model, likf, _ = optimize(model, x.to(device), y.to(device), lr=0.1)
 
             # Model evaluation
             model.eval()
@@ -270,7 +272,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
             BestQuery = Tested if len(Tested) == 1 else Tested[
                 (MapPredictionTested == torch.max(MapPredictionTested)).reshape(len(MapPredictionTested))]
             if len(BestQuery) > 1:
-                BestQuery = np.array([BestQuery[np.random.randint(len(BestQuery))]])
+                BestQuery = np.array([BestQuery[np.random.randint(len(BestQuery))].cpu()])
 
             # Store metrics
             P_max.append(BestQuery[0])
@@ -292,8 +294,8 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
                 sobol_interactions[q] = interactions.copy()
 
                 if (space_reconfiguration is None or space_reconfiguration.done()) and (q > (MaxQueries // 4)):
-                    surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_prior=prior_lik)
-                    surrogate = NeuralExactGP(x, y, surrogate_likelihood, priorbox, outputscale_priorbox)
+                    surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood(noise_prior=prior_lik).to(device)
+                    surrogate = NeuralExactGP(x, y, surrogate_likelihood, priorbox, outputscale_priorbox).to(device)
                     space_reconfiguration = executor.submit(sobol.method, x, y, surrogate)
 
             # computation time calculations
@@ -303,8 +305,6 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
             train_time[q] = elapsed
             cum_time[q] = timer
             q += 1
-
-        executor.shutdown(wait=False)
 
         # estimate current exploration performance
         perf_explore = (MPm[P_max].reshape((len(MPm[P_max]))) / mMPm).cpu().numpy()
@@ -318,6 +318,25 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
         ss_tot = torch.sum((y_true - torch.mean(y_true)) ** 2)
         r_squared = (1 - (ss_res / ss_tot)).item()
 
+        model_name = model.name
+
+        # Storage Cleanup
+        executor.shutdown(wait=True)
+        del model
+        del likf
+        del observed_pred
+        del ymu
+        del ys2
+        del X_test
+        del subject 
+        del MPm
+        
+        if 'cuda' in str(device):
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+
+        gc.collect()
+
         return {
             'indices': (subject_idx, emg_idx, kappa_idx, rep_idx),
             'perf_explore': perf_explore,
@@ -327,7 +346,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
             'sobol_interactions': sobol_interactions,
             'train_time': train_time,
             'cum_time': cum_time,
-            'model_name': model.name if model else 'Unknown'
+            'model_name': model_name
         }
 
     except Exception as e:
@@ -523,5 +542,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    main()
-    #neurostim_bo('nhp', NeuralSobolGP, kappas=[3.0], devices=['cpu', 'cuda:0', 'cuda:1'] )
+    #main()
+    neurostim_bo('nhp', NeuralSobolGP, kappas=[1.0, 3.0], devices=['cpu', 'cuda:0', 'cuda:1'] )
