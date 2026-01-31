@@ -67,7 +67,7 @@ class Sobol:
       update_partition(interactions) -> partition (list of list of dims)
     """
 
-    def __init__(self, f_obj, method='scipy', M=1024, B=4):
+    def __init__(self, f_obj, method='scipy', M=2048, B=1):
         """
         f_obj: SyntheticTestFun object for the test function to optimize
         epsilon: threshold for high-order sobol interactions
@@ -684,7 +684,7 @@ class NeuralSobol:
       update_partition(interactions) -> partition (list of list of dims)
     """
 
-    def __init__(self, dataset_type, M=1024, B=4):
+    def __init__(self, dataset_type, M=2048, B=1):
         """
         Args:
             dataset_type: string ('5d_rat', 'nhp', 'rat', 'spinal')

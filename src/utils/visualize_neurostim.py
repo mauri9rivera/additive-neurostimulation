@@ -16,7 +16,7 @@ from neurostim_datasets import *
 DATASET_CONFIG = {
     'nhp': {
         'budget': 96,
-        'model_names': ['ExactGP', 'AdditiveGP', 'NeuralSobolGP'],
+        'model_names': ['ExactGP', 'NeuralAdditiveGP', 'NeuralSobolGP'],
         'suffix': '',
         'n_emgs': [6, 8, 4, 4],
     },
@@ -28,14 +28,14 @@ DATASET_CONFIG = {
     },
     '5d_rat': {
         'budget': 100,
-        'model_names': ['ExactGP', 'AdditiveGP', 'neuralSobolGP'],
+        'model_names': ['NeuralExactGP', 'NeuralAdditiveGP', 'neuralSobolGP'],
         'suffix': '',
-        'n_emgs': [5, 4, 4],
+        'n_emgs': [4] #, 4] #TODO: Change this when analysis done [5, 4, 4],
     },
     'spinal': {
         'budget': 64,
-        'model_names': ['ExactGP', 'AdditiveGP', 'neuralSobolGP'],
-        'suffix': '_wbaseline',
+        'model_names': ['neuralExactGP', 'neuralAdditiveGP', 'neuralSobolGP'],
+        'suffix': '',
         'n_emgs': [8, 10, 10, 10, 10, 10, 10, 8, 8, 8, 8],
     },
 }
@@ -55,7 +55,7 @@ def get_npz_files(dataset):
     base_dir = f'./output/neurostim_experiments/{dataset}'
     npz_files = []
     for model in model_names:
-        filename = f'{dataset}_{model}_budget{budget}_20reps{suffix}.npz'
+        filename = f'{dataset}_{model}_budget{budget}_20reps.npz'
         npz_files.append(os.path.join(base_dir, filename))
 
     return npz_files
@@ -223,11 +223,12 @@ def optimization_metrics(kappas, dataset='nhp'):
 
         k = data['kappas'][kappas[idx]]
         
-        # Plot exploration as dotted line
+        best_exploration = mean_PP[-1]
+        # Plot exploration as line
         ax.plot(x_values, mean_PP, color=colors[idx], linestyle='-', label=f'Exploration ({labels[idx]}) | kappa {k}')
         ax.fill_between(x_values, mean_PP - conf_interval_PP, mean_PP + conf_interval_PP, color=colors[idx], alpha=0.15)
         
-        # Plot exploitation as filled area
+        # Plot exploitation as dotted line
         ax.plot(x_values, mean_PP_t, color=colors[idx], linestyle='--')
         #ax.fill_between(x_values, mean_PP_t - conf_interval_PP_t, mean_PP_t + conf_interval_PP_t, color=colors[idx], alpha=0.3)
 
@@ -635,10 +636,10 @@ if __name__ == '__main__':
 
 
     # Plot optimization metrics for rat dataset
-    optimization_metrics(kappas=[2, 3, -1], dataset='rat')
+    optimization_metrics(kappas=[2, -1, -1], dataset='5d_rat')
 
     # Plot kappa comparison
-    #plot_kappas(dataset='rat')
+    #plot_kappas(dataset='5d_rat')
 
     # Partition metrics (still requires loading data manually for SobolGP file)
     # npz_files = get_npz_files('spinal')

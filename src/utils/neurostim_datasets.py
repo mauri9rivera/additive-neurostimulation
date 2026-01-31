@@ -91,9 +91,9 @@ def set_experiment(dataset_type):
         options['rho_low']=0.001
         options['nrnd']=1 #has to be >= 1
         options['noise_max']=0.055
-        options['n_subjects']=3
+        options['n_subjects']= 2 #TODO after analysis 3
         options['n_queries']= 100
-        options['n_emgs'] = [5, 4, 4]
+        options['n_emgs'] = [4, 4] #TODO after analysis [4, 4, 5]
         options['n_dims'] = 5
     elif dataset_type == 'spinal':
         options['noise_min']=0.05
@@ -112,263 +112,7 @@ def set_experiment(dataset_type):
 
     return options
 
-def load_data(dataset_type, m_i, device='cpu'):
-
-    path_to_dataset = f'./datasets/{dataset_type}'
-    device = torch.device(device)
-
-    if dataset_type == '5d_rat':
-
-        emg_map = {
-            0: np.array(['extensor carpi radialis']),
-            1: np.array(['flexor carpi ulnaris']),
-            2: np.array(['triceps']),
-            3: np.array(['biceps']),
-            4: np.array(['extensor carpi radialis']),
-            5: np.array(['flexor carpi ulnaris']),
-
-        }
-        match m_i:
-            case 0 | 1 | 2 | 3:
-
-                data = scipy.io.loadmat(f'{path_to_dataset}/rData03_230724_4x4x3x32x8_ar.mat')['Data']
-                resp = data[0][0][0]
-                param = data[0][0][1]
-                ch2xy = param[:, [0,1,2,5,6]]
-                peak_resp = torch.from_numpy(resp).float().to(device)
-                ch2xy = torch.from_numpy(ch2xy).float().to(device)
-
-                subjet = {
-                    'emgs': emg_map[m_i],
-                    'nChan': 32,
-                    'sorted_respMean': peak_resp,
-                    'ch2xy': ch2xy,
-                    'dim_sizes': np.array([8, 4, 3, 4, 4]),
-                    'DimSearchSpace': np.prod([8, 4, 3, 4, 4])
-                }
-            case 4 | 5:
-
-                data = scipy.io.loadmat(f'{path_to_dataset}/5D_step4.mat')
-                resp = data['emg_response']
-                param = data['stim_combinations']
-                ch2xy = torch.from_numpy(param[:, [0,1,2,5,6]])
-                peak_resp = torch.from_numpy(resp[:, :, :, 0]).float().to(device)
-
-                subjet = {
-                    'emgs': emg_map[m_i],
-                    'nChan': 32,
-                    'sorted_respMean': peak_resp,
-                    'ch2xy': ch2xy,
-                    'dim_sizes': np.array([8, 4, 4, 4, 4]),
-                    'DimSearchSpace': np.prod([8, 4, 4, 4, 4])
-                }
-
-        return subjet
-    elif dataset_type=='nhp': # nhp dataset has 4 subjects
-        if m_i==0:
-            Cebus1_M1_190221 = scipy.io.loadmat(path_to_dataset+'/Cebus1_M1_190221.mat')
-            Cebus1_M1_190221= {'emgs': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][0][0],
-           'nChan': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][2][0][0],
-           'sorted_isvalid': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][8],
-           'sorted_resp': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][9],
-           'sorted_respMean': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][10],
-           'ch2xy': Cebus1_M1_190221['Cebus1_M1_190221'][0][0][16],
-           'DimSearchSpace': 96},
-            SET=Cebus1_M1_190221[0]
-        if m_i==1:
-            Cebus2_M1_200123 = scipy.io.loadmat(path_to_dataset+'/Cebus2_M1_200123.mat')  
-            Cebus2_M1_200123= {'emgs': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][0][0],
-           'nChan': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][2][0][0],
-           'sorted_isvalid': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][8],
-           'sorted_resp': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][9],
-           'sorted_respMean': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][10],
-           'ch2xy': Cebus2_M1_200123['Cebus2_M1_200123'][0][0][16],
-           'DimSearchSpace': 96}
-            SET=Cebus2_M1_200123
-        if m_i==2:    
-            Macaque1_M1_181212 = scipy.io.loadmat(path_to_dataset+'/Macaque1_M1_181212.mat')
-            Macaque1_M1_181212= {'emgs': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][0][0],
-           'nChan': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][2][0][0],
-           'sorted_isvalid': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][8],
-           'sorted_resp': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][9],              
-           'sorted_respMean': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][15],
-           'ch2xy': Macaque1_M1_181212['Macaque1_M1_181212'][0][0][14],
-           'DimSearchSpace': 96}            
-            SET=Macaque1_M1_181212
-        if m_i==3:    
-            Macaque2_M1_190527 = scipy.io.loadmat(path_to_dataset+'/Macaque2_M1_190527.mat')
-            Macaque2_M1_190527= {'emgs': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][0][0],
-           'nChan': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][2][0][0],
-           'sorted_isvalid': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][8],
-           'sorted_resp': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][9],              
-           'sorted_respMean': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][15],
-           'ch2xy': Macaque2_M1_190527['Macaque2_M1_190527'][0][0][14],
-           'DimSearchSpace': 96}
-            SET=Macaque2_M1_190527
-        return SET
-    elif dataset_type=='rat':  # rat dataset has 6 subjects
-        if m_i==0:
-            rat1_M1_190716 = scipy.io.loadmat(path_to_dataset+'/rat1_M1_190716.mat')
-            rat1_M1_190716= {'emgs': rat1_M1_190716['rat1_M1_190716'][0][0][0][0],
-           'nChan': rat1_M1_190716['rat1_M1_190716'][0][0][2][0][0],
-           'sorted_isvalid': rat1_M1_190716['rat1_M1_190716'][0][0][8],
-           'sorted_resp': rat1_M1_190716['rat1_M1_190716'][0][0][9],              
-           'sorted_respMean': rat1_M1_190716['rat1_M1_190716'][0][0][15],
-           'ch2xy': rat1_M1_190716['rat1_M1_190716'][0][0][14],
-           'DimSearchSpace': 32}            
-            return rat1_M1_190716
-        if m_i==1:
-            rat2_M1_190617 = scipy.io.loadmat(path_to_dataset+'/rat2_M1_190617.mat')
-            rat2_M1_190617= {'emgs': rat2_M1_190617['rat2_M1_190617'][0][0][0][0],
-           'nChan': rat2_M1_190617['rat2_M1_190617'][0][0][2][0][0],
-           'sorted_isvalid': rat2_M1_190617['rat2_M1_190617'][0][0][8],
-           'sorted_resp': rat2_M1_190617['rat2_M1_190617'][0][0][9],              
-           'sorted_respMean': rat2_M1_190617['rat2_M1_190617'][0][0][15],
-           'ch2xy': rat2_M1_190617['rat2_M1_190617'][0][0][14],
-           'DimSearchSpace': 32}         
-            return rat2_M1_190617          
-        if m_i==2:
-            rat3_M1_190728 = scipy.io.loadmat(path_to_dataset+'/rat3_M1_190728.mat')
-            rat3_M1_190728= {'emgs': rat3_M1_190728['rat3_M1_190728'][0][0][0][0],
-           'nChan': rat3_M1_190728['rat3_M1_190728'][0][0][2][0][0],
-           'sorted_isvalid': rat3_M1_190728['rat3_M1_190728'][0][0][8],
-           'sorted_resp': rat3_M1_190728['rat3_M1_190728'][0][0][9],              
-           'sorted_respMean': rat3_M1_190728['rat3_M1_190728'][0][0][15],
-           'ch2xy': rat3_M1_190728['rat3_M1_190728'][0][0][14],
-           'DimSearchSpace': 32}           
-            return rat3_M1_190728                       
-        if m_i==3:
-            rat4_M1_191109 = scipy.io.loadmat(path_to_dataset+'/rat4_M1_191109.mat')
-            rat4_M1_191109= {'emgs': rat4_M1_191109['rat4_M1_191109'][0][0][0][0],
-           'nChan': rat4_M1_191109['rat4_M1_191109'][0][0][2][0][0],
-           'sorted_isvalid': rat4_M1_191109['rat4_M1_191109'][0][0][8],
-           'sorted_resp': rat4_M1_191109['rat4_M1_191109'][0][0][9],              
-           'sorted_respMean': rat4_M1_191109['rat4_M1_191109'][0][0][15],
-           'ch2xy': rat4_M1_191109['rat4_M1_191109'][0][0][14],
-           'DimSearchSpace': 32}            
-            return rat4_M1_191109                       
-        if m_i==4:
-            rat5_M1_191112 = scipy.io.loadmat(path_to_dataset+'/rat5_M1_191112.mat')
-            rat5_M1_191112= {'emgs': rat5_M1_191112['rat5_M1_191112'][0][0][0][0],
-           'nChan': rat5_M1_191112['rat5_M1_191112'][0][0][2][0][0],
-           'sorted_isvalid': rat5_M1_191112['rat5_M1_191112'][0][0][8],
-           'sorted_resp': rat5_M1_191112['rat5_M1_191112'][0][0][9],              
-           'sorted_respMean': rat5_M1_191112['rat5_M1_191112'][0][0][15],
-           'ch2xy': rat5_M1_191112['rat5_M1_191112'][0][0][14],
-           'DimSearchSpace': 32}
-                       
-            return rat5_M1_191112                      
-        if m_i==5:
-            rat6_M1_200218 = scipy.io.loadmat(path_to_dataset+'/rat6_M1_200218.mat')        
-            rat6_M1_200218= {'emgs': rat6_M1_200218['rat6_M1_200218'][0][0][0][0],
-           'nChan': rat6_M1_200218['rat6_M1_200218'][0][0][2][0][0],
-           'sorted_isvalid': rat6_M1_200218['rat6_M1_200218'][0][0][8],
-           'sorted_resp': rat6_M1_200218['rat6_M1_200218'][0][0][9],              
-           'sorted_respMean': rat6_M1_200218['rat6_M1_200218'][0][0][15],
-           'ch2xy': rat6_M1_200218['rat6_M1_200218'][0][0][14],
-           'DimSearchSpace': 32}          
-            return rat6_M1_200218               
-    elif dataset_type=='spinal':
-        
-        specific_subject = None
-        match m_i:
-            case 0:
-                specific_subject = 'rat0_C5_500uA.pkl'
-            case 1:
-                specific_subject = 'rat1_C5_500uA.pkl'
-            case 2:
-                specific_subject = 'rat1_C5_700uA.pkl'
-            case 3:
-                specific_subject = 'rat1_midC4_500uA.pkl'
-            case 4:
-                specific_subject = 'rat2_C4_300uA.pkl'
-            case 5:
-                specific_subject = 'rat2_C5_300uA.pkl'
-            case 6:
-                specific_subject = 'rat2_C6_300uA.pkl'
-            case 7:
-                specific_subject = 'rat3_C4_300uA.pkl'
-            case 8:
-                specific_subject = 'rat3_C5_200uA.pkl'
-            case 9:
-                specific_subject = 'rat3_C5_350uA.pkl'
-            case 10:
-                specific_subject = 'rat3_C6_300uA.pkl'
-        
-         #load data
-        with open(path_to_dataset + specific_subject, "rb") as f:
-            data = pickle.load(f)
-        
-        ch2xy, emgs = data['ch2xy'], data['emgs']
-        evoked_emg, filtered_emg = data['evoked_emg'], data['filtered_emg']
-        maps = data['map']
-        parameters = data['parameters']
-        resp_region = data['resp_region']
-        response = data['reponse']
-        fs = data['sampFreqEMG']
-        sorted_evoked = data['sorted_evoked']
-        sorted_filtered = data['sorted_filtered']
-        sorted_resp = data['sorted_resp']
-        sorted_isvalid = data['sorted_isvalid']
-        sorted_respMean = data['sorted_respMean']
-        sorted_respSD = data['sorted_resp_SD']
-        stim_channel = data['stim_channel']
-        stimProfile=data['stimProfile']
-        n_muscles = emgs.shape[0]
-
-        #Computing baseline for filtered signal
-        nChan = parameters['nChan'][0]
-        where_zero = np.where(abs(stimProfile) > 10**(-50))[0][0]
-        window_size = int(fs * 35 * 10**(-3))
-        baseline = []
-        for iChan in nChan:
-            reps = np.where(stim_channel == iChan + 1)[0]
-            n_rep = len(reps)
-            mean_baseline = np.mean(sorted_filtered[iChan, :, :n_rep, 0 : where_zero], axis=-1)
-            baseline.append(mean_baseline)
-        baseline = np.stack(baseline, axis=0)
-
-        #remove baseline from filtered signal
-        sorted_filtered[:, :, :n_rep, :] = sorted_filtered[:, :, :n_rep, :] - baseline[..., np.newaxis]
-        sorted_resp = np.nanmax(sorted_filtered[:, :, :n_rep, int(resp_region[0]): int(resp_region[1])], axis=-1)
-        masked_resp = np.ma.masked_where(sorted_isvalid[:, :, :n_rep] == 0, sorted_resp)
-        sorted_respMean = masked_resp.mean(axis=-1)
-
-         # compute baseline for evoked signal
-        baseline = []
-        for iChan in range(nChan):
-            reps = np.where(stim_channel == iChan + 1)[0]
-            n_rep = len(reps)
-            # Compute mean over the last dimension (time), across those repetitions
-            mean_baseline = np.mean(sorted_evoked[iChan, :, :n_rep, 0 : where_zero], axis=-1)
-            baseline.append(mean_baseline)
-        baseline = np.stack(baseline, axis=0)  # shape: (nChan, nSamples)
-        
-        #remove baseline from evoked signal
-        sorted_evoked[:, :, :n_rep, :] = sorted_evoked[:, :, :n_rep, :] - baseline[..., np.newaxis]
-        sorted_resp = np.nanmax(sorted_evoked[:,:,:n_rep,int(resp_region[0]) :int(resp_region[1])], axis=-1)
-        masked_resp = np.ma.masked_where(sorted_isvalid[:,:,:n_rep] == 0, sorted_resp)
-
-        subject = {
-            'emgs': emgs,
-            'nChan': 64,
-            'DimSearchSpace': 64,
-            'sorted_respMean': sorted_respMean,
-            'ch2xy': ch2xy,
-            'dim_sizes': np.array([8, 4, 3, 4, 4]),
-            'evoked_emg': evoked_emg, 'filtered_emg':filtered_emg, 'sorted_resp': sorted_resp,  
-            'sorted_isvalid': sorted_isvalid, 'sorted_respSD': sorted_respSD,
-            'sorted_filtered': sorted_filtered, 'stim_channel': stim_channel, 'fs': fs,
-        'parameters': parameters, 'n_muscles': n_muscles, 'maps': maps,
-        'resp_region': resp_region, 'stimProfile': stimProfile,  'baseline' : baseline    
-        }
-        
-        return subject
-        
-    else:
-        raise ValueError('The dataset type should be 5d_rat, nhp or rat' )
-
-def load_data2(dataset_type, m_i):
+def load_data(dataset_type, m_i):
     '''
     Input: 
         - dataset_type: str characterizing the modality of the experiment
@@ -384,7 +128,7 @@ def load_data2(dataset_type, m_i):
     if dataset_type == '5d_rat':
         
         match m_i:
-            case 0:
+            case 2:
                 data = scipy.io.loadmat(f'{path_to_dataset}/BCI00_5D.mat')
                 emgs = ['left extensor carpi radialis', 'biceps', 'triceps',
                                  'left flexor carpi ulnaris', 'unknown']
@@ -394,7 +138,7 @@ def load_data2(dataset_type, m_i):
                 emgs = ['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
                                  'left biceps']
                 dim_sizes = np.array([8, 4, 4, 4, 4])
-            case 2:
+            case 0:
                 data = scipy.io.loadmat(f'{path_to_dataset}/rData03_5D.mat')
                 emgs = ['left extensor carpi radialis', 'left flexor carpi ulnaris', ' left triceps',
                                     'left pectoralis']
@@ -610,7 +354,7 @@ def load_data2(dataset_type, m_i):
         where_zero = np.where(abs(stimProfile) > 10**(-50))[0][0]
         window_size = int(fs * 35 * 10**(-3))
         baseline = []
-        n_rep = 10000 # First, determine n_reps global
+        n_rep = 10000 # Globally define n_rep cutoff
         for iChan in range(nChan):
             reps= np.where(stim_channel == iChan + 1)[0]
             if len(reps) < n_rep:

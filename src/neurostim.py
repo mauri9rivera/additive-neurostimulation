@@ -78,7 +78,7 @@ def sobol_interactions(dataset_type, surrogate='rf', N=4096):
 
     for m_i in range(options['n_subjects']):
 
-        subject = load_data2(dataset_type, m_i)
+        subject = load_data(dataset_type, m_i)
         X = subject['ch2xy'].astype(float)
 
         s1 = []
@@ -137,7 +137,7 @@ def sobol_interactions(dataset_type, surrogate='rf', N=4096):
 ### --- BO methods --- ###
 
 def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
-                          dataset, model_cls, device, options):
+                          dataset, model_cls, device, options, lr=0.1, M=1024):
     """
     Worker function for a single (subject, emg, kappa, rep) job.
 
@@ -161,7 +161,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
 
     try:
         # Load subject data inside worker to avoid serialization issues
-        subject = load_data2(dataset, subject_idx)
+        subject = load_data(dataset, subject_idx)
         subject['ch2xy'] = torch.tensor(subject['ch2xy'], device=device)
 
         # "Ground truth" map
@@ -245,7 +245,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
             if q == 0:
                 model = model_cls(x, y, likf, priorbox, outputscale_priorbox)
                 if model.name == 'NeuralSobolGP':
-                    sobol = NeuralSobol(dataset).to(device)
+                    sobol = NeuralSobol(dataset, M=M).to(device)
                     model.sobol = sobol
                     interactions = np.zeros((ndims), dtype=float)
             else:
@@ -255,7 +255,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
             model.train()
             likf.train()
             model.to(device), likf.to(device)
-            model, likf, _ = optimize(model, x.to(device), y.to(device), lr=0.1)
+            model, likf, _ = optimize(model, x.to(device), y.to(device), lr=lr)
 
             # Model evaluation
             model.eval()
@@ -354,7 +354,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
         traceback.print_exc()
         return None
 
-def neurostim_bo(dataset, model_cls, kappas, devices=['cpu']):
+def neurostim_bo(dataset, model_cls, kappas, devices=['cpu'], lr=0.1, M=2048):
     """
     Run neurostimulation Bayesian optimization across subjects, EMGs, kappas, and reps.
     Uses ProcessPoolExecutor to distribute work across multiple devices.
@@ -369,6 +369,10 @@ def neurostim_bo(dataset, model_cls, kappas, devices=['cpu']):
         UCB exploration coefficients
     devices : list of str
         List of devices for parallel execution (e.g., ['cpu'], ['cuda:0', 'cuda:1'])
+    lr : float
+        Learning rate for GP optimization (default 0.1)
+    M : int
+        Sobol MC samples (default 1024)
     """
     np.random.seed(0)
 
@@ -396,8 +400,7 @@ def neurostim_bo(dataset, model_cls, kappas, devices=['cpu']):
 
     for s_idx in range(nSubjects):
         # Load subject to get number of EMGs
-        subject = load_data2(dataset, s_idx)
-        n_emgs_this_subject = len(subject['emgs'])
+        n_emgs_this_subject = options['n_emgs'][s_idx]
 
         for k_idx, kappa in enumerate(kappas):
             for e_i in range(n_emgs_this_subject):
@@ -412,7 +415,9 @@ def neurostim_bo(dataset, model_cls, kappas, devices=['cpu']):
                         'dataset': dataset,
                         'model_cls': model_cls,
                         'device': device,
-                        'options': options
+                        'options': options,
+                        'lr': lr,
+                        'M': M,
                     })
                     job_idx += 1
 
@@ -430,7 +435,7 @@ def neurostim_bo(dataset, model_cls, kappas, devices=['cpu']):
                 PP[s, e, k, r] = result['perf_explore']
 
                 # Load subject to get MPm for exploitation conversion
-                subject = load_data2(dataset, s)
+                subject = load_data(dataset, s)
                 MPm = torch.tensor(subject['sorted_respMean'][:, e]).float()
                 mMPm = torch.max(MPm)
                 PP_t[s, e, k, r] = (MPm[result['perf_exploit'].astype(int)] / mMPm).numpy()
@@ -457,7 +462,100 @@ def neurostim_bo(dataset, model_cls, kappas, devices=['cpu']):
                         Cum_train=Cum_train)
     print(f'saved results to {results_path}')
 
-    
+    return {
+        'PP': PP, 'PP_t': PP_t, 'REGRETS': REGRETS,
+        'RSQ': RSQ, 'Train_time': Train_time, 'Cum_train': Cum_train,
+        'SOBOLS': SOBOLS, 'model_name': model_name,
+    }
+
+def lr_search(dataset, lr_list, kappa, devices=['cpu'], M=2048):
+    """
+    Run learning rate search for all 3 models (NeuralExactGP, NeuralAdditiveGP, NeuralSobolGP).
+
+    For each model and each lr, runs neurostim_bo and aggregates exploration/log-regret curves.
+    Produces a combined 3-row x 2-column plot (one row per model).
+
+    Parameters
+    ----------
+    dataset : str
+        Dataset identifier (e.g., 'nhp', 'rat')
+    lr_list : list of float
+        Learning rates to sweep
+    kappa : float
+        Single kappa for all runs
+    devices : list of str
+    M : int
+        Sobol MC samples
+    """
+    from models.gaussians import NeuralExactGP, NeuralAdditiveGP, NeuralSobolGP
+
+    model_specs = [
+        (NeuralExactGP, 'NeuralExactGP'),
+        (NeuralAdditiveGP, 'NeuralAdditiveGP'),
+        (NeuralSobolGP, 'NeuralSobolGP'),
+    ]
+
+    all_results = {}  # {model_name: {lr: {'PP': ..., 'REGRETS': ...}}}
+
+    for model_cls, model_name in model_specs:
+        all_results[model_name] = {}
+        for lr in lr_list:
+            print(f"\n--- lr_search: {model_name} lr={lr} kappa={kappa} ---")
+            res = neurostim_bo(dataset, model_cls, kappas=[kappa],
+                               devices=devices, lr=lr, M=M)
+            all_results[model_name][lr] = res
+
+    # Plotting: 3 rows (one per model), 2 columns (exploration, log-regret)
+    n_models = len(model_specs)
+    fig, axes = plt.subplots(n_models, 2, figsize=(14, 5 * n_models), squeeze=False)
+    cmap = plt.get_cmap('tab10')
+
+    for row, (model_cls, model_name) in enumerate(model_specs):
+        ax_explore = axes[row, 0]
+        ax_regret = axes[row, 1]
+
+        for idx, lr in enumerate(lr_list):
+            res = all_results[model_name][lr]
+            # PP shape: (nSubjects, max(nEmgs), len(kappas), nRep, MaxQueries)
+            # Average over subjects, emgs, kappas (dim=1), reps -> (MaxQueries,)
+            pp = res['PP']
+            regrets = res['REGRETS']
+
+            # Mean over all non-query dims: subjects(0), emgs(1), kappas(2), reps(3)
+            mean_explore = np.nanmean(pp, axis=(0, 1, 2, 3))
+            mean_regret = np.nanmean(regrets, axis=(0, 1, 2, 3))
+
+            color = cmap(idx % 10)
+            x = np.arange(len(mean_explore))
+
+            ax_explore.plot(x, mean_explore, color=color, label=f'lr={lr}')
+            ax_regret.plot(x, mean_regret, color=color, label=f'lr={lr}')
+
+        ax_explore.set_title(f'{model_name} - Exploration')
+        ax_explore.set_xlabel('Query')
+        ax_explore.set_ylabel('Exploration Score')
+        ax_explore.set_ylim(0, 1.1)
+        ax_explore.legend(loc='lower right', fontsize='small')
+        ax_explore.grid(True)
+
+        ax_regret.set_title(f'{model_name} - Log Regret')
+        ax_regret.set_xlabel('Query')
+        ax_regret.set_ylabel('Log Regret')
+        ax_regret.legend(loc='upper right', fontsize='small')
+        ax_regret.grid(True)
+
+    fig.suptitle(f'LR Search on {dataset} (kappa={kappa})', fontsize=14)
+    plt.tight_layout()
+
+    output_dir = os.path.join('output', 'neurostim_experiments', dataset)
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(output_dir, f'lr_search_{dataset}.svg')
+    plt.savefig(plot_path, format='svg')
+    plt.close(fig)
+    print(f"Saved lr_search plot to {plot_path}")
+
+    return all_results
+
 ### --- Parser handling --- ###
 
 def _parse_list_of_floats(text):
@@ -490,11 +588,20 @@ def main(argv=None):
     # Dataset selection
     parser.add_argument('--dataset', type=str, default='5d_rat', help='Neurostimulation dataset type')
 
+    # Method selection
+    parser.add_argument('--method', type=str, default='neurostim_bo',
+                        help='Method: neurostim_bo, lr_search, M_search')
+
     # Model selection
     parser.add_argument('--model_cls', type=str, default='NeuralExactGP', help='Model class name (NeuralExactGP, NeuralAdditiveGP, NeuralSobolGP)')
 
     # Method-specific params
     parser.add_argument('--kappas', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for experiments')
+    parser.add_argument('--kappa', type=float, default=None, help='Single kappa for hyperparam searches (lr_search, M_search)')
+    parser.add_argument('--lr', type=float, default=0.1, help='GP learning rate (default 0.1)')
+    parser.add_argument('--M', type=int, default=1024, help='Sobol MC samples (default 1024)')
+    parser.add_argument('--lr_list', type=_parse_list_of_floats, default=None, help='Comma-separated learning rates for lr_search')
+    parser.add_argument('--M_list', type=_parse_list_of_ints, default=None, help='Comma-separated M values for M_search')
 
     # Device selection
     parser.add_argument('--device', type=str, default='cpu', help='Device for computation (e.g., cpu, cuda:0)')
@@ -502,6 +609,7 @@ def main(argv=None):
 
     # Misc
     parser.add_argument('--list_models', action='store_true')
+    parser.add_argument('--list_methods', action='store_true')
 
     args = parser.parse_args(argv)
 
@@ -512,14 +620,29 @@ def main(argv=None):
         'NeuralSobolGP': NeuralSobolGP,
     }
 
+    method_map = {
+        'neurostim_bo': neurostim_bo,
+        'lr_search': lr_search,
+        'M_search': M_search_neurostim,
+    }
+
     if args.list_models:
         print('Available model classes:')
         for k in model_map.keys():
             print(' -', k)
         return
 
+    if args.list_methods:
+        print('Available methods:')
+        for k in method_map.keys():
+            print(' -', k)
+        return
+
     if args.model_cls not in model_map:
         raise ValueError(f"Unknown model_cls '{args.model_cls}'. Use --list_models to see options.")
+
+    if args.method not in method_map:
+        raise ValueError(f"Unknown method '{args.method}'. Use --list_methods to see options.")
 
     model_cls = model_map[args.model_cls]
 
@@ -531,7 +654,27 @@ def main(argv=None):
 
     # dispatch
     try:
-        result = neurostim_bo(args.dataset, model_cls, kappas=args.kappas, devices=device_list)
+        if args.method == 'neurostim_bo':
+            result = neurostim_bo(args.dataset, model_cls, kappas=args.kappas,
+                                  devices=device_list, lr=args.lr, M=args.M)
+
+        elif args.method == 'lr_search':
+            if args.kappa is None:
+                raise ValueError('--kappa must be provided for lr_search')
+            lr_list_val = args.lr_list or [0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
+            result = lr_search(args.dataset, lr_list_val, kappa=args.kappa,
+                               devices=device_list, M=args.M)
+
+        elif args.method == 'M_search':
+            if args.kappa is None:
+                raise ValueError('--kappa must be provided for M_search')
+            m_list_val = args.M_list or [256, 512, 1024, 2048]
+            result = M_search_neurostim(args.dataset, m_list_val, kappa=args.kappa,
+                                        devices=device_list, lr=args.lr)
+
+        else:
+            raise ValueError(f'Unsupported method: {args.method}')
+
         print('Completed')
 
     except Exception as e:
@@ -542,5 +685,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    #main()
-    neurostim_bo('nhp', NeuralSobolGP, kappas=[1.0, 3.0], devices=['cpu', 'cuda:0', 'cuda:1'] )
+    main()
+    #neurostim_bo('spinal', NeuralSobolGP, kappas=[25.0], devices=['cpu', 'cuda:0', 'cuda:1'] )

@@ -40,7 +40,7 @@ warnings.filterwarnings(
 
 ### Runners ###
 
-def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0, save=False, verbose=False,  device='cpu'):
+def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0, M=1024, epsilon=0.25, save=False, verbose=False,  device='cpu'):
     """
     Returns the same metrics as run_bo, plus:
       - partition_updates: list of partition structures (list of lists) when updates occurred
@@ -49,6 +49,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
 
     # Setting device for computations
     device = torch.device(device)
+    f_obj.to(device)
 
     sobol_workers = 1   # background threads for Sobol
     # --------------------------------------------------------
@@ -59,12 +60,13 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
     lower, upper = bounds[0], bounds[1]
     grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d, device=device)
     with torch.no_grad():
-        grid_y = f_obj.f.forward(grid_x).float().squeeze(-1) 
+        grid_y = f_obj.f.forward(grid_x).float().squeeze(-1)
     grid_min = grid_y.min().item()
 
     # Initiate training set
     n_init = np.clip(f_obj.d*3, 1, 20)
-    sobol = Sobol(f_obj, n_init).to(device)
+    sobol = Sobol(f_obj, M=M).to(device)
+    sobol.epsilon = epsilon
     true_best = grid_y.max().item() #f_obj.f.optimal_value
     sampler = qmc.LatinHypercube(d=f_obj.d)
     sample = sampler.random(n=n_init)
@@ -372,11 +374,65 @@ def run_single_kappa(kappa, device, f_obj, model_cls, n_iter, n_reps, bo_method)
 
     stacked_explore = np.stack(explore_list, axis=0)
     stacked_exploit = np.stack(exploit_list, axis=0)
-    
+
     return kappa, stacked_explore.mean(axis=0), stacked_exploit.mean(axis=0)
 
-def run_single_optm(model_label, model_cls, kappa, rep, device, 
-                           f_obj, n_iter):
+def run_single_M(M_val, device, f_obj, model_cls, n_iter, n_reps, kappa, epsilon):
+    """
+    Worker function that runs n_reps repetitions of run_partitionbo for a SINGLE M value.
+    """
+    explore_list, exploit_list = [], []
+
+    f_obj.to(device)
+    print(f"[Worker {device}] Starting M={M_val}")
+
+    for rep in range(n_reps):
+        try:
+            results = run_partitionbo(f_obj, model_cls, n_iter=n_iter,
+                                      kappa=kappa, M=M_val, epsilon=epsilon,
+                                      save=False, device=device)
+            explore_list.append(results['exploration'])
+            exploit_list.append(results['exploitation'])
+        except Exception as e:
+            print(f"Error in M={M_val}, rep={rep} on {device}: {e}")
+            traceback.print_exc()
+            explore_list.append(np.zeros(n_iter))
+            exploit_list.append(np.zeros(n_iter))
+
+    stacked_explore = np.stack(explore_list, axis=0)
+    stacked_exploit = np.stack(exploit_list, axis=0)
+
+    return M_val, stacked_explore.mean(axis=0), stacked_exploit.mean(axis=0)
+
+def run_single_epsilon(eps_val, device, f_obj, model_cls, n_iter, n_reps, kappa, M):
+    """
+    Worker function that runs n_reps repetitions of run_partitionbo for a SINGLE epsilon value.
+    """
+    explore_list, exploit_list = [], []
+
+    f_obj.to(device)
+    print(f"[Worker {device}] Starting epsilon={eps_val}")
+
+    for rep in range(n_reps):
+        try:
+            results = run_partitionbo(f_obj, model_cls, n_iter=n_iter,
+                                      kappa=kappa, M=M, epsilon=eps_val,
+                                      save=False, device=device)
+            explore_list.append(results['exploration'])
+            exploit_list.append(results['exploitation'])
+        except Exception as e:
+            print(f"Error in epsilon={eps_val}, rep={rep} on {device}: {e}")
+            traceback.print_exc()
+            explore_list.append(np.zeros(n_iter))
+            exploit_list.append(np.zeros(n_iter))
+
+    stacked_explore = np.stack(explore_list, axis=0)
+    stacked_exploit = np.stack(exploit_list, axis=0)
+
+    return eps_val, stacked_explore.mean(axis=0), stacked_exploit.mean(axis=0)
+
+def run_single_optm(model_label, model_cls, kappa, rep, device,
+                           f_obj, n_iter, M=1024, epsilon=0.25):
     """
     Worker to run a single repetition for a specific model class.
     """
@@ -387,8 +443,9 @@ def run_single_optm(model_label, model_cls, kappa, rep, device,
     try:
         # Select correct runner
         if model_label in ['SobolGP', 'MHGP']:
-            res = run_partitionbo(f_obj, model_cls, n_iter=n_iter, 
-                                  kappa=kappa, save=False, device=device)
+            res = run_partitionbo(f_obj, model_cls, n_iter=n_iter,
+                                  kappa=kappa, M=M, epsilon=epsilon,
+                                  save=False, device=device)
         else:
             res = run_bo(f_obj, model_cls, n_iter=n_iter, 
                          kappa=kappa, save=False, device=device)
@@ -499,6 +556,158 @@ def kappa_search(f_obj, kappa_list, model_cls=ExactGP, n_iter=100, n_reps=15,
     plt.savefig(plot_path, format="svg")
     plt.close()
     print(f"Saved kappa search plot to {plot_path}")
+
+def M_search(f_obj, M_list, model_cls=SobolGP, n_iter=100, n_reps=15,
+             kappa=7.0, epsilon=0.25, devices=['cpu']):
+    """
+    For each M in M_list, run run_partitionbo n_reps times and plot averaged
+    exploration and exploitation traces.
+
+    Parameters
+    ----------
+    f_obj : SyntheticTestFun
+    M_list : list of int
+        Sobol MC sample counts to sweep
+    model_cls : class
+        GP model class (should be SobolGP)
+    n_iter : int
+    n_reps : int
+    kappa : float
+    epsilon : float
+    devices : list of str
+    """
+    averaged = {}
+
+    num_workers = len(devices)
+    print(f"\nStarting M Search with {num_workers} workers on devices: {devices}")
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        future_to_M = {}
+
+        for i, M_val in enumerate(M_list):
+            assigned_device = devices[i % num_workers]
+            future = executor.submit(
+                run_single_M,
+                M_val, assigned_device, f_obj, model_cls,
+                n_iter, n_reps, kappa, epsilon
+            )
+            future_to_M[future] = M_val
+
+        for future in as_completed(future_to_M):
+            M_val = future_to_M[future]
+            try:
+                m_res, mean_explore, mean_exploit = future.result()
+                averaged[m_res] = {'explore': mean_explore, 'exploit': mean_exploit}
+                print(f"Finished M={m_res}")
+            except Exception as exc:
+                print(f'M={M_val} generated an exception: {exc}')
+
+    # Plotting
+    print("\nAll runs complete. Generating Plot...")
+    plt.figure(figsize=(10, 6))
+    cmap = plt.get_cmap('tab10')
+    x = np.arange(0, n_iter)
+
+    for idx, M_val in enumerate(M_list):
+        vals = averaged.get(M_val, None)
+        if vals is None:
+            continue
+        color = cmap(idx % 10)
+        plt.plot(x, vals['explore'], linestyle='-', label=f'M={M_val} Explore', color=color)
+        plt.plot(x, vals['exploit'], linestyle='--', color=color)
+
+    plt.xlabel('Iteration')
+    plt.ylabel('Metric Value')
+    plt.title(f"{model_cls.__name__} on {f_obj.d}-{f_obj.name} | M Search (averaged over {n_reps} runs)")
+    plt.ylim(0, 1.1)
+    plt.legend(loc='lower right')
+    plt.grid(True)
+
+    output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(
+        output_dir,
+        f'M_search_{model_cls.__name__}_{f_obj.d}-d_budget{n_iter}.svg'
+    )
+    plt.savefig(plot_path, format="svg")
+    plt.close()
+    print(f"Saved M search plot to {plot_path}")
+
+def epsilon_search(f_obj, epsilon_list, model_cls=SobolGP, n_iter=100, n_reps=15,
+                   kappa=7.0, M=1024, devices=['cpu']):
+    """
+    For each epsilon in epsilon_list, run run_partitionbo n_reps times and plot averaged
+    exploration and exploitation traces.
+
+    Parameters
+    ----------
+    f_obj : SyntheticTestFun
+    epsilon_list : list of float
+        Additivity threshold values to sweep
+    model_cls : class
+        GP model class (should be SobolGP)
+    n_iter : int
+    n_reps : int
+    kappa : float
+    M : int
+    devices : list of str
+    """
+    averaged = {}
+
+    num_workers = len(devices)
+    print(f"\nStarting Epsilon Search with {num_workers} workers on devices: {devices}")
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        future_to_eps = {}
+
+        for i, eps_val in enumerate(epsilon_list):
+            assigned_device = devices[i % num_workers]
+            future = executor.submit(
+                run_single_epsilon,
+                eps_val, assigned_device, f_obj, model_cls,
+                n_iter, n_reps, kappa, M
+            )
+            future_to_eps[future] = eps_val
+
+        for future in as_completed(future_to_eps):
+            eps_val = future_to_eps[future]
+            try:
+                e_res, mean_explore, mean_exploit = future.result()
+                averaged[e_res] = {'explore': mean_explore, 'exploit': mean_exploit}
+                print(f"Finished epsilon={e_res}")
+            except Exception as exc:
+                print(f'epsilon={eps_val} generated an exception: {exc}')
+
+    # Plotting
+    print("\nAll runs complete. Generating Plot...")
+    plt.figure(figsize=(10, 6))
+    cmap = plt.get_cmap('tab10')
+    x = np.arange(0, n_iter)
+
+    for idx, eps_val in enumerate(epsilon_list):
+        vals = averaged.get(eps_val, None)
+        if vals is None:
+            continue
+        color = cmap(idx % 10)
+        plt.plot(x, vals['explore'], linestyle='-', label=f'eps={eps_val} Explore', color=color)
+        plt.plot(x, vals['exploit'], linestyle='--', color=color)
+
+    plt.xlabel('Iteration')
+    plt.ylabel('Metric Value')
+    plt.title(f"{model_cls.__name__} on {f_obj.d}-{f_obj.name} | Epsilon Search (averaged over {n_reps} runs)")
+    plt.ylim(0, 1.1)
+    plt.legend(loc='lower right')
+    plt.grid(True)
+
+    output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(
+        output_dir,
+        f'epsilon_search_{model_cls.__name__}_{f_obj.d}-d_budget{n_iter}.svg'
+    )
+    plt.savefig(plot_path, format="svg")
+    plt.close()
+    print(f"Saved epsilon search plot to {plot_path}")
 
 def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['cpu']):
     """
@@ -771,101 +980,258 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
         'regrets_path': regrets_path
     }
 
-def partition_reconstruction(f_obj, n_iter=200, n_reps=10, n_sobol=10, kappa=1.0, threshold=0.05, save=False, verbose=False, device='cpu'):
+def internal_representation(f_obj, model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0,
+                            per_n=10, grid_size=50, save=True, verbose=False, device='cpu'):
     """
-    Compute and plot how well partition_updates reconstruct the true Sobol interaction structure.
-    
-    Updated to handle (1, d) higher-order interaction vectors (variable-wise) rather than 
-    (d, d) pairwise matrices.
+    Visualize step-by-step GP posterior evolution for 2D functions.
 
-    Returns:
-        cc_list: list of CC values (accuracy of detecting interacting variables)
-        cs_list: list of CS values (accuracy of detecting additive variables)
-        update_iters: list of BO iteration numbers corresponding to each sobol update
+    First row: Ground truth map (centered)
+    Following rows: Posterior mean and uncertainty maps side by side
+
+    Parameters
+    ----------
+    f_obj : SyntheticTestFun
+        Must be 2D (f_obj.d == 2)
+    model_cls : class
+        GP model class (ExactGP, AdditiveGP, SobolGP, MHGP)
+    n_iter : int
+        Total optimization budget
+    n_sobol : int
+        Sobol computation frequency (for SobolGP)
+    kappa : float
+        UCB exploration coefficient
+    per_n : int
+        Plot GP every per_n iterations
+    grid_size : int
+        Resolution of visualization grid
+    save : bool
+        Whether to save output figure
+    verbose : bool
+        Print iteration info
+    device : str
+        Computation device
     """
-    
-    # --- 1) Get True Sobol Interactions (Variable-wise) ---
-    sobols = sobol_sensitivity(f_obj, n_samples=10000) 
-    sobols = np.nan_to_num(np.asarray( 1 - (np.clip(sobols['S1'], 0.0, 1.0) / np.clip(sobols['ST'], 0.0, 1.0)), dtype=float)).flatten()
-    d = f_obj.d
-    surrogate_sobols = []
-    plt.figure(figsize=(9, 5))
-    color = 'green'
 
-    for rep in range(n_reps):
-        # Removed model_cls arg
-        results = run_partitionbo(f_obj.to(device),
-                            model_cls=SobolGP, # or pass the actual class if strictly needed by internal logic
-                            n_iter=n_iter,
-                            n_sobol=n_sobol,
-                            kappa=kappa,
-                            save=False,
-                            verbose=verbose,
-                            device=device)
-        
-        surrogate_sobols.append(results['sobol_interactions'])
+    # Input validation
+    assert f_obj.d == 2, "internal_representation supports only 2D functions."
 
-    # --- Figure: Sobol interaction traces (Per Dimension) ---
-    nrows = d
-    fig2, axes = plt.subplots(nrows, 1, figsize=(8, 3*nrows + 1), squeeze=False)
-    axes_flat = axes.flatten()
-    
-    labels = ['True Interaction', 'Additivity Threshold', 'Predicted Interaction']
-    x_full = np.arange(1, n_iter + 1)
+    device = torch.device(device)
+    sobol_workers = 1
 
-    for i in range(d):
-        ax = axes_flat[i]
+    # Grid initialization for visualization
+    lb, ub = f_obj.lower_bounds, f_obj.upper_bounds
+    xs = np.linspace(lb[0], ub[0], grid_size)
+    ys = np.linspace(lb[1], ub[1], grid_size)
+    gx, gy = np.meshgrid(xs, ys)
+    grid_pts = torch.tensor(np.column_stack([gx.ravel(), gy.ravel()]), dtype=torch.float32, device=device)
 
-        # Plot true as horizontal black line
-        true_val = float(sobols[i])
-        true_label = ax.plot(x_full, [true_val]*x_full.shape[0], color='black', linestyle='--', linewidth=1.2)
-        threshold_label = ax.plot(x_full, [threshold]*x_full.shape[0], color='red', linestyle='--', linewidth=1.2)
+    # Compute ground truth map
+    with torch.no_grad():
+        true_map = f_obj.f.evaluate_true(grid_pts).cpu().numpy().reshape(grid_size, grid_size)
+    if f_obj.negate:
+        true_map = -true_map
 
-        # Estimated sobol interaction curve
-        surrogate_mean = []
-        for surrogate_sobol_trace in surrogate_sobols:
-            
-            trace_per_dim = [1.0] * f_obj.d*3 # Init assumption
-            
-            for t_step in range(len(surrogate_sobol_trace)):
+    # Initialize bounds and grid for BO
+    n_points = int(100 * f_obj.d**2)
+    bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float().to(device)
+    lower, upper = bounds[0], bounds[1]
+    bo_grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d, device=device)
+    with torch.no_grad():
+        bo_grid_y = f_obj.f.forward(bo_grid_x).float().squeeze(-1)
+    grid_min = bo_grid_y.min().item()
 
-                if surrogate_sobol_trace[t_step] is None:
-                    trace_per_dim.append(float(0.0))
-                    
-                else:
-                    val_vector = np.asarray(surrogate_sobol_trace[t_step]).flatten()
-                    trace_per_dim.append(float(val_vector[i]))
-            
-            trace_per_dim = np.asarray(trace_per_dim, dtype=float)
-            surrogate_mean.append(trace_per_dim)
-            ax.plot(x_full, trace_per_dim[:len(x_full)], color=color, linestyle='-', alpha=0.1)
+    # Initialize training set with Latin Hypercube
+    n_init = np.clip(f_obj.d * 3, 1, 20)
+    true_best = bo_grid_y.max().item()
+    sampler = qmc.LatinHypercube(d=f_obj.d)
+    sample = sampler.random(n=n_init)
+    sample_scaled = qmc.scale(sample, lower.cpu(), upper.cpu())
+    train_x = torch.from_numpy(sample_scaled).float().to(device)
+    train_y = f_obj.f.forward(train_x)
 
-        surrogate_mean = np.asarray(surrogate_mean)
-        surrogate_mean = np.mean(surrogate_mean, axis=0)
-        prediction_label = ax.plot(x_full, surrogate_mean[:len(x_full)], color=color, linestyle='-')
+    current_min = min(grid_min, train_y.min().item())
+    current_max = max(true_best, train_y.max().item())
 
-        ax.set_ylim(-0.05, 1.1)
-        ax.set_xlim(1, n_iter)
-        ax.set_title(f'Dimension {i+1}')
-        ax.grid(True, linestyle='--', linewidth=0.4)
+    # Storage for snapshots
+    snapshots = []
+    query_points = train_x.cpu().numpy().tolist()
 
-    # Title and Saving
-    raw_title = f'Sobol Indices Traces for {f_obj.d}d-{f_obj.name} | SobolGP (kappa={kappa})'
-    wrapped_title = textwrap.fill(raw_title, width=80)
+    # Initialize Sobol if using SobolGP
+    sobol = Sobol(f_obj).to(device) if model_cls in [SobolGP, MHGP] else None
 
-    fig2.suptitle(wrapped_title, fontsize=14)
-    fig2.legend([true_label[0], threshold_label[0], prediction_label[0]], labels=labels, loc="upper right", bbox_to_anchor=(0.98, 0.98))
-    plt.tight_layout()
+    # Initialize model
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    model = model_cls(train_x, train_y, likelihood).to(device)
+    if sobol is not None:
+        model.sobol = sobol
+    interactions = np.zeros(f_obj.d, dtype=float)
 
-    output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
-    os.makedirs(output_dir, exist_ok=True)
-    sobol_fname = f'sobol_recon_SobolGP_{f_obj.d}d-{f_obj.name}_kappa{kappa}.svg'
-    outpath = os.path.join(output_dir, sobol_fname)
-    fig2.savefig(outpath)
-    plt.close(fig2)
+    # Initialize executor for Sobol background jobs
+    executor = ThreadPoolExecutor(max_workers=sobol_workers)
+    space_reconfiguration = None
+
+    # Main optimization loop
+    for i in range(n_iter - n_init):
+
+        # Train model
+        y_range = current_max - current_min
+        train_y_norm = (train_y - current_min) / y_range
+        model, likelihood, _ = optimize(model, train_x, train_y_norm)
+
+        # Maximize acquisition
+        new_x, _, _ = maximize_acq(kappa, model, likelihood, bo_grid_x)
+        new_y = f_obj.f.forward(new_x)
+
+        # Update bounds
+        new_y_val = new_y.item()
+        if new_y_val < current_min:
+            current_min = new_y_val
+        if new_y_val > current_max:
+            current_max = new_y_val
+        if new_y_val > true_best:
+            true_best = new_y_val
+        if new_y_val < grid_min:
+            grid_min = new_y_val
+
+        train_x = torch.cat([train_x, new_x])
+        train_y = torch.cat([train_y, new_y])
+        query_points.append(new_x.cpu().numpy().flatten().tolist())
+
+        # Capture snapshot every per_n iterations
+        if (i + 1) % per_n == 0 or i == n_iter - n_init - 1:
+            model.eval()
+            likelihood.eval()
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                post = likelihood(model(grid_pts))
+                mean_map = post.mean.cpu().numpy().reshape(grid_size, grid_size)
+                std_map = np.sqrt(post.variance.cpu().numpy()).reshape(grid_size, grid_size)
+
+            snapshots.append({
+                'iter': i + n_init + 1,
+                'mean': mean_map,
+                'std': std_map,
+                'queries': [q.copy() for q in query_points]
+            })
+
+        # Handle Sobol partition updates for SobolGP/MHGP
+        if model_cls in [SobolGP, MHGP]:
+            if space_reconfiguration is not None and space_reconfiguration.done():
+                interactions = space_reconfiguration.result()
+                new_partition = sobol.update_partition(interactions)
+                model.update_partition(new_partition)
+                space_reconfiguration = None
+
+            if i > n_sobol:
+                if space_reconfiguration is None or space_reconfiguration.done():
+                    try:
+                        surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+                        train_y_norm = (train_y - current_min) / (current_max - current_min)
+                        surrogate = ExactGP(train_x, train_y_norm, surrogate_likelihood).to(device)
+                        space_reconfiguration = executor.submit(sobol.method, train_x, train_y_norm, surrogate)
+                    except Exception as e:
+                        space_reconfiguration = None
+                        if verbose:
+                            print(f"[Sobol] submit failed: {e}")
+
+        # Reinitialize model for next iteration
+        model = model_cls(train_x, train_y_norm, likelihood,
+                          model.partition if hasattr(model, 'partition') else None,
+                          model.history if hasattr(model, 'history') else None,
+                          model.sobol if hasattr(model, 'sobol') else None).to(device)
+
+        if verbose:
+            print(f"Iter {i + n_init + 1:03d} | best: {train_y.max().item():.4f}")
+
+    executor.shutdown(wait=False)
+
+    # Create figure
+    n_snapshots = len(snapshots)
+    n_rows = 1 + n_snapshots  # 1 for ground truth + snapshot rows
+
+    fig = plt.figure(figsize=(10, 4 * n_rows))
+    gs = fig.add_gridspec(n_rows, 2, wspace=0.10, hspace=0.4,
+                          left=0.05, right=0.95, top=0.95, bottom=0.05)
+
+    # Normalize ground truth to [0, 1]
+    true_map_norm = (true_map - true_map.min()) / (np.ptp(true_map) + 1e-8)
+
+    # Plot ground truth (row 0, centered across both columns)
+    ax_gt = fig.add_subplot(gs[0, :])
+    im = ax_gt.imshow(true_map_norm, cmap='viridis', vmin=0, vmax=1,
+                      extent=[lb[0], ub[0], lb[1], ub[1]], origin='lower')
+    ax_gt.set_title("Ground Truth", fontsize=14, fontweight='bold')
+    ax_gt.set_xlabel("$x_1$")
+    ax_gt.set_ylabel("$x_2$")
+    ax_gt.set_xticks([])
+    ax_gt.set_yticks([])
+
+    # Mark the maximum value location with a white star
+    max_idx = np.unravel_index(np.argmax(true_map_norm), true_map_norm.shape)
+    max_x = lb[0] + (max_idx[1] / (grid_size - 1)) * (ub[0] - lb[0])
+    max_y = lb[1] + (max_idx[0] / (grid_size - 1)) * (ub[1] - lb[1])
+    ax_gt.scatter(max_x, max_y, c='white', s=150, marker='*', edgecolors='black', linewidths=0.5, zorder=10)
+
+    # Add colorbar next to ground truth (in first row, right side)
+    cbar = fig.colorbar(im, ax=ax_gt, fraction=0.046, pad=0.04)
+    cbar.set_label('Normalized Value [0, 1]', fontsize=10)
+
+    # Plot mean/std pairs for each snapshot
+    for idx, snap in enumerate(snapshots):
+        row = idx + 1
+
+        # Normalize mean to [0, 1]
+        mean_norm = (snap['mean'] - snap['mean'].min()) / (np.ptp(snap['mean']) + 1e-8)
+
+        # Normalize std to [0, 1]
+        std_norm = (snap['std'] - snap['std'].min()) / (np.ptp(snap['std']) + 1e-8)
+
+        # Mean subplot (left)
+        ax_mean = fig.add_subplot(gs[row, 0])
+        ax_mean.imshow(mean_norm, cmap='viridis', vmin=0, vmax=1,
+                       extent=[lb[0], ub[0], lb[1], ub[1]], origin='lower')
+        ax_mean.set_title(f"Predicted Map (Iter {snap['iter']})", fontsize=11)
+        ax_mean.set_xlabel("$x_1$")
+        ax_mean.set_ylabel("$x_2$")
+        ax_mean.set_xticks([])
+        ax_mean.set_yticks([])
+
+        # Overlay all query points in black
+        queries = np.array(snap['queries'])
+        ax_mean.scatter(queries[:, 0], queries[:, 1], c='black', s=15, alpha=0.7, edgecolors='white', linewidths=0.5)
+
+        # Mark the ground truth maximum location with a white star
+        ax_mean.scatter(max_x, max_y, c='white', s=150, marker='*', edgecolors='black', linewidths=0.5, zorder=10)
+
+        # Mark the model's predicted maximum (argmax of mean map) in red
+        pred_max_idx = np.unravel_index(np.argmax(mean_norm), mean_norm.shape)
+        pred_max_x = lb[0] + (pred_max_idx[1] / (grid_size - 1)) * (ub[0] - lb[0])
+        pred_max_y = lb[1] + (pred_max_idx[0] / (grid_size - 1)) * (ub[1] - lb[1])
+        ax_mean.scatter(pred_max_x, pred_max_y, c='red', s=40, alpha=0.9, edgecolors='white', linewidths=0.5, zorder=11)
+
+        # Std subplot (right)
+        ax_std = fig.add_subplot(gs[row, 1])
+        ax_std.imshow(std_norm, cmap='viridis', vmin=0, vmax=1,
+                      extent=[lb[0], ub[0], lb[1], ub[1]], origin='lower')
+        ax_std.set_title(f"Uncertainty (Iter {snap['iter']})", fontsize=11)
+        ax_std.set_xlabel("$x_1$")
+        ax_std.set_ylabel("$x_2$")
+        ax_std.set_xticks([])
+        ax_std.set_yticks([])
+
+    # Save figure
+    if save:
+        output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
+        os.makedirs(output_dir, exist_ok=True)
+        fname = f'internal_representation_{model_cls.__name__}_{f_obj.d}d-{f_obj.name}_kappa{kappa}_budget{n_iter}.svg'
+        fpath = os.path.join(output_dir, fname)
+        plt.savefig(fpath, format='svg', bbox_inches='tight')
+        print(f"Saved internal representation plot to {fpath}")
+
+    plt.close(fig)
+
+    return {'snapshots': snapshots, 'true_map': true_map}
 
 ### Parser handling
-
 def _parse_list_of_floats(text):
     if text is None:
         return None
@@ -907,6 +1273,10 @@ def main(argv=None):
     parser.add_argument('--kappa', type=float, default=1.0)
     parser.add_argument('--kappa_list', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for kappa_search')
     parser.add_argument('--kappas', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for optimization_metrics (3 values expected)')
+    parser.add_argument('--M_list', type=_parse_list_of_ints, default=None, help='Comma-separated M values for M_search (e.g. 256,512,1024,2048)')
+    parser.add_argument('--epsilon_list', type=_parse_list_of_floats, default=None, help='Comma-separated epsilon values for epsilon_search (e.g. 0.1,0.15,0.2,0.25,0.3)')
+    parser.add_argument('--M', type=int, default=1024, help='Sobol MC samples (default 1024)')
+    parser.add_argument('--epsilon', type=float, default=0.25, help='Additivity threshold (default 0.25)')
 
     #  Device Flags ---
     parser.add_argument('--device', type=str, default='cpu', help='Device for single runs (e.g. cuda:0)')
@@ -933,8 +1303,10 @@ def main(argv=None):
         'run_bo': run_bo,
         'run_partitionbo': run_partitionbo,
         'kappa_search': kappa_search,
+        'M_search': M_search,
+        'epsilon_search': epsilon_search,
         'optimization_metrics': optimization_metrics,
-        'partition_reconstruction': partition_reconstruction,
+        'internal_representation': internal_representation,
     }
 
     if args.list_models:
@@ -987,7 +1359,8 @@ def main(argv=None):
                             save=args.save, verbose=args.verbose, device=args.device)
         
         elif args.method == 'run_partitionbo':
-            result = run_partitionbo(f_obj, model_cls, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa, 
+            result = run_partitionbo(f_obj, model_cls, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa,
+                            M=args.M, epsilon=args.epsilon,
                             save=args.save, verbose=args.verbose, device=args.device)
 
         elif args.method == 'kappa_search':
@@ -996,12 +1369,27 @@ def main(argv=None):
             result = kappa_search(f_obj, k_list, model_cls=model_cls, n_iter=args.n_iter, n_reps=args.n_reps, 
                                   bo_method=bo_method, devices=device_list)
 
+        elif args.method == 'M_search':
+            m_list = args.M_list or [256, 512, 1024, 2048]
+            result = M_search(f_obj, m_list, model_cls=model_cls, n_iter=args.n_iter, n_reps=args.n_reps,
+                              kappa=args.kappa, epsilon=args.epsilon, devices=device_list)
+
+        elif args.method == 'epsilon_search':
+            eps_list = args.epsilon_list or [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+            result = epsilon_search(f_obj, eps_list, model_cls=model_cls, n_iter=args.n_iter, n_reps=args.n_reps,
+                                    kappa=args.kappa, M=args.M, devices=device_list)
+
         elif args.method == 'optimization_metrics':
             if args.kappas is None: raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values)')
             kappas = args.kappas
             result = optimization_metrics(f_obj, kappas, n_iter=args.n_iter, n_reps=args.n_reps, devices=device_list)
         elif args.method == 'partition_reconstruction':
             result = partition_reconstruction(f_obj, SobolGP, n_iter=args.n_iter, n_reps= args.n_reps, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose, device=args.device)
+        elif args.method == 'internal_representation':
+            if args.dim != 2:
+                raise ValueError("internal_representation only supports 2D functions (--dim 2)")
+            result = internal_representation(f_obj, model_cls, n_iter=args.n_iter, n_sobol=args.n_sobol,
+                                             kappa=args.kappa, save=args.save, verbose=args.verbose, device=args.device)
         else:
             raise ValueError('Unsupported method')
 

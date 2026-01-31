@@ -112,7 +112,12 @@ class SyntheticTestFun:
         device = torch.device(device)
         self.device = device
         # BoTorch functions are nn.Modules, so they support .to()
-        self.f.to(device) 
+        self.f.to(device)
+        # Also move any plain tensor attributes that nn.Module.to() misses
+        for attr_name in list(vars(self.f)):
+            val = getattr(self.f, attr_name)
+            if isinstance(val, torch.Tensor) and val.device != device:
+                setattr(self.f, attr_name, val.to(device))
         return self
 
     def simulate(self, n_samples):
@@ -257,7 +262,7 @@ class TwoBlobs(BaseTestProblem):
     One blob is scaled up so there is a clear single maximum at blob1's mean.
     """
 
-    def __init__(self, noise_std=0.0, negate=False, weight1=1.0, weight2=0.4):
+    def __init__(self, noise_std=0.0, negate=False, weight1=1.0, weight2=0.7):
         
         # --- attributes BaseTestProblem expects BEFORE super().__init__() ---
         self.d = 2
@@ -278,7 +283,7 @@ class TwoBlobs(BaseTestProblem):
         # Gaussian 1 (dominant blob)
         self.mean1 = torch.tensor([7.0, 6.0], dtype=dtype)
         self.std1 = torch.tensor([1.0, 0.5], dtype=dtype)
-        self.rho1 = torch.tensor(0.7, dtype=dtype)
+        self.rho1 = torch.tensor(0.5, dtype=dtype)
         self.weight1 = torch.tensor(weight1, dtype=dtype)
 
         # Gaussian 2 (smaller blob)
@@ -361,6 +366,7 @@ class DBlobs(BaseTestProblem):
         n_blobs: Optional[int] = None,
         noise_std: float = 0.0,
         negate: bool = False,
+        seed: int = 1,
         rho_max: float = 0.3,
         n_random_samples: int = 5000,
         refine_restarts: int = 8,
@@ -387,9 +393,9 @@ class DBlobs(BaseTestProblem):
         # set number of blobs
         self.n_blobs = n_blobs if n_blobs is not None else self.d
 
-        # RNG
-        torch.manual_seed(1)
-        np.random.seed(1)
+        # local RNG — no global state pollution
+        self._rng = torch.Generator(device="cpu")
+        self._rng.manual_seed(seed)
 
         # storage lists (will convert to tensors)
         means_list = []
@@ -406,13 +412,13 @@ class DBlobs(BaseTestProblem):
 
         # build blobs
         for i in range(self.n_blobs):
-            mean = torch.as_tensor(2.0 + 6.0 * torch.rand(self.d), dtype=dtype, device=device)
+            mean = torch.as_tensor(2.0 + 6.0 * torch.rand(self.d, generator=self._rng), dtype=dtype, device=device)
             means_list.append(mean)
 
-            stds = torch.as_tensor(0.5 + 1.5 * torch.rand(self.d), dtype=dtype, device=device)
+            stds = torch.as_tensor(0.5 + 1.5 * torch.rand(self.d, generator=self._rng), dtype=dtype, device=device)
 
             # sample rho in safe interval [rho_lower, rho_upper]
-            rho_val = float(rho_lower + (rho_upper - rho_lower) * torch.rand(1).item())
+            rho_val = float(rho_lower + (rho_upper - rho_lower) * torch.rand(1, generator=self._rng).item())
             rhos_list.append(torch.as_tensor(rho_val, dtype=dtype, device=device))
 
             # covariance via exchangeable / compound-symmetry + PD regularization
@@ -475,7 +481,7 @@ class DBlobs(BaseTestProblem):
         # simple random sampling
         while n_rem > 0:
             bs = min(batch, n_rem)
-            Xs = 10.0 * torch.rand(bs, self.d, dtype=dtype, device=device)
+            Xs = 10.0 * torch.rand(bs, self.d, dtype=dtype, device=device, generator=self._rng)
             Ys = self._evaluate_single_point(Xs).reshape(-1)
             max_Y = float(Ys.max().item())
             min_Y = float(Ys.min().item())
@@ -491,7 +497,7 @@ class DBlobs(BaseTestProblem):
         best_ref_x = self.optimal_point.clone()
         starts = [self.optimal_point.clone()]
         for _ in range(refine_restarts - 1):
-            starts.append(10.0 * torch.rand(self.d, dtype=dtype, device=device))
+            starts.append(10.0 * torch.rand(self.d, dtype=dtype, device=device, generator=self._rng))
 
         for s in starts:
             x = s.clone().detach().to(dtype).requires_grad_(True)
