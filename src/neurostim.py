@@ -354,7 +354,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
         traceback.print_exc()
         return None
 
-def neurostim_bo(dataset, model_cls, kappas, devices=['cpu'], lr=0.1, M=2048):
+def neurostim_bo(dataset, model_cls, kappas, devices=['cpu'], lr=0.01, M=2048):
     """
     Run neurostimulation Bayesian optimization across subjects, EMGs, kappas, and reps.
     Uses ProcessPoolExecutor to distribute work across multiple devices.
@@ -487,7 +487,6 @@ def lr_search(dataset, lr_list, kappa, devices=['cpu'], M=2048):
     M : int
         Sobol MC samples
     """
-    from models.gaussians import NeuralExactGP, NeuralAdditiveGP, NeuralSobolGP
 
     model_specs = [
         (NeuralExactGP, 'NeuralExactGP'),
@@ -506,6 +505,12 @@ def lr_search(dataset, lr_list, kappa, devices=['cpu'], M=2048):
             all_results[model_name][lr] = res
 
     # Plotting: 3 rows (one per model), 2 columns (exploration, log-regret)
+    options = set_experiment(dataset)
+    emg_map = options['n_emgs']
+    n_iters = options['n_queries']
+    n_reps = options['n_reps']
+    n_total_emgs = np.sum(emg_map)
+
     n_models = len(model_specs)
     fig, axes = plt.subplots(n_models, 2, figsize=(14, 5 * n_models), squeeze=False)
     cmap = plt.get_cmap('tab10')
@@ -516,14 +521,21 @@ def lr_search(dataset, lr_list, kappa, devices=['cpu'], M=2048):
 
         for idx, lr in enumerate(lr_list):
             res = all_results[model_name][lr]
-            # PP shape: (nSubjects, max(nEmgs), len(kappas), nRep, MaxQueries)
-            # Average over subjects, emgs, kappas (dim=1), reps -> (MaxQueries,)
             pp = res['PP']
             regrets = res['REGRETS']
 
-            # Mean over all non-query dims: subjects(0), emgs(1), kappas(2), reps(3)
-            mean_explore = np.nanmean(pp, axis=(0, 1, 2, 3))
-            mean_regret = np.nanmean(regrets, axis=(0, 1, 2, 3))
+            # Aggregate only over valid subject/EMG slots (skip zero-padded entries)
+            explorations = np.zeros((n_total_emgs, n_reps, n_iters))
+            regrets_valid = np.zeros((n_total_emgs, n_reps, n_iters))
+            jj = 0
+            for s_i in range(len(emg_map)):
+                for muscle in range(emg_map[s_i]):
+                    explorations[jj] = pp[s_i, muscle, 0]
+                    regrets_valid[jj] = regrets[s_i, muscle, 0]
+                    jj += 1
+
+            mean_explore = explorations.mean(axis=(0, 1))
+            mean_regret = regrets_valid.mean(axis=(0, 1))
 
             color = cmap(idx % 10)
             x = np.arange(len(mean_explore))
@@ -553,6 +565,91 @@ def lr_search(dataset, lr_list, kappa, devices=['cpu'], M=2048):
     plt.savefig(plot_path, format='svg')
     plt.close(fig)
     print(f"Saved lr_search plot to {plot_path}")
+
+    return all_results
+
+def M_search_neurostim(dataset, M_list, kappa, devices=['cpu'], lr=0.01):
+    """
+    Run M search for NeuralSobolGP only (M only affects Sobol computation).
+
+    For each M in M_list, runs neurostim_bo with NeuralSobolGP and aggregates results.
+    Produces a two-panel plot (exploration, log-regret).
+
+    Parameters
+    ----------
+    dataset : str
+        Dataset identifier
+    M_list : list of int
+        Sobol MC sample counts to sweep
+    kappa : float
+        Single kappa for all runs
+    devices : list of str
+    lr : float
+        GP learning rate
+    """
+    all_results = {}
+
+    for M_val in M_list:
+        print(f"\n--- M_search: NeuralSobolGP M={M_val} kappa={kappa} ---")
+        res = neurostim_bo(dataset, NeuralSobolGP, kappas=[kappa],
+                           devices=devices, lr=lr, M=M_val)
+        all_results[M_val] = res
+
+    # Aggregate using emg-map-aware logic (skip zero-padded slots)
+    options = set_experiment(dataset)
+    emg_map = options['n_emgs']
+    n_iters = options['n_queries']
+    n_reps = options['n_reps']
+    n_total_emgs = np.sum(emg_map)
+
+    fig, (ax_explore, ax_regret) = plt.subplots(1, 2, figsize=(14, 5))
+    cmap = plt.get_cmap('tab10')
+
+    for idx, M_val in enumerate(M_list):
+        res = all_results[M_val]
+        pp = res['PP']
+        regrets = res['REGRETS']
+
+        explorations = np.zeros((n_total_emgs, n_reps, n_iters))
+        regrets_valid = np.zeros((n_total_emgs, n_reps, n_iters))
+        jj = 0
+        for s_i in range(len(emg_map)):
+            for muscle in range(emg_map[s_i]):
+                explorations[jj] = pp[s_i, muscle, 0]
+                regrets_valid[jj] = regrets[s_i, muscle, 0]
+                jj += 1
+
+        mean_explore = explorations.mean(axis=(0, 1))
+        mean_regret = regrets_valid.mean(axis=(0, 1))
+
+        color = cmap(idx % 10)
+        x = np.arange(len(mean_explore))
+
+        ax_explore.plot(x, mean_explore, color=color, label=f'M={M_val}')
+        ax_regret.plot(x, mean_regret, color=color, label=f'M={M_val}')
+
+    ax_explore.set_title('NeuralSobolGP - Exploration')
+    ax_explore.set_xlabel('Query')
+    ax_explore.set_ylabel('Exploration Score')
+    ax_explore.set_ylim(0, 1.1)
+    ax_explore.legend(loc='lower right', fontsize='small')
+    ax_explore.grid(True)
+
+    ax_regret.set_title('NeuralSobolGP - Log Regret')
+    ax_regret.set_xlabel('Query')
+    ax_regret.set_ylabel('Log Regret')
+    ax_regret.legend(loc='upper right', fontsize='small')
+    ax_regret.grid(True)
+
+    fig.suptitle(f'M Search on {dataset} (kappa={kappa})', fontsize=14)
+    plt.tight_layout()
+
+    output_dir = os.path.join('output', 'neurostim_experiments', dataset)
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(output_dir, f'M_search_NeuralSobolGP_{dataset}.svg')
+    plt.savefig(plot_path, format='svg')
+    plt.close(fig)
+    print(f"Saved M_search plot to {plot_path}")
 
     return all_results
 
