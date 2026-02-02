@@ -11,7 +11,7 @@ from botorch.models.gpytorch import GPyTorchModel
 
 ### Model utils ###
 
-def optimize(gp, train_x, train_y, n_iter=30, lr=0.01):
+def optimize(gp, train_x, train_y, n_iter=50, lr=0.01):
     """
     Train an ExactGP + Likelihood model.
 

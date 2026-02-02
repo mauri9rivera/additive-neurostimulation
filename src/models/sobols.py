@@ -791,7 +791,7 @@ class NeuralSobol:
             norm_factor = np.sum(ST)
             S1_boot[b] = S1
             ST_boot_norm[b] = ST / norm_factor
-            high_boot[b] = 1 - (S1_boot[b] / ST_boot_norm[b])
+            high_boot[b] = 1 - (S1_boot[b] / (ST_boot_norm[b] + 1e-9))
 
         # Aggregation over bootstrap
         high_mean = high_boot.mean(axis=0)

@@ -354,7 +354,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
         traceback.print_exc()
         return None
 
-def neurostim_bo(dataset, model_cls, kappas, devices=['cpu'], lr=0.01, M=2048):
+def neurostim_bo(dataset, model_cls, kappas, devices=['cpu'], lr=None, M=None):
     """
     Run neurostimulation Bayesian optimization across subjects, EMGs, kappas, and reps.
     Uses ProcessPoolExecutor to distribute work across multiple devices.
@@ -369,15 +369,28 @@ def neurostim_bo(dataset, model_cls, kappas, devices=['cpu'], lr=0.01, M=2048):
         UCB exploration coefficients
     devices : list of str
         List of devices for parallel execution (e.g., ['cpu'], ['cuda:0', 'cuda:1'])
-    lr : float
-        Learning rate for GP optimization (default 0.1)
-    M : int
-        Sobol MC samples (default 1024)
+    lr : float or None
+        Learning rate for GP optimization. If None, uses dataset default.
+    M : int or None
+        Sobol MC samples. If None, uses dataset default.
     """
     np.random.seed(0)
 
     # Experiment parameters initialization
     options = set_experiment(dataset)
+
+    # Dataset-specific defaults
+    dataset_defaults = {
+        'nhp':    {'lr': 0.1, 'M': 1024},
+        'spinal': {'lr': 0.1, 'M': 1024},
+        'rat':    {'lr': 0.1, 'M': 4096},
+        '5d_rat': {'lr': 0.1, 'M': 4096},
+    }
+    defaults = dataset_defaults.get(dataset, {'lr': 0.1, 'M': 1024})
+    if lr is None:
+        lr = defaults['lr']
+    if M is None:
+        M = defaults['M']
     nRep = options['n_reps']
     nSubjects = options['n_subjects']
     nEmgs = options['n_emgs']
@@ -444,7 +457,7 @@ def neurostim_bo(dataset, model_cls, kappas, devices=['cpu'], lr=0.01, M=2048):
                 Train_time[s, e, k, r] = result['train_time']
                 Cum_train[s, e, k, r] = result['cum_time']
                 RSQ[s, e, k, r] = result['rsq']
-                REGRETS[s, e, k, r] = np.log(result['regret'] + 1e-8)
+                REGRETS[s, e, k, r] = result['regret']
                 SOBOLS[s, e, k, r] = result['sobol_interactions']
                 model_name = result['model_name']
 
@@ -468,7 +481,7 @@ def neurostim_bo(dataset, model_cls, kappas, devices=['cpu'], lr=0.01, M=2048):
         'SOBOLS': SOBOLS, 'model_name': model_name,
     }
 
-def lr_search(dataset, lr_list, kappa, devices=['cpu'], M=2048):
+def lr_search(dataset, lr_list, kappa, devices=['cpu'], M=1024):
     """
     Run learning rate search for all 3 models (NeuralExactGP, NeuralAdditiveGP, NeuralSobolGP).
 
@@ -550,9 +563,9 @@ def lr_search(dataset, lr_list, kappa, devices=['cpu'], M=2048):
         ax_explore.legend(loc='lower right', fontsize='small')
         ax_explore.grid(True)
 
-        ax_regret.set_title(f'{model_name} - Log Regret')
+        ax_regret.set_title(f'{model_name} - Regret')
         ax_regret.set_xlabel('Query')
-        ax_regret.set_ylabel('Log Regret')
+        ax_regret.set_ylabel('Regret')
         ax_regret.legend(loc='upper right', fontsize='small')
         ax_regret.grid(True)
 
@@ -568,7 +581,7 @@ def lr_search(dataset, lr_list, kappa, devices=['cpu'], M=2048):
 
     return all_results
 
-def M_search_neurostim(dataset, M_list, kappa, devices=['cpu'], lr=0.01):
+def M_search_neurostim(dataset, M_list, kappa, devices=['cpu'], lr=0.1):
     """
     Run M search for NeuralSobolGP only (M only affects Sobol computation).
 
@@ -635,9 +648,9 @@ def M_search_neurostim(dataset, M_list, kappa, devices=['cpu'], lr=0.01):
     ax_explore.legend(loc='lower right', fontsize='small')
     ax_explore.grid(True)
 
-    ax_regret.set_title('NeuralSobolGP - Log Regret')
+    ax_regret.set_title('NeuralSobolGP - Regret')
     ax_regret.set_xlabel('Query')
-    ax_regret.set_ylabel('Log Regret')
+    ax_regret.set_ylabel('Regret')
     ax_regret.legend(loc='upper right', fontsize='small')
     ax_regret.grid(True)
 

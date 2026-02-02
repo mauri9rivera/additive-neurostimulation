@@ -286,9 +286,7 @@ def optimization_metrics(kappas, dataset='nhp'):
         
     ax2.set_title("Regret across runs", fontsize=14, fontweight="bold")
     ax2.set_xlabel("Iterations")
-    ax2.set_ylabel(" Log Regret")
-    #ax2.set_yscale("log")
-    ax.set_ylim(-10, 10)
+    ax2.set_ylabel("Regret")
     ax2.grid(True, which='both', linestyle='--', linewidth=0.4)
     ax2.legend(loc='upper right', fontsize='small')
 
