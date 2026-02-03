@@ -445,7 +445,7 @@ class NeuralAdditiveGP(gpytorch.models.ExactGP):
                                                                                                                                                                                                                
         kernel = gpytorch.kernels.ScaleKernel(                                                                                                                                                                 
             gpytorch.kernels.MaternKernel(                                                                                                                                                                     
-                nu=2.5, ard_num_dims=self.n_dims, batch_shape=torch.Size([self.n_dims]),                                                                                                                       
+                nu=2.5, ard_num_dims=1, batch_shape=torch.Size([self.n_dims]),                                                                                                                       
                 lengthscale_prior=lengthscale_prior                                                                                                                                                            
             ),                                                                                                                                                                                                 
             outputscale_prior=outputscale_prior                                                                                                                                                                

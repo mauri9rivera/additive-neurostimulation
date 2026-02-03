@@ -192,7 +192,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
         sobol_interactions = np.empty(MaxQueries, dtype=object)
 
         # maximum response obtained in this round
-        MaxSeenResp = 0
+        MaxSeenResp = 0.0
         q = 0
         timer = 0.0
         order_this = torch.randperm(DimSearchSpace, device=device)
@@ -209,7 +209,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
             # Query selection
             if q >= nrnd:
                 # Max of acquisition map
-                AcquisitionMap = ymu + kappa * torch.nan_to_num(torch.sqrt(ys2))
+                AcquisitionMap = torch.nan_to_num(ymu) + kappa * torch.nan_to_num(torch.sqrt(ys2))
                 Next_Elec = torch.where(
                     AcquisitionMap.reshape(len(AcquisitionMap)) == torch.max(AcquisitionMap.reshape(len(AcquisitionMap))))
                 Next_Elec = Next_Elec[0][np.random.randint(len(Next_Elec))] if len(Next_Elec[0]) > 1 else Next_Elec[0][0]
@@ -231,15 +231,18 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
 
             std = (0.02 * torch.mean(test_respo)).clamp(min=0.0)
             noise = torch.randn((), device=test_respo.device, dtype=test_respo.dtype) * std
-            test_respo = test_respo + noise
+            test_respo = (test_respo + noise).clamp(min=1e-5)
             P_test[q][1] = test_respo
 
-            if (test_respo > MaxSeenResp) or (MaxSeenResp == 0):
+            if (test_respo > MaxSeenResp) or (MaxSeenResp == 0.0):
                 MaxSeenResp = test_respo
 
             x = subject['ch2xy'][P_test[:q + 1, 0].long(), :].float()
             x = x.reshape((len(x), ndims))
             y = P_test[:q + 1, 1] / MaxSeenResp
+
+            if (torch.max(torch.abs(y)) > MaxSeenResp) or (MaxSeenResp==0.0):
+                MaxSeenResp=torch.max(torch.abs(y))
 
             # Model initialization and model update
             if q == 0:
@@ -795,5 +798,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    main()
-    #neurostim_bo('spinal', NeuralSobolGP, kappas=[25.0], devices=['cpu', 'cuda:0', 'cuda:1'] )
+    #main()
+    neurostim_bo('5d_rat', NeuralExactGP, kappas=[11.0], devices=['cpu']) #, 'cuda:0', 'cuda:1'] )

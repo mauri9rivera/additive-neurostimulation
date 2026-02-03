@@ -16,7 +16,7 @@ from neurostim_datasets import *
 DATASET_CONFIG = {
     'nhp': {
         'budget': 96,
-        'model_names': ['ExactGP', 'NeuralAdditiveGP', 'NeuralSobolGP'],
+        'model_names': ['NeuralExactGP', 'NeuralAdditiveGP', 'NeuralSobolGP'],
         'suffix': '',
         'n_emgs': [6, 8, 4, 4],
     },
@@ -28,9 +28,9 @@ DATASET_CONFIG = {
     },
     '5d_rat': {
         'budget': 100,
-        'model_names': ['NeuralExactGP', 'NeuralAdditiveGP', 'neuralSobolGP'],
+        'model_names': ['NeuralExactGP', 'NeuralAdditiveGP', 'NeuralSobolGP'],
         'suffix': '',
-        'n_emgs': [4] #, 4] #TODO: Change this when analysis done [5, 4, 4],
+        'n_emgs': [4, 1]  #TODO: Change this when analysis done [4, 4, 5],
     },
     'spinal': {
         'budget': 64,
@@ -98,7 +98,7 @@ def plot_kappas(dataset, show=True):
     # Prepare save dir
     save_dir=f'output/neurostim_experiments/{dataset}'
     os.makedirs(save_dir, exist_ok=True)
-    out_fname = f"{dataset}_kappa_comparison.svg"
+    out_fname = f"{dataset}_kappa_comparison_unresolved.svg"
     out_path = os.path.join(save_dir, out_fname)
 
 
@@ -629,15 +629,103 @@ def partition_metrics(data, dataset_type, subject_idx, kappa_idx=2, figsize_per_
     plt.close(fig)
 
 
+def plot_emg_exploration_traces(dataset, subject_idx, kappa_idx, show=True):
+    """
+    Plot exploration traces for every EMG of a given subject and kappa_idx.
+    One column per model (ExactGP, AdditiveGP, SobolGP), one row per EMG.
+    Individual repetitions are shown as semi-transparent lines and the mean
+    as a bold line, so noisy EMGs can be identified visually.
+
+    Parameters:
+    - dataset: str, one of 'nhp', 'rat', '5d_rat', 'spinal'
+    - subject_idx: int, subject index
+    - kappa_idx: int, index into the kappas array stored in the npz
+    - show: bool, whether to call plt.show()
+    """
+    npz_files = get_npz_files(dataset)
+    model_names = ['ExactGP', 'AdditiveGP', 'SobolGP']
+
+    options = set_experiment(dataset)
+    n_emgs = options['n_emgs'][subject_idx]
+
+    # Try to load EMG names from the raw dataset for labelling
+    try:
+        subject = load_data(dataset, subject_idx)
+        emg_names = [str(e).strip() for e in subject['emgs']]
+    except Exception:
+        emg_names = [f'EMG {i}' for i in range(n_emgs)]
+
+    n_models = len(npz_files)
+    fig, axes = plt.subplots(n_emgs, n_models,
+                             figsize=(5 * n_models, 3 * n_emgs),
+                             squeeze=False)
+
+    for col, filepath in enumerate(npz_files):
+        if col == 0:
+            continue
+        data = np.load(filepath, allow_pickle=True)
+        PP = np.asarray(data['PP'])
+        kappas = data['kappas']
+        n_iters = PP.shape[-1]
+        iterations = np.arange(1, n_iters + 1)
+
+        for e_i in range(n_emgs):
+            ax = axes[e_i, col]
+
+            # PP shape: (n_subjects, max_n_emgs, n_kappas, n_reps, max_queries)
+            traces = PP[subject_idx, e_i, kappa_idx]  # (n_reps, n_iters)
+
+            # Individual reps
+            for r in range(traces.shape[0]):
+                ax.plot(iterations, traces[r],
+                        color='steelblue', alpha=0.15, linewidth=0.8)
+
+            # Mean trace
+            mean_trace = np.mean(traces, axis=0)
+            ax.plot(iterations, mean_trace,
+                    color='darkblue', linewidth=1.5, label='mean')
+
+            ax.set_ylim(0.0, 1.05)
+            ax.set_xlim(1, n_iters)
+            ax.grid(True, linestyle='--', linewidth=0.4)
+
+            if col == 0:
+                label = emg_names[e_i] if e_i < len(emg_names) else f'EMG {e_i}'
+                ax.set_ylabel(label, fontsize=9)
+            if e_i == 0:
+                ax.set_title(f'{model_names[col]} (κ={float(kappas[kappa_idx])})')
+            if e_i == n_emgs - 1:
+                ax.set_xlabel('Iterations')
+
+    fig.suptitle(
+        f'Exploration traces per EMG | {dataset} subject {subject_idx} | kappa_idx={kappa_idx}',
+        fontsize=14)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    save_dir = f'output/neurostim_experiments/{dataset}'
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(
+        save_dir,
+        f'{dataset}_emg_traces_subj{subject_idx}_kappa{kappa_idx}.svg')
+    fig.savefig(out_path, bbox_inches='tight', dpi=200)
+    print(f'Saved EMG exploration traces to {out_path}')
+    if show:
+        plt.show()
+    plt.close(fig)
+
 
 if __name__ == '__main__':
 
 
     # Plot optimization metrics for rat dataset
-    optimization_metrics(kappas=[2, -1, -1], dataset='5d_rat')
+    optimization_metrics(kappas=[4, -1, -2], dataset='spinal')
 
     # Plot kappa comparison
-    #plot_kappas(dataset='5d_rat')
+    #plot_kappas(dataset='spinal')
+
+    #plot_emg_exploration_traces('5d_rat', 1, -1)
+    # EMG exploration traces for 5d_rat
+    # plot_emg_exploration_traces('5d_rat', subject_idx=0, kappa_idx=0)
 
     # Partition metrics (still requires loading data manually for SobolGP file)
     # npz_files = get_npz_files('spinal')
