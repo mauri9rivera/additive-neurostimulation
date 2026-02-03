@@ -798,5 +798,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
 
-    #main()
-    neurostim_bo('5d_rat', NeuralExactGP, kappas=[11.0], devices=['cpu']) #, 'cuda:0', 'cuda:1'] )
+    main()
+    #neurostim_bo('5d_rat', NeuralExactGP, kappas=[11.0], devices=['cpu']) #, 'cuda:0', 'cuda:1'] )

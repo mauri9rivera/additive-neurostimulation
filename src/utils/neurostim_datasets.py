@@ -91,9 +91,9 @@ def set_experiment(dataset_type):
         options['rho_low']=0.001
         options['nrnd']=1 #has to be >= 1
         options['noise_max']=0.055
-        options['n_subjects']= 1 #TODO after analysis 3
+        options['n_subjects']= 2 #TODO after analysis 3
         options['n_queries']= 100
-        options['n_emgs'] = [4] #TODO after analysis [4, 4, 5]
+        options['n_emgs'] = [4, 1] #TODO after analysis [4, 4, 5]
         options['n_dims'] = 5
     elif dataset_type == 'spinal':
         options['noise_min']=0.05
