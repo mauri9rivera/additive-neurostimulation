@@ -8,7 +8,7 @@ from scipy.stats import qmc, uniform
 import tntorch as tn
 import gpytorch
 
-def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
+def optimize(gp, train_x, train_y, n_iter=50, lr=0.01):
     """
     Train an GP + Likelihood model.
 
@@ -301,7 +301,7 @@ class Sobol:
             norm_factor = np.sum(ST)
             S1_boot[b] = S1 #/ norm_factor
             ST_boot_norm[b] = ST / norm_factor
-            high_boot[b] = 1 - (S1_boot[b] / ST_boot_norm[b]) #ST_boot_norm[b] - S1_boot[b]     # higher-order index
+            high_boot[b] = 1 - np.clip((S1_boot[b] / (ST_boot_norm[b] + 1e-4)), 0.0 , 1.0) #ST_boot_norm[b] - S1_boot[b]     # higher-order index
 
         # ---- Aggregation over bootstrap ----
         high_mean = high_boot.mean(axis=0)

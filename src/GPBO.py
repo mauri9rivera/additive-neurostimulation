@@ -55,7 +55,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
     # --------------------------------------------------------
 
     # Initiate n_init points, bounds
-    n_points = int(100 * f_obj.d**2)
+    n_points = np.clip(int(100 * f_obj.d**2), 1, 10000)
     bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float().to(device)  # shape (2, d)
     lower, upper = bounds[0], bounds[1]
     grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d, device=device)
@@ -84,6 +84,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
 
     # Additional metrics
     sobol_interactions = []
+    lengthscale_history = []
 
     # Initialize executor
     executor = ThreadPoolExecutor(max_workers=sobol_workers)
@@ -91,7 +92,9 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
 
     # initialize model 
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-    model = model_cls(train_x, train_y, likelihood).to(device)
+    y_range = current_max - current_min
+    train_y_norm = (train_y - current_min) / y_range
+    model = model_cls(train_x, train_y_norm, likelihood).to(device)
     model.sobol = sobol
     interactions = np.zeros(f_obj.d, dtype=float)
     # main optimization loop
@@ -102,6 +105,8 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
         y_range = current_max - current_min
         train_y_norm = (train_y - current_min) / y_range
         model, likelihood, epoch_losses = optimize(model, train_x, train_y_norm)
+        ls_vec = extract_lengthscales_log(model, f_obj.d)
+        lengthscale_history.append(ls_vec.cpu().numpy() if ls_vec is not None else np.full(f_obj.d, np.nan))
         loss_curve.append(np.mean(epoch_losses))
 
         new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
@@ -113,16 +118,16 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
             current_min = new_y_val
         if new_y_val > current_max:
             current_max = new_y_val
-            
+
         # Keep your original tracking for the final score
         if new_y_val > true_best:
             true_best = new_y_val
         if new_y_val < grid_min:
             grid_min = new_y_val
-        
+
         train_x = torch.cat([train_x, new_x])
         train_y  = torch.cat([train_y, new_y])
-        
+
         # Posterior predictions for R^2
         model.eval(); likelihood.eval()
         with warnings.catch_warnings():
@@ -159,13 +164,13 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
             space_reconfiguration = None
         else:
             sobol_interactions.append(interactions)
-            
+
         t1 = time.time()
         elapsed_train = t1 - t0
         train_times.append(elapsed_train)
         model = model_cls(train_x, train_y_norm, likelihood,
-                          model.partition, model.history, model.sobol).to(device) 
-        
+                          model.partition, model.history, model.sobol).to(device)
+
 
         # Submit a new Sobol background job every n_sobol iterations (if none pending)
         if  i > n_sobol: #(i % n_sobol) == 0:
@@ -175,13 +180,13 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
                     y_range = current_max - current_min
                     train_y_norm = (train_y - current_min) / y_range
                     surrogate = ExactGP(train_x, train_y_norm, surrogate_likelihood).to(device)
-                    space_reconfiguration = executor.submit(sobol.method, train_x, train_y_norm, surrogate)
+                    space_reconfiguration = executor.submit(sobol.method, train_x, train_y, surrogate)
                 except Exception as e:
                     space_reconfiguration = None
                     print(f"[Sobol] submit failed: {e}")
 
         if verbose:
-            print(f"Iter {i+1:02d} Loss: {epoch_losses:.4f} Exploit score: {exploit:.4f}, Explore score: {explore:.4f}, R^2: {r2_score:.4f} | partition: {model.partition}")
+            print(f"Iter {i+1:02d} Loss: {np.mean(epoch_losses):.4f} Exploit score: {exploit:.4f}, Explore score: {explore:.4f}, R^2: {r2_score:.4f} | partition: {model.partition}")
             print(f'best observed: {best_observed:.4f} |  true best: {true_best:.4f} | current query: {new_y.item():.4f}')
 
     executor.shutdown(wait=False)
@@ -212,8 +217,243 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
         'loss_curve': np.array(loss_curve),
         'regrets': np.array(regrets),
         'sobol_interactions': sobol_interactions,
-        'train_times': train_times,        
-        'cumulative_time': cumulative_time 
+        'lengthscales': np.array(lengthscale_history),
+        'train_times': train_times,
+        'cumulative_time': cumulative_time
+    }
+    return result
+
+def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
+              M=1024, epsilon=0.25,
+              W=8, delta=0.01, cooldown=5, gamma=0.5,
+              save=False, verbose=False, device='cpu'):
+    """
+    Adaptive-Trigger Bayesian Optimization.
+
+    Structurally identical to run_partitionbo but replaces the static
+    ``if i > n_sobol`` trigger with an event-driven mechanism:
+      1. MLL Stagnation Trigger — fires when the rolling MLL gain drops below delta
+      2. Hyperparameter Stability Gate — prevents triggering while lengthscales are still moving
+
+    Parameters
+    ----------
+    W : int
+        Rolling window size for MLL stagnation detection.
+    delta : float
+        MLL gain threshold below which stagnation is detected.
+    cooldown : int
+        Minimum BO iterations between consecutive Sobol triggers.
+    gamma : float
+        Max hyperparameter velocity (L2 norm of log-lengthscale change) to pass the stability gate.
+    """
+
+    device = torch.device(device)
+    f_obj.to(device)
+
+    sobol_workers = 1
+
+    # Initiate n_init points, bounds
+    n_points = np.clip(int(100 * f_obj.d**2), 1, 10000)
+    bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float().to(device)
+    lower, upper = bounds[0], bounds[1]
+    grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d, device=device)
+    with torch.no_grad():
+        grid_y = f_obj.f.forward(grid_x).float().squeeze(-1)
+    grid_min = grid_y.min().item()
+
+    # Initiate training set
+    n_init = np.clip(f_obj.d*3, 1, 20)
+    sobol = Sobol(f_obj, M=M).to(device)
+    sobol.epsilon = epsilon
+    true_best = grid_y.max().item()
+    sampler = qmc.LatinHypercube(d=f_obj.d)
+    sample = sampler.random(n=n_init)
+    sample_scaled = qmc.scale(sample, lower.cpu(), upper.cpu())
+    train_x_cpu = torch.from_numpy(sample_scaled).float()
+    train_x = train_x_cpu.to(device)
+    train_y = f_obj.f.forward(train_x)
+    best_observed = train_y.max().item()
+
+    current_min = min(grid_min, train_y.min().item())
+    current_max = max(true_best, train_y.max().item())
+
+    # initialize metrics
+    r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = (
+        [0.0 for _ in range(n_init)], [], [0.0 for _ in range(n_init)],
+        [0.0 for _ in range(n_init)], [1.0 for _ in range(n_init)], [0.0 for _ in range(n_init)]
+    )
+
+    sobol_interactions = []
+
+    # Adaptive trigger state
+    mll_history = []
+    theta_prev = None
+    t_last_sobol = -cooldown   # allows first trigger after warmup
+    trigger_log = []
+    lengthscale_history = []
+
+    # Initialize executor
+    executor = ThreadPoolExecutor(max_workers=sobol_workers)
+    space_reconfiguration = None
+
+    # initialize model
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    model = model_cls(train_x, train_y, likelihood).to(device)
+    model.sobol = sobol
+    interactions = np.zeros(f_obj.d, dtype=float)
+
+    # main optimization loop
+    for i in range(n_iter - n_init):
+
+        # Train model
+        t0 = time.time()
+        y_range = current_max - current_min
+        train_y_norm = (train_y - current_min) / y_range
+        model, likelihood, epoch_losses = optimize(model, train_x, train_y_norm)
+        ls_vec = extract_lengthscales_log(model, f_obj.d)
+        lengthscale_history.append(ls_vec.cpu().numpy() if ls_vec is not None else np.full(f_obj.d, np.nan))
+        loss_curve.append(np.mean(epoch_losses))
+        mll_history.append(epoch_losses[-1])  # final-epoch MLL
+
+        new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
+        new_y = f_obj.f.forward(new_x)
+
+        # Update global bounds
+        new_y_val = new_y.item()
+        if new_y_val < current_min:
+            current_min = new_y_val
+        if new_y_val > current_max:
+            current_max = new_y_val
+        if new_y_val > true_best:
+            true_best = new_y_val
+        if new_y_val < grid_min:
+            grid_min = new_y_val
+
+        train_x = torch.cat([train_x, new_x])
+        train_y = torch.cat([train_y, new_y])
+
+        # Posterior predictions for R^2
+        model.eval(); likelihood.eval()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=gpytorch.utils.warnings.GPInputWarning if hasattr(gpytorch.utils, "warnings") else Warning)
+            with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                post = likelihood(model(grid_x))
+
+            y_true = ((grid_y.squeeze(-1) - grid_min) / (true_best - grid_min)).cpu()
+            y_pred = post.mean.cpu()
+            ss_res = torch.sum((y_true - y_pred) ** 2)
+            ss_tot = torch.sum((y_true - y_true.mean()) ** 2)
+            r2_score = np.clip(1 - (ss_res / ss_tot), 0.0, 1.0)
+            r_squared.append(r2_score.item())
+
+        # Exploration and Exploitation scores
+        best_observed = train_y.max().item()
+        explore = (best_observed - grid_min) / (true_best - grid_min + 1e-9)
+        exploit = (new_y.item() - grid_min) / (true_best - grid_min + 1e-9)
+        explore = np.clip(explore, 0.0, 1.0)
+        exploit = np.clip(exploit, 0.0, 1.0)
+        exploit_scores.append(exploit.item())
+        expl_scores.append(explore.item())
+
+        # Regret scores
+        regret = true_best - best_observed + 1e-9
+        regrets.append(regret)
+
+        # If there is a pending Sobol job finished, fetch it and update partition
+        if space_reconfiguration is not None and space_reconfiguration.done():
+            interactions = space_reconfiguration.result()
+            new_partition = sobol.update_partition(interactions)
+            model.update_partition(new_partition)
+            sobol_interactions.append(interactions)
+            space_reconfiguration = None
+            theta_prev = None  # dimension of lengthscale vector changed
+        else:
+            sobol_interactions.append(interactions)
+
+        t1 = time.time()
+        elapsed_train = t1 - t0
+        train_times.append(elapsed_train)
+        model = model_cls(train_x, train_y_norm, likelihood,
+                          model.partition, model.history, model.sobol).to(device)
+
+        # Extract lengthscales and compute velocity
+        theta_curr = extract_lengthscales_log(model)
+        if (theta_prev is not None and theta_curr is not None
+                and theta_prev.shape == theta_curr.shape):
+            v_t = torch.norm(theta_curr - theta_prev, p=2).item()
+        else:
+            v_t = float('inf')
+        theta_prev = theta_curr
+
+        # Adaptive trigger
+        t = len(mll_history)
+
+        # Metric 1: MLL Stagnation
+        mll_trigger = False
+        if t >= 2 * W:
+            G_t = abs(np.mean(mll_history[t-W:t]) - np.mean(mll_history[t-2*W:t-W]))
+            mll_trigger = (G_t < delta)
+        else:
+            G_t = float('inf')
+
+        # Metric 2: Hyperparameter Stability Gate
+        hp_gate = (v_t < gamma)
+
+        # Combined decision
+        should_trigger = mll_trigger and hp_gate and (i - t_last_sobol > cooldown)
+
+        if should_trigger:
+            if space_reconfiguration is None or space_reconfiguration.done():
+                try:
+                    surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+                    y_range = current_max - current_min
+                    train_y_norm = (train_y - current_min) / y_range
+                    surrogate = ExactGP(train_x, train_y_norm, surrogate_likelihood).to(device)
+                    space_reconfiguration = executor.submit(sobol.method, train_x, train_y_norm, surrogate)
+                    t_last_sobol = i
+                    trigger_log.append({'iter': i + n_init, 'G_t': G_t, 'v_t': v_t})
+                except Exception as e:
+                    space_reconfiguration = None
+                    print(f"[Sobol] submit failed: {e}")
+
+        if verbose:
+            trigger_info = f" G_t={G_t:.4f} v_t={v_t:.4f}" if t >= 2 * W else ""
+            triggered_str = " [AT] Sobol triggered!" if (should_trigger and space_reconfiguration is not None) else ""
+            print(f"Iter {i+1:02d} Loss: {np.mean(epoch_losses):.4f} Exploit: {exploit:.4f}, Explore: {explore:.4f}, R^2: {r2_score:.4f} | partition: {model.partition}{trigger_info}{triggered_str}")
+            print(f'best observed: {best_observed:.4f} |  true best: {true_best:.4f} | current query: {new_y.item():.4f}')
+
+    executor.shutdown(wait=False)
+
+    # compute cumulative training time per-iteration
+    train_times = np.array(train_times, dtype=np.float64)
+    cumulative_time = np.cumsum(train_times)
+
+    if save:
+        output_dir = os.path.join("output", "breaking_additivity", "AT_BO")
+        os.makedirs(output_dir, exist_ok=True)
+        fname = f"AT_BO_{datetime.date.today().isoformat()}_kappa{kappa}_{f_obj.name}.npz"
+        fpath = os.path.join(output_dir, fname)
+        np.savez(fpath,
+                 r_squared=np.array(r_squared),
+                 loss_curve=np.array(loss_curve),
+                 exploration=np.array(expl_scores),
+                 exploitation=np.array(exploit_scores),
+                 regrets=np.array(regrets),
+                 sobol_interactions=np.array(sobol_interactions, dtype=object),
+                 mll_history=np.array(mll_history))
+
+    result = {
+        'r2': np.array(r_squared),
+        'exploration': np.array(expl_scores),
+        'exploitation': np.array(exploit_scores),
+        'loss_curve': np.array(loss_curve),
+        'regrets': np.array(regrets),
+        'sobol_interactions': sobol_interactions,
+        'lengthscales': np.array(lengthscale_history),
+        'train_times': train_times,
+        'cumulative_time': cumulative_time,
+        'trigger_log': trigger_log,
+        'mll_history': np.array(mll_history),
     }
     return result
 
@@ -223,7 +463,7 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
     device = torch.device(device)
 
     # Initiate n_init points, bounds
-    n_points = int(100 * f_obj.d**2)
+    n_points = np.clip(int(100 * f_obj.d**2), 1, 10000)
     bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float().to(device)  # shape (2, d)
     lower, upper = bounds[0], bounds[1]
     grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d, device=device)
@@ -247,7 +487,8 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
 
     #initialize metrics
     r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [0.0 for i in range(n_init)], [], [0.0 for i in range(n_init)], [0.0 for i in range(n_init)], [1.0 for i in range(n_init)], [0.0 for i in range(n_init)]
-    
+    lengthscale_history = []
+
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
     model = model_cls(train_x, train_y, likelihood).to(device)
 
@@ -258,6 +499,8 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
         y_range = current_max - current_min
         train_y_norm = (train_y - current_min) / y_range
         model, likelihood, epoch_losses = optimize(model, train_x, train_y_norm)
+        ls_vec = extract_lengthscales_log(model, f_obj.d)
+        lengthscale_history.append(ls_vec.cpu().numpy() if ls_vec is not None else np.full(f_obj.d, np.nan))
 
         loss_curve.append(np.mean(epoch_losses))
         new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
@@ -345,8 +588,9 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
         'exploitation': exploitation,
         'loss': loss_curve,
         'regrets': regrets,
-        'train_times': train_times,        
-        'cumulative_time': cumulative_time 
+        'lengthscales': np.array(lengthscale_history),
+        'train_times': train_times,
+        'cumulative_time': cumulative_time
        }
 
 def run_single_kappa(kappa, device, f_obj, model_cls, n_iter, n_reps, bo_method):
@@ -1231,6 +1475,123 @@ def internal_representation(f_obj, model_cls=SobolGP, n_iter=200, n_sobol=30, ka
 
     return {'snapshots': snapshots, 'true_map': true_map}
 
+def _run_single_lengthscale(rep, device, f_obj, model_cls, n_iter, kappa,
+                            n_sobol, M, epsilon, W, delta, cooldown, gamma):
+    """
+    Worker function that runs a single BO rep and returns the lengthscale trace.
+    """
+    model_name = model_cls.__name__
+    f_obj.to(device)
+
+    print(f"[Worker {device}] Starting {model_name} rep {rep+1}")
+
+    try:
+        if model_cls is MHGP:
+            result = run_AT_BO(f_obj, model_cls, n_iter=n_iter, kappa=kappa,
+                               M=M, epsilon=epsilon,
+                               W=W, delta=delta, cooldown=cooldown, gamma=gamma,
+                               save=False, verbose=False, device=device)
+        elif model_cls is SobolGP:
+            result = run_partitionbo(f_obj, model_cls, n_iter=n_iter, n_sobol=n_sobol,
+                                     kappa=kappa, M=M, epsilon=epsilon,
+                                     save=False, verbose=False, device=device)
+        else:
+            result = run_bo(f_obj, model_cls, n_iter=n_iter, kappa=kappa,
+                            save=False, verbose=False, device=device)
+
+        return result['lengthscales']  # keep in log-space
+    except Exception as e:
+        print(f"FAILED: {model_name} rep {rep+1} on {device}: {e}")
+        traceback.print_exc()
+        return None
+
+def visualize_lengthscales(f_obj, model_cls, n_iter=200, n_reps=10, n_sobol=30, kappa=1.0,
+                           M=1024, epsilon=0.25,
+                           W=8, delta=0.01, cooldown=5, gamma=0.5,
+                           save=True, verbose=False, devices=['cpu']):
+    """
+    Run n_reps BO experiments in parallel across devices and plot averaged
+    per-dimension lengthscale evolution.
+
+    Dispatches to the appropriate runner based on model_cls:
+      - SobolGP  -> run_AT_BO
+      - MHGP     -> run_partitionbo
+      - otherwise -> run_bo
+    """
+    model_name = model_cls.__name__
+    d = f_obj.d
+    num_workers = len(devices)
+
+    print(f"\nStarting Lengthscale Visualization with {num_workers} workers on devices: {devices}")
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for rep in range(n_reps):
+            assigned_device = devices[rep % num_workers]
+            future = executor.submit(
+                _run_single_lengthscale,
+                rep, assigned_device, f_obj, model_cls, n_iter, kappa,
+                n_sobol, M, epsilon, W, delta, cooldown, gamma
+            )
+            futures.append(future)
+
+        all_ls = []
+        for future in as_completed(futures):
+            ls = future.result()
+            if ls is not None:
+                all_ls.append(ls)
+
+    if not all_ls:
+        print("All reps failed — no plot generated.")
+        return None
+
+    # Stack: (n_reps, n_iter - n_init, d) — values are already in log-space
+    all_ls = np.array(all_ls)
+    mean_ls = np.mean(all_ls, axis=0)
+    std_ls = np.std(all_ls, axis=0)
+
+    n_init = np.clip(d * 3, 1, 20)
+    iters = np.arange(n_init + 1, n_init + 1 + mean_ls.shape[0])
+
+    # SCoreBO Figure 8 style: 1xd grid of subplots, y-limits [-1, 1]
+    fig, axes = plt.subplots(1, d, figsize=(4.5 * d, 6), squeeze=False)
+    axes = axes.flatten()
+    colors = plt.cm.tab10(np.linspace(0, 1, d))
+
+    for dim_i in range(d):
+        ax = axes[dim_i]
+        color = colors[dim_i]
+        ax.plot(iters, mean_ls[:, dim_i], color=color, linewidth=1.5)
+        ax.fill_between(iters,
+                        mean_ls[:, dim_i] - std_ls[:, dim_i],
+                        mean_ls[:, dim_i] + std_ls[:, dim_i],
+                        color=color, alpha=0.2)
+
+        ax.set_ylim(-1, 1)
+        ax.axhline(y=0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+        ax.grid(True, linestyle='--', linewidth=0.4, alpha=0.5)
+        ax.set_title(f'$\\ell_{{{dim_i + 1}}}$', fontsize=12)
+        ax.set_xlabel('Iteration', fontsize=10)
+        if dim_i == 0:
+            ax.set_ylabel('log lengthscale', fontsize=10)
+
+    fig.suptitle(
+        f'Lengthscale Convergence | {model_name} on {d}d-{f_obj.name} (kappa={kappa}, n={len(all_ls)})',
+        fontsize=13
+    )
+    plt.tight_layout()
+
+    if save:
+        output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
+        os.makedirs(output_dir, exist_ok=True)
+        fname = f'lengthscales_{model_name}_{d}d-{f_obj.name}_kappa{kappa}.svg'
+        fpath = os.path.join(output_dir, fname)
+        plt.savefig(fpath, format='svg')
+        print(f"Saved lengthscale plot to {fpath}")
+
+    plt.close(fig)
+    return {'mean_lengthscales': mean_ls, 'std_lengthscales': std_ls}
+
 ### Parser handling
 def _parse_list_of_floats(text):
     if text is None:
@@ -1262,8 +1623,8 @@ def main(argv=None):
     parser.add_argument('--negate', choices=['auto','true','false'], default='auto', help='Negate objective? if auto will use default mapping in script')
 
     # Method selection
-    parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, kappa_search, optimization_metrics, partition_reconstruction')
-    parser.add_argument('--model_cls', type=str, default='ExactGP', help='Model class name (ExactGP, AdditiveGP, SobolGP, MHGP)')
+    parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, run_AT_BO, kappa_search, optimization_metrics, partition_reconstruction, visualize_lengthscales')
+    parser.add_argument('--model_cls', type=str, default='ExactGP', help='Model class name (ExactGP, AdditiveGP, AdditiveDuvenaudGP, SobolGP, MHGP)')
     parser.add_argument('--bo_method', type=str, default='run_bo', help='BO method used by higher-level routines (run_bo or run_partitionbo)')
 
     # Method-specific params
@@ -1277,6 +1638,12 @@ def main(argv=None):
     parser.add_argument('--epsilon_list', type=_parse_list_of_floats, default=None, help='Comma-separated epsilon values for epsilon_search (e.g. 0.1,0.15,0.2,0.25,0.3)')
     parser.add_argument('--M', type=int, default=1024, help='Sobol MC samples (default 1024)')
     parser.add_argument('--epsilon', type=float, default=0.25, help='Additivity threshold (default 0.25)')
+
+    # Adaptive trigger params (run_AT_BO)
+    parser.add_argument('--W', type=int, default=10, help='Rolling window size for MLL stagnation (default 10)')
+    parser.add_argument('--delta', type=float, default=0.01, help='MLL gain threshold for stagnation detection (default 0.01)')
+    parser.add_argument('--cooldown', type=int, default=15, help='Min BO iterations between Sobol triggers (default 15)')
+    parser.add_argument('--gamma', type=float, default=0.5, help='Max hyperparameter velocity for stability gate (default 0.5)')
 
     #  Device Flags ---
     parser.add_argument('--device', type=str, default='cpu', help='Device for single runs (e.g. cuda:0)')
@@ -1295,6 +1662,7 @@ def main(argv=None):
     model_map = {
         'ExactGP': ExactGP,
         'AdditiveGP': AdditiveGP,
+        'AdditiveDuvenaudGP': AdditiveDuvenaudGP,
         'SobolGP': SobolGP,
         'MHGP': MHGP,
     }
@@ -1302,11 +1670,13 @@ def main(argv=None):
     method_map = {
         'run_bo': run_bo,
         'run_partitionbo': run_partitionbo,
+        'run_AT_BO': run_AT_BO,
         'kappa_search': kappa_search,
         'M_search': M_search,
         'epsilon_search': epsilon_search,
         'optimization_metrics': optimization_metrics,
         'internal_representation': internal_representation,
+        'visualize_lengthscales': visualize_lengthscales,
     }
 
     if args.list_models:
@@ -1327,8 +1697,8 @@ def main(argv=None):
     if args.method not in method_map:
         raise ValueError(f"Unknown method '{args.method}'. Use --list_methods to see options.")
 
-    if args.bo_method not in ['run_bo', 'run_partitionbo']:
-        raise ValueError("bo_method must be 'run_bo' or 'run_partitionbo'")
+    if args.bo_method not in ['run_bo', 'run_partitionbo', 'run_AT_BO']:
+        raise ValueError("bo_method must be 'run_bo', 'run_partitionbo', or 'run_AT_BO'")
 
     model_cls = model_map[args.model_cls]
     bo_method = run_partitionbo if args.model_cls in ['MHGP', 'SobolGP'] else run_bo
@@ -1363,6 +1733,13 @@ def main(argv=None):
                             M=args.M, epsilon=args.epsilon,
                             save=args.save, verbose=args.verbose, device=args.device)
 
+        elif args.method == 'run_AT_BO':
+            result = run_AT_BO(f_obj, model_cls, n_iter=args.n_iter, kappa=args.kappa,
+                               M=args.M, epsilon=args.epsilon,
+                               W=args.W, delta=args.delta,
+                               cooldown=args.cooldown, gamma=args.gamma,
+                               save=args.save, verbose=args.verbose, device=args.device)
+
         elif args.method == 'kappa_search':
             # Provide a default kappa list if none given
             k_list = args.kappa_list or [0.5, 1.0, 3.0, 5.0, 7.0, 9.0, 15.0]
@@ -1383,13 +1760,18 @@ def main(argv=None):
             if args.kappas is None: raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values)')
             kappas = args.kappas
             result = optimization_metrics(f_obj, kappas, n_iter=args.n_iter, n_reps=args.n_reps, devices=device_list)
-        elif args.method == 'partition_reconstruction':
-            result = partition_reconstruction(f_obj, SobolGP, n_iter=args.n_iter, n_reps= args.n_reps, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose, device=args.device)
         elif args.method == 'internal_representation':
             if args.dim != 2:
                 raise ValueError("internal_representation only supports 2D functions (--dim 2)")
             result = internal_representation(f_obj, model_cls, n_iter=args.n_iter, n_sobol=args.n_sobol,
                                              kappa=args.kappa, save=args.save, verbose=args.verbose, device=args.device)
+        elif args.method == 'visualize_lengthscales':
+            result = visualize_lengthscales(
+                f_obj, model_cls, n_iter=args.n_iter, n_reps=args.n_reps,
+                n_sobol=args.n_sobol,
+                kappa=args.kappa, M=args.M, epsilon=args.epsilon,
+                W=args.W, delta=args.delta, cooldown=args.cooldown, gamma=args.gamma,
+                save=True, verbose=args.verbose, devices=device_list)
         else:
             raise ValueError('Unsupported method')
 
@@ -1404,3 +1786,5 @@ def main(argv=None):
 if __name__ == '__main__':
 
     main()
+    
+

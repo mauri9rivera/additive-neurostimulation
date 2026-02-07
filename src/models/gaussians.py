@@ -24,7 +24,7 @@ def optimize(gp, train_x, train_y, n_iter=50, lr=0.01):
         lr: float, learning rate
 
     Returns:
-        gp (trained), likelihood (trained), mean_epoch_loss (float)
+        gp (trained), likelihood (trained), epoch_losses (list of float)
     """
 
     # training inputs alignmnet
@@ -49,8 +49,34 @@ def optimize(gp, train_x, train_y, n_iter=50, lr=0.01):
         optimizer.step()
         epoch_losses.append(loss.item())
 
-    mean_loss = float(np.mean(epoch_losses))
-    return gp, gp.likelihood, mean_loss
+    return gp, gp.likelihood, epoch_losses
+
+def extract_lengthscales_log(model, d=None):
+    """Extract per-dimension kernel lengthscales as a (d,) tensor in log-space.
+
+    Returns a tensor where index i is the log-lengthscale for input dimension i,
+    regardless of kernel structure (fully-coupled, batched-additive, or partitioned).
+    """
+    try:
+        if hasattr(model.covar_module, 'kernels'):
+            # AdditiveKernel (SobolGP, MHGP) — multiple ScaleKernel(MaternKernel)
+
+            d = model.n_dims
+            device = next(model.parameters()).device
+            result = torch.zeros(d, device=device)
+            for kernel in model.covar_module.kernels:
+                ls = kernel.base_kernel.lengthscale.detach().flatten()
+                active = kernel.base_kernel.active_dims
+                for j, dim_idx in enumerate(active):
+                    result[int(dim_idx)] = torch.log(ls[j])
+            return result
+        elif hasattr(model.covar_module, 'base_kernel'):
+            # ExactGP or AdditiveGP — single ScaleKernel wrapping base kernel
+            ls = model.covar_module.base_kernel.lengthscale.detach()
+            return torch.log(ls.flatten())
+        return None
+    except Exception:
+        return None
 
 def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points, mode='normal'):
     """
@@ -87,8 +113,9 @@ def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points, mode='normal')
 class ExactGP(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood):
         super(ExactGP, self).__init__(train_x, train_y, likelihood)
+        self.n_dims = train_x.shape[-1]
         self.mean_module = gpytorch.means.ConstantMean()
-        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=train_x.shape[-1]))
+        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=train_x.shape[-1]))
         self.likf = likelihood
         self.name = 'ExactGP'
 
@@ -102,6 +129,7 @@ class AdditiveGP(gpytorch.models.ExactGP):
     def __init__(self, X_train, y_train, likelihood):
         super().__init__(X_train, y_train, likelihood)
         input_dim = X_train.shape[-1]
+        self.n_dims = input_dim
         self.covar_module = gpytorch.kernels.ScaleKernel(
                                 gpytorch.kernels.MaternKernel(
                                     nu=2.5,
@@ -122,6 +150,49 @@ class AdditiveGP(gpytorch.models.ExactGP):
         mean = self.mean_module(X)
         batched_dimensions_of_X = X.mT.unsqueeze(-1)  # Now a d x n x 1 tensor
         covar = self.covar_module(batched_dimensions_of_X).sum(dim=-3)
+        return gpytorch.distributions.MultivariateNormal(mean, covar)
+
+class AdditiveDuvenaudGP(gpytorch.models.ExactGP):
+    """
+    Duvenaud-style additive GP (Duvenaud et al., 2011).
+
+    Uses gpytorch.utils.sum_interaction_terms to compute the sum of all
+    interaction terms up to `max_degree` from d univariate Matern-5/2 kernels.
+    With max_degree=1 this is identical to AdditiveGP; with max_degree=2 it
+    adds all pairwise interaction products k_i * k_j, etc.
+    """
+
+    def __init__(self, X_train, y_train, likelihood, max_degree=3):
+        super().__init__(X_train, y_train, likelihood)
+        input_dim = X_train.shape[-1]
+        self.n_dims = input_dim
+        self.max_degree = min(max_degree, input_dim)
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.MaternKernel(
+                nu=2.5,
+                batch_shape=torch.Size([input_dim]),
+                ard_num_dims=1,
+            )
+        )
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.likelihood = likelihood
+        self.name = 'AdditiveDuvenaudGP'
+
+    @property
+    def num_outputs(self):
+        return 1
+
+    def forward(self, X):
+        mean = self.mean_module(X)
+        batched_dimensions_of_X = X.mT.unsqueeze(-1)  # d x n x 1
+        univariate_covars = self.covar_module(batched_dimensions_of_X)
+        covar = gpytorch.utils.sum_interaction_terms(
+            univariate_covars, max_degree=self.max_degree, dim=-3
+        )
+        # Newton-Girard subtraction can push near-zero eigenvalues negative;
+        # add small diagonal jitter to keep the matrix numerically PSD.
+        jitter = 1e-4 * torch.eye(covar.shape[-1], device=X.device, dtype=X.dtype)
+        covar = covar + jitter
         return gpytorch.distributions.MultivariateNormal(mean, covar)
 
 class MHGP(gpytorch.models.ExactGP):

@@ -30,7 +30,7 @@ DATASET_CONFIG = {
         'budget': 100,
         'model_names': ['NeuralExactGP', 'NeuralAdditiveGP', 'NeuralSobolGP'],
         'suffix': '',
-        'n_emgs': [4, 1]  #TODO: Change this when analysis done [4, 4, 5],
+        'n_emgs': [4]  #TODO: Change this when analysis done [4, 4, 5],
     },
     'spinal': {
         'budget': 64,
@@ -98,7 +98,7 @@ def plot_kappas(dataset, show=True):
     # Prepare save dir
     save_dir=f'output/neurostim_experiments/{dataset}'
     os.makedirs(save_dir, exist_ok=True)
-    out_fname = f"{dataset}_kappa_comparison_unresolved.svg"
+    out_fname = f"{dataset}_kappa_comparison.svg"
     out_path = os.path.join(save_dir, out_fname)
 
 
@@ -717,11 +717,12 @@ def plot_emg_exploration_traces(dataset, subject_idx, kappa_idx, show=True):
 if __name__ == '__main__':
 
 
-    # Plot optimization metrics for rat dataset
-    optimization_metrics(kappas=[4, -1, -2], dataset='spinal')
+    # Plot optimizacdtion metrics for rat dataset
+    optimization_metrics(kappas=[2, 3, 2], dataset='5d_rat')
 
     # Plot kappa comparison
-    #plot_kappas(dataset='spinal')
+
+    #plot_kappas(dataset='5d_rat')
 
     #plot_emg_exploration_traces('5d_rat', 1, -1)
     # EMG exploration traces for 5d_rat
