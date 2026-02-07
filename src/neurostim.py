@@ -310,7 +310,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
             q += 1
 
         # estimate current exploration performance
-        perf_explore = (MPm[P_max].reshape((len(MPm[P_max]))) / mMPm).cpu().numpy()
+        perf_explore = np.maximum.accumulate((MPm[P_max].reshape(-1) / mMPm).cpu().numpy())
         # estimate current exploitation performance
         perf_exploit = P_test[:, 0].long().cpu().numpy()
         # R^2 correlation with ground truth

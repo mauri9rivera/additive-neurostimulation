@@ -55,7 +55,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
     # --------------------------------------------------------
 
     # Initiate n_init points, bounds
-    n_points = int(100 * f_obj.d**2)
+    n_points = np.clip(int(100 * f_obj.d**2), 1, 5000)
     bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float().to(device)  # shape (2, d)
     lower, upper = bounds[0], bounds[1]
     grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d, device=device)
@@ -91,7 +91,9 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
 
     # initialize model 
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-    model = model_cls(train_x, train_y, likelihood).to(device)
+    y_range = current_max - current_min
+    train_y_norm = (train_y - current_min) / y_range
+    model = model_cls(train_x, train_y_norm, likelihood).to(device)
     model.sobol = sobol
     interactions = np.zeros(f_obj.d, dtype=float)
     # main optimization loop
@@ -113,16 +115,16 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
             current_min = new_y_val
         if new_y_val > current_max:
             current_max = new_y_val
-            
+
         # Keep your original tracking for the final score
         if new_y_val > true_best:
             true_best = new_y_val
         if new_y_val < grid_min:
             grid_min = new_y_val
-        
+
         train_x = torch.cat([train_x, new_x])
         train_y  = torch.cat([train_y, new_y])
-        
+
         # Posterior predictions for R^2
         model.eval(); likelihood.eval()
         with warnings.catch_warnings():
@@ -159,13 +161,13 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
             space_reconfiguration = None
         else:
             sobol_interactions.append(interactions)
-            
+
         t1 = time.time()
         elapsed_train = t1 - t0
         train_times.append(elapsed_train)
         model = model_cls(train_x, train_y_norm, likelihood,
-                          model.partition, model.history, model.sobol).to(device) 
-        
+                          model.partition, model.history, model.sobol).to(device)
+
 
         # Submit a new Sobol background job every n_sobol iterations (if none pending)
         if  i > n_sobol: #(i % n_sobol) == 0:
@@ -175,7 +177,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
                     y_range = current_max - current_min
                     train_y_norm = (train_y - current_min) / y_range
                     surrogate = ExactGP(train_x, train_y_norm, surrogate_likelihood).to(device)
-                    space_reconfiguration = executor.submit(sobol.method, train_x, train_y_norm, surrogate)
+                    space_reconfiguration = executor.submit(sobol.method, train_x, train_y, surrogate)
                 except Exception as e:
                     space_reconfiguration = None
                     print(f"[Sobol] submit failed: {e}")
@@ -223,7 +225,7 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
     device = torch.device(device)
 
     # Initiate n_init points, bounds
-    n_points = int(100 * f_obj.d**2)
+    n_points = np.clip(int(100 * f_obj.d**2), 1, 5000)
     bounds = torch.from_numpy(np.stack([f_obj.lower_bounds, f_obj.upper_bounds])).float().to(device)  # shape (2, d)
     lower, upper = bounds[0], bounds[1]
     grid_x = lower + (upper - lower) * torch.rand(n_points, f_obj.d, device=device)
@@ -1231,6 +1233,7 @@ def internal_representation(f_obj, model_cls=SobolGP, n_iter=200, n_sobol=30, ka
 
     return {'snapshots': snapshots, 'true_map': true_map}
 
+
 ### Parser handling
 def _parse_list_of_floats(text):
     if text is None:
@@ -1262,8 +1265,8 @@ def main(argv=None):
     parser.add_argument('--negate', choices=['auto','true','false'], default='auto', help='Negate objective? if auto will use default mapping in script')
 
     # Method selection
-    parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, kappa_search, optimization_metrics, partition_reconstruction')
-    parser.add_argument('--model_cls', type=str, default='ExactGP', help='Model class name (ExactGP, AdditiveGP, SobolGP, MHGP)')
+    parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, run_AT_BO, kappa_search, optimization_metrics, partition_reconstruction, visualize_lengthscales')
+    parser.add_argument('--model_cls', type=str, default='ExactGP', help='Model class name (ExactGP, AdditiveGP, AdditiveDuvenaudGP, SobolGP, MHGP)')
     parser.add_argument('--bo_method', type=str, default='run_bo', help='BO method used by higher-level routines (run_bo or run_partitionbo)')
 
     # Method-specific params
@@ -1277,6 +1280,12 @@ def main(argv=None):
     parser.add_argument('--epsilon_list', type=_parse_list_of_floats, default=None, help='Comma-separated epsilon values for epsilon_search (e.g. 0.1,0.15,0.2,0.25,0.3)')
     parser.add_argument('--M', type=int, default=1024, help='Sobol MC samples (default 1024)')
     parser.add_argument('--epsilon', type=float, default=0.25, help='Additivity threshold (default 0.25)')
+
+    # Adaptive trigger params (run_AT_BO)
+    parser.add_argument('--W', type=int, default=10, help='Rolling window size for MLL stagnation (default 10)')
+    parser.add_argument('--delta', type=float, default=0.01, help='MLL gain threshold for stagnation detection (default 0.01)')
+    parser.add_argument('--cooldown', type=int, default=15, help='Min BO iterations between Sobol triggers (default 15)')
+    parser.add_argument('--gamma', type=float, default=0.5, help='Max hyperparameter velocity for stability gate (default 0.5)')
 
     #  Device Flags ---
     parser.add_argument('--device', type=str, default='cpu', help='Device for single runs (e.g. cuda:0)')
@@ -1295,6 +1304,7 @@ def main(argv=None):
     model_map = {
         'ExactGP': ExactGP,
         'AdditiveGP': AdditiveGP,
+        'AdditiveDuvenaudGP': AdditiveDuvenaudGP,
         'SobolGP': SobolGP,
         'MHGP': MHGP,
     }
@@ -1302,11 +1312,13 @@ def main(argv=None):
     method_map = {
         'run_bo': run_bo,
         'run_partitionbo': run_partitionbo,
+        'run_AT_BO': run_AT_BO,
         'kappa_search': kappa_search,
         'M_search': M_search,
         'epsilon_search': epsilon_search,
         'optimization_metrics': optimization_metrics,
         'internal_representation': internal_representation,
+        'visualize_lengthscales': visualize_lengthscales,
     }
 
     if args.list_models:
@@ -1327,8 +1339,8 @@ def main(argv=None):
     if args.method not in method_map:
         raise ValueError(f"Unknown method '{args.method}'. Use --list_methods to see options.")
 
-    if args.bo_method not in ['run_bo', 'run_partitionbo']:
-        raise ValueError("bo_method must be 'run_bo' or 'run_partitionbo'")
+    if args.bo_method not in ['run_bo', 'run_partitionbo', 'run_AT_BO']:
+        raise ValueError("bo_method must be 'run_bo', 'run_partitionbo', or 'run_AT_BO'")
 
     model_cls = model_map[args.model_cls]
     bo_method = run_partitionbo if args.model_cls in ['MHGP', 'SobolGP'] else run_bo
@@ -1363,6 +1375,13 @@ def main(argv=None):
                             M=args.M, epsilon=args.epsilon,
                             save=args.save, verbose=args.verbose, device=args.device)
 
+        elif args.method == 'run_AT_BO':
+            result = run_AT_BO(f_obj, model_cls, n_iter=args.n_iter, kappa=args.kappa,
+                               M=args.M, epsilon=args.epsilon,
+                               W=args.W, delta=args.delta,
+                               cooldown=args.cooldown, gamma=args.gamma,
+                               save=args.save, verbose=args.verbose, device=args.device)
+
         elif args.method == 'kappa_search':
             # Provide a default kappa list if none given
             k_list = args.kappa_list or [0.5, 1.0, 3.0, 5.0, 7.0, 9.0, 15.0]
@@ -1383,13 +1402,18 @@ def main(argv=None):
             if args.kappas is None: raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values)')
             kappas = args.kappas
             result = optimization_metrics(f_obj, kappas, n_iter=args.n_iter, n_reps=args.n_reps, devices=device_list)
-        elif args.method == 'partition_reconstruction':
-            result = partition_reconstruction(f_obj, SobolGP, n_iter=args.n_iter, n_reps= args.n_reps, n_sobol=args.n_sobol, kappa=args.kappa, save=args.save, verbose=args.verbose, device=args.device)
         elif args.method == 'internal_representation':
             if args.dim != 2:
                 raise ValueError("internal_representation only supports 2D functions (--dim 2)")
             result = internal_representation(f_obj, model_cls, n_iter=args.n_iter, n_sobol=args.n_sobol,
                                              kappa=args.kappa, save=args.save, verbose=args.verbose, device=args.device)
+        elif args.method == 'visualize_lengthscales':
+            result = visualize_lengthscales(
+                f_obj, model_cls, n_iter=args.n_iter, n_reps=args.n_reps,
+                n_sobol=args.n_sobol,
+                kappa=args.kappa, M=args.M, epsilon=args.epsilon,
+                W=args.W, delta=args.delta, cooldown=args.cooldown, gamma=args.gamma,
+                save=True, verbose=args.verbose, devices=device_list)
         else:
             raise ValueError('Unsupported method')
 

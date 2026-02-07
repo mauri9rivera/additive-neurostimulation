@@ -8,7 +8,7 @@ from scipy.stats import qmc, uniform
 import tntorch as tn
 import gpytorch
 
-def optimize(gp, train_x, train_y, n_iter=20, lr=0.01):
+def optimize(gp, train_x, train_y, n_iter=50, lr=0.01):
     """
     Train an GP + Likelihood model.
 
@@ -75,7 +75,8 @@ class Sobol:
         M: number of monte-carlo samples for sobol metamodel
         method: string representing the Sobol global sensitivity analysis method to use.
         """
-        self.epsilon = 0.25 #0.20 #np.clip(0.05*(0.998**t), 0.03, 0.08)
+        self.epsilon = 0.20 #0.25? 
+        self.delta = 0.05
         self.B = B
         self.M = M
         self.problem = self._build_problem(f_obj)
@@ -282,31 +283,29 @@ class Sobol:
 
 
         # ---- Bootstrap storage ----
-        S1_boot = np.zeros((self.B, d))
-        ST_boot_norm = np.zeros((self.B, d))
-        high_boot = np.zeros((self.B, d))
+        S1_boot = np.zeros((1, d))
+        ST_boot_norm = np.zeros((1, d))
+        SH_boot = np.zeros((1, d))
 
-        for b in range(self.B):
+        result = scipy_sobol(
+        func=gp_mean_wrapper, 
+        n=self.M, 
+        dists=dists, 
+        )
 
-            result = scipy_sobol(
-            func=gp_mean_wrapper, 
-            n=self.M, 
-            dists=dists, 
-            )
+        # Extract components
+        S1 = np.clip(result.first_order, 0.0, 1.0)
+        ST = np.clip(result.total_order, 0.0, 1.0)
 
-            # Extract components
-            S1 = np.clip(result.first_order, 0, 1)
-            ST = np.clip(result.total_order, 0, np.inf)
+        norm_factor = np.sum(ST) + 1e-4
+        S1_boot = S1 
+        ST_boot_norm = (ST / norm_factor) + 1e-5
+        SH_boot = 1 - np.clip((S1_boot / ST_boot_norm), 0.0, 1.0) # higher-order index
 
-            norm_factor = np.sum(ST)
-            S1_boot[b] = S1 #/ norm_factor
-            ST_boot_norm[b] = ST / norm_factor
-            high_boot[b] = 1 - (S1_boot[b] / ST_boot_norm[b]) #ST_boot_norm[b] - S1_boot[b]     # higher-order index
+        # Zero out high-order indices where first-order signal is negligible
+        SH_boot[S1_boot <= self.delta] = 0.0
 
-        # ---- Aggregation over bootstrap ----
-        high_mean = high_boot.mean(axis=0)
-
-        return high_mean
+        return SH_boot
 
     def interactions_deriv(self, train_x, train_y, metamodel):
         """
@@ -691,7 +690,8 @@ class NeuralSobol:
             M: number of monte-carlo samples for sobol analysis
             B: number of bootstrap samples
         """
-        self.epsilon = 0.25
+        self.epsilon = 0.20
+        self.delta = 0.05
         self.B = B
         self.M = M
         self.problem = self._build_problem(dataset_type)
@@ -772,31 +772,29 @@ class NeuralSobol:
                 mean_pred = output.mean
             return mean_pred.cpu().numpy().reshape(-1)
 
-        # Bootstrap storage
-        S1_boot = np.zeros((self.B, d))
-        ST_boot_norm = np.zeros((self.B, d))
-        high_boot = np.zeros((self.B, d))
+        S1_boot = np.zeros((1, d))
+        ST_boot_norm = np.zeros((1, d))
+        SH_boot = np.zeros((1, d))
 
-        for b in range(self.B):
-            result = scipy_sobol(
-                func=gp_mean_wrapper,
-                n=self.M,
-                dists=dists,
-            )
+        result = scipy_sobol(
+            func=gp_mean_wrapper,
+            n=self.M,
+            dists=dists,
+        )
 
-            # Extract components
-            S1 = np.clip(result.first_order, 0, 1)
-            ST = np.clip(result.total_order, 0, np.inf)
+        # Extract components
+        S1 = np.clip(result.first_order, 0.0, 1.0)
+        ST = np.clip(result.total_order, 0.0, 1.0)
 
-            norm_factor = np.sum(ST)
-            S1_boot[b] = S1
-            ST_boot_norm[b] = ST / norm_factor
-            high_boot[b] = 1 - (S1_boot[b] / (ST_boot_norm[b] + 1e-9))
+        norm_factor = np.sum(ST) + 1e-4
+        S1_boot = S1
+        ST_boot_norm = (ST / norm_factor) + 1e-5
+        SH_boot = 1 - np.clip((S1_boot / ST_boot_norm), 0.0, 1.0) # higher-order index
 
-        # Aggregation over bootstrap
-        high_mean = high_boot.mean(axis=0)
+        # Zero out high-order indices where first-order signal is negligible
+        SH_boot[S1_boot <= self.delta] = 0.0
 
-        return high_mean
+        return SH_boot
 
     def update_partition(self, interactions):
         """
