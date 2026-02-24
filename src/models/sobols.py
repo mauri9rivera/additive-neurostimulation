@@ -305,8 +305,10 @@ class Sobol:
 
         # ---- Aggregation over bootstrap ----
         high_mean = high_boot.mean(axis=0)
+        S1_mean = S1_boot.mean(axis=0)
+        ST_mean = ST_boot_norm.mean(axis=0)
 
-        return high_mean
+        return {'S1': S1_mean, 'SD': high_mean, 'ST': ST_mean}
 
     def interactions_deriv(self, train_x, train_y, metamodel):
         """
@@ -644,10 +646,13 @@ class Sobol:
         Partition dimensions using a greedy algorithm based on high-order interactions.
 
         Inputs:
-        - interactions: numpy array (1, d) matrix with high-order Sobol indices.
+        - interactions: numpy array (d,) or dict with 'SD' key containing high-order Sobol indices.
         Output:
         - partitions: list of lists, each sublist contains indices belonging to a partition.
         """
+        if isinstance(interactions, dict):
+            interactions = interactions['SD']
+
         d = self.problem['num_vars']
 
         # initialize stack of dimensions
@@ -803,10 +808,13 @@ class NeuralSobol:
         Partition dimensions using a greedy algorithm based on high-order interactions.
 
         Inputs:
-        - interactions: numpy array (d,) with high-order Sobol indices.
+        - interactions: numpy array (d,) or dict with 'SD' key containing high-order Sobol indices.
         Output:
         - partitions: list of lists, each sublist contains indices belonging to a partition.
         """
+        if isinstance(interactions, dict):
+            interactions = interactions['SD']
+
         d = self.problem['num_vars']
 
         # P will hold the partitions

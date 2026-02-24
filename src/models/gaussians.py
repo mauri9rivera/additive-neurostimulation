@@ -197,21 +197,32 @@ class AdditiveDuvenaudGP(gpytorch.models.ExactGP):
 
 class MHGP(gpytorch.models.ExactGP):
 
-    def __init__(self, train_x, train_y, likelihood, partition = None, history = None, sobol=None, epsilon=8e-2):
+    def __init__(self, train_x, train_y, likelihood, partition=None, history=None, sobol=None):
 
         super().__init__(train_x, train_y, likelihood)
-        self.mean_module = gpytorch.means.ZeroMean() 
+        self.mean_module = gpytorch.means.ZeroMean()
         self.partition = partition if partition is not None else [[i] for i in range(train_x.shape[-1])]
-        self.history = history if history else [self.partition_to_key(self.partition)] 
+        self.history = history if history else [self.partition_to_key(self.partition)]
         self.sobol = sobol
         self.name = 'MHGP'
         self.n_dims = train_x.shape[-1]
-        self.epsilon = 0.08 # - 0.02 * min(1.0, (self.n_dims**2 / 30.0))
-        self.split_bias = 0.7
-        self.max_attempts = self.bell_number(self.n_dims)
+        self.nb_partitions = self.n_dims
 
-        #build covar_module based on partition
+        # build covar_module based on partition
         self._build_covar()
+
+    def max_singleton_partitions(self):
+        """Number of distinct partitions reachable by _sample_partition.
+
+        Each dimension independently chooses singleton vs. grouped, giving 2^d
+        possibilities.  Use this to stop triggering Sobol reconfiguration once
+        the history has explored all of them.
+        """
+        return 2 ** self.n_dims
+
+    def history_exhausted(self):
+        """Return True if the partition history covers all reachable partitions."""
+        return len(self.history) >= self.max_singleton_partitions()
 
     def _build_covar(self):
 
@@ -221,9 +232,9 @@ class MHGP(gpytorch.models.ExactGP):
             ard_dims = len(group)
 
             base_kernel = gpytorch.kernels.MaternKernel(
-                nu = 2.5,
-                ard_num_dims = ard_dims,
-                active_dims = group,
+                nu=2.5,
+                ard_num_dims=ard_dims,
+                active_dims=group,
             )
 
             scaled_kernel = gpytorch.kernels.ScaleKernel(base_kernel)
@@ -241,142 +252,146 @@ class MHGP(gpytorch.models.ExactGP):
         """
         key = self.partition_to_key(new_partition)
         return key in self.history
-    
+
     def update_partition(self, new_partition):
 
         # normalize indices to ints
+        new_partition = [list(map(int, grp)) for grp in new_partition if len(grp) > 0]
         new_key = self.partition_to_key(new_partition)
         current_key = self.partition_to_key(self.partition)
         # avoid unnecessary rebuilds:
-        if new_partition == current_key:
+        if new_key == current_key:
             return
         self.partition = [list(grp) for grp in new_key]
         self._build_covar()
-    
-    def sobol_partitioning(self, interactions):
-        
-        old_partition = self.partition
-        has_candidate = False
-        attempts = 0
 
-        if len(self.history) == self.max_attempts:
-            return old_partition
+    def rank_and_select_partition(self, sobol_dict, lengthscales, device='cpu'):
+        """
+        Rank-based partition selection using Sobol total-order indices and log-lengthscales.
 
-        while not has_candidate and attempts < (self.max_attempts + 5):
+        1. Compute scores[i] = log(l_i) - ST_i  (higher = more likely additive/singleton)
+        2. Softmax scores -> probs[i] = probability dimension i is a singleton
+        3. Generate nb_partitions candidate partitions via _sample_partition(probs)
+        4. Include current partition as extra candidate
+        5. Filter out candidates already in history
+        6. Evaluate candidates via parallel MLL -> return best partition
 
-            new_partition = copy.deepcopy(self.partition)
-            
-            # Split strategy
-            if random.random() < self.split_bias:
+        Returns
+        -------
+        best_partition : list of lists
+        """
+        ST = np.asarray(sobol_dict['ST']).flatten()
 
-                robbed_idx = random.randint(0, len(new_partition) - 1)
-                robbed_subset = new_partition[robbed_idx]
+        if lengthscales is not None:
+            ls_np = lengthscales.detach().cpu().numpy().flatten()
+        else:
+            ls_np = np.zeros(self.n_dims)
 
-                if len(robbed_subset) > 1:
+        # Score: high log-lengthscale (insensitive) and low ST -> additive
+        scores = ls_np - ST
 
-                    victim = np.random.choice(robbed_subset) #, random.randint(1, len(splitted_subset) - 1))
-                    robbed_subset.remove(victim)
-                    new_partition[robbed_idx] = robbed_subset # to fix split duplicate singletons issue
-                    new_partition.append([victim.astype(int)]) 
-                
-                    if (not self.check_history(new_partition)) and self.are_additive(victim, robbed_subset, interactions):
+        # Softmax to get per-dimension singleton probability
+        scores_shifted = scores - scores.max()
+        exp_scores = np.exp(scores_shifted)
+        probs = exp_scores / (exp_scores.sum() + 1e-9)
 
-                        has_candidate = True
-                        return new_partition
-                else:
-                    attempts+=1
+        # Generate candidate partitions
+        candidates = []
+        candidates.append(self.partition) # Always include current partition as candidate
 
-            # Merge strategy
-            else:
-                
-                if len(new_partition) > 1:
+        for _ in range(self.nb_partitions):
+            cand = self._sample_partition(probs)
+            if not self.check_history(cand) and cand not in candidates:
+                candidates.append(cand)
 
-                    robber_idx, robbed_idx = random.sample(range(len(new_partition)), 2)
 
-                    robbed_subset = new_partition[robbed_idx]
-                    robber_subset = new_partition[robber_idx]
 
-                    new_partition.remove(robbed_subset)
-                    new_partition.remove(robber_subset)
-                    new_partition.append(robbed_subset + robber_subset)
+        # Deduplicate
+        seen = set()
+        unique_candidates = []
+        for c in candidates:
+            key = self.partition_to_key(c)
+            if key not in seen:
+                seen.add(key)
+                unique_candidates.append(c)
+        candidates = unique_candidates
 
-                    all_additive = True
-                    for victim in robbed_subset:
-                            additive = self.are_additive(victim, robber_subset, interactions)
-                            if not additive:
-                                all_additive = False
-                                break
-                    
-                    has_candidate = all_additive
-                    if has_candidate and (not self.check_history(new_partition)):
-                        return new_partition
- 
-            attempts +=1
-
-        #print(f'Number of attempts exceedded')
-        return old_partition
-
-    def bell_number(self, n):
-        bell = [[0]*(n+1) for _ in range(n+1)]
-        bell[0][0] = 1
-        for i in range(1, n+1):
-            bell[i][0] = bell[i-1][i-1]
-            for j in range(1, i+1):
-                bell[i][j] = bell[i-1][j-1] + bell[i][j-1]
-        return bell[n][0]
-
-    def are_additive(self, individual, set, interactions):
-
-        for evaluator in set:
-
-            i = min(evaluator, individual)
-            j = max(evaluator, individual)
-
-            if interactions[j] > self.epsilon:
-                return False
-        
-        return True
-        
-    def calculate_acceptance(self, proposed_model, device='cpu'):
-
-        self.train()
-        self.likelihood.train()
-        proposed_model.train()
-        proposed_model.likelihood.train()
-
-        mll_curr = gpytorch.mlls.ExactMarginalLogLikelihood(self.likelihood, self)
-        mll_proposed = gpytorch.mlls.ExactMarginalLogLikelihood(proposed_model.likelihood, proposed_model)
-        train_inputs = tuple(t.to(device) for t in self.train_inputs)
-
-        curr_evidence = mll_curr(self(*train_inputs), self.train_targets)
-        proposed_evidence = mll_proposed(proposed_model(proposed_model.train_inputs[0]), proposed_model.train_targets)
-
-        acceptance = min(1.0, proposed_evidence / (curr_evidence + 1e-9))
-
-        return acceptance
-    
-    def metropolis_hastings(self, interactions, device='cpu'):
-
-        # update sobol interactions from surrogate model training
-        new_partition = self.sobol_partitioning(interactions)
-        if new_partition == self.partition:
+        if len(candidates) == 1:
             return self.partition
-        proposed_model = MHGP(self.train_inputs[0], self.train_targets, gpytorch.likelihoods.GaussianLikelihood(), 
-                              partition=new_partition, history=self.history, sobol=self.sobol)
-        proposed_model.to(device)
-        proposed_model.likelihood.to(device)
-        proposed_model, proposed_model.likelihood, _ = optimize(proposed_model, proposed_model.train_inputs[0], proposed_model.train_targets)
-        
-        acceptance_ratio = self.calculate_acceptance(proposed_model)
 
-        if acceptance_ratio >= 1.0:
-            #print(f'Update for model accepted! Genetics propose to partition {new_partition} from {self.partition} with acceptance {acceptance_ratio}')
-            self.history.append(self.partition_to_key(new_partition))
-            return new_partition
+        # Evaluate candidates in parallel
+        best_partition, best_mll = self._evaluate_candidates_parallel(candidates, device)
+        self.history.append(self.partition_to_key(best_partition))
 
-        else: 
-            return self.partition 
-        
+        return best_partition
+
+    def _sample_partition(self, probs):
+        """
+        Sample a partition from per-dimension singleton probabilities.
+
+        For each dimension i: with probability probs[i], make it a singleton [i];
+        otherwise add to a 'grouped' bucket.
+        Returns partition as list-of-lists (singletons + one grouped list if non-empty).
+        """
+        singletons = []
+        grouped = []
+        for i in range(self.n_dims):
+            if random.random() < probs[i]:
+                singletons.append([i])
+            else:
+                grouped.append(i)
+
+        partition = singletons[:]
+        if grouped:
+            partition.append(grouped)
+
+        # Edge case: if all dimensions are grouped, return as single group
+        if not partition:
+            partition = [list(range(self.n_dims))]
+
+        return partition
+
+    def _evaluate_candidates_parallel(self, candidates, device='cpu'):
+        """
+        Evaluate candidate partitions by training a temporary MHGP and computing MLL.
+        Uses ThreadPoolExecutor for parallel evaluation.
+
+        Returns (best_partition, best_mll).
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        train_x = self.train_inputs[0]
+        train_y = self.train_targets
+
+        def eval_candidate(partition):
+            try:
+                lik = gpytorch.likelihoods.GaussianLikelihood().to(device)
+                candidate_model = MHGP(train_x, train_y, lik, partition=partition).to(device)
+                candidate_model, lik, _ = optimize(candidate_model, train_x, train_y, n_iter=30)
+
+                candidate_model.train()
+                lik.train()
+                mll_fn = gpytorch.mlls.ExactMarginalLogLikelihood(lik, candidate_model)
+                output = candidate_model(train_x)
+                mll_val = mll_fn(output, train_y).item()
+                return partition, mll_val
+            except Exception:
+                return partition, float('-inf')
+
+        max_workers = min(len(candidates), 4)
+        best_partition = self.partition
+        best_mll = float('-inf')
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(eval_candidate, c) for c in candidates]
+            for f in futures:
+                partition, mll_val = f.result()
+                if mll_val > best_mll:
+                    best_mll = mll_val
+                    best_partition = partition
+
+        return best_partition, best_mll
+
     def forward(self, x):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)

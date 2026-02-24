@@ -96,7 +96,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
     train_y_norm = (train_y - current_min) / y_range
     model = model_cls(train_x, train_y_norm, likelihood).to(device)
     model.sobol = sobol
-    interactions = np.zeros(f_obj.d, dtype=float)
+    interactions = {'S1': np.zeros(f_obj.d), 'SD': np.zeros(f_obj.d), 'ST': np.zeros(f_obj.d)}
     # main optimization loop
     for i in range(n_iter - n_init):
 
@@ -158,7 +158,11 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
         # If there is a pending Sobol job finished, fetch it and update partition
         if space_reconfiguration is not None and space_reconfiguration.done():
             interactions = space_reconfiguration.result()
-            new_partition = sobol.update_partition(interactions)
+            if isinstance(model, MHGP):
+                ls_vec_part = extract_lengthscales_log(model, f_obj.d)
+                new_partition = model.rank_and_select_partition(interactions, ls_vec_part, device=str(device))
+            else:
+                new_partition = sobol.update_partition(interactions)
             model.update_partition(new_partition)
             sobol_interactions.append(interactions)
             space_reconfiguration = None
@@ -173,7 +177,9 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
 
 
         # Submit a new Sobol background job every n_sobol iterations (if none pending)
-        if  i > n_sobol: #(i % n_sobol) == 0:
+        # Skip if MHGP has already exhausted all reachable partitions
+        history_full = isinstance(model, MHGP) and model.history_exhausted()
+        if i > n_sobol and not history_full:
             if space_reconfiguration is None or space_reconfiguration.done():
                 try:
                     surrogate_likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
@@ -300,7 +306,7 @@ def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
     model = model_cls(train_x, train_y, likelihood).to(device)
     model.sobol = sobol
-    interactions = np.zeros(f_obj.d, dtype=float)
+    interactions = {'S1': np.zeros(f_obj.d), 'SD': np.zeros(f_obj.d), 'ST': np.zeros(f_obj.d)}
 
     # main optimization loop
     for i in range(n_iter - n_init):
@@ -362,7 +368,11 @@ def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
         # If there is a pending Sobol job finished, fetch it and update partition
         if space_reconfiguration is not None and space_reconfiguration.done():
             interactions = space_reconfiguration.result()
-            new_partition = sobol.update_partition(interactions)
+            if isinstance(model, MHGP):
+                ls_vec_part = extract_lengthscales_log(model, f_obj.d)
+                new_partition = model.rank_and_select_partition(interactions, ls_vec_part, device=str(device))
+            else:
+                new_partition = sobol.update_partition(interactions)
             model.update_partition(new_partition)
             sobol_interactions.append(interactions)
             space_reconfiguration = None
@@ -399,8 +409,9 @@ def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
         # Metric 2: Hyperparameter Stability Gate
         hp_gate = (v_t < gamma)
 
-        # Combined decision
-        should_trigger = mll_trigger and hp_gate and (i - t_last_sobol > cooldown)
+        # Combined decision — also skip if MHGP has exhausted all reachable partitions
+        history_full = isinstance(model, MHGP) and model.history_exhausted()
+        should_trigger = mll_trigger and hp_gate and (i - t_last_sobol > cooldown) and not history_full
 
         if should_trigger:
             if space_reconfiguration is None or space_reconfiguration.done():
@@ -429,7 +440,7 @@ def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
     cumulative_time = np.cumsum(train_times)
 
     if save:
-        output_dir = os.path.join("output", "breaking_additivity", "AT_BO")
+        output_dir = os.path.join("output", "synthetic_experiments", "AT_BO")
         os.makedirs(output_dir, exist_ok=True)
         fname = f"AT_BO_{datetime.date.today().isoformat()}_kappa{kappa}_{f_obj.name}.npz"
         fpath = os.path.join(output_dir, fname)
@@ -979,7 +990,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
         (ExactGP, 'red',  'ExactGP',    kappas[0]),
         (AdditiveGP, 'blue', 'AdditiveGP',   kappas[1]),
         (SobolGP, 'green', 'SobolGP',             kappas[2]),
-        #(MHGP, 'orange', 'MHGP',                  kappas[3])
+        (MHGP, 'orange', 'MHGP',                  kappas[3]),
     ]
 
     # Pre-allocate results containers
@@ -1030,7 +1041,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
         all_explore = np.array([d['exploration'] for d in data_list])
         all_exploit = np.array([d['exploitation'] for d in data_list])
         all_r2 = np.array([d['r2'] for d in data_list])
-        all_surrogate_sobols = np.array([d['sobol_interactions'] for d in data_list]) if label == 'SobolGP' else None
+        all_surrogate_sobols = np.array([d['sobol_interactions'] for d in data_list]) if label in ['SobolGP', 'MHGP'] else None
 
         # Averages
         mean_explore = np.mean(all_explore, axis=0)
@@ -1167,6 +1178,9 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
     x_full = np.arange(1, n_iter + 1)
     threshold = 0.25
 
+    legend_handles = []
+    legend_labels_list = []
+
     for i in range(d):
         ax = axes_flat[i]
 
@@ -1175,28 +1189,39 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
         true_label = ax.plot(x_full, [true_val]*x_full.shape[0], color='black', linestyle='--', linewidth=1.2)
         threshold_label = ax.plot(x_full, [threshold]*x_full.shape[0], color='red', linestyle='--', linewidth=1.2)
 
-        # Estimated sobol interaction curve
-        surrogate_mean = []
-        for surrogate_sobol_trace in metrics['SobolGP']['surrogate_sobols']:
-            
-            trace_per_dim = [0.0] * f_obj.d*3 # Init assumption
-            
-            for t_step in range(len(surrogate_sobol_trace)):
+        # Estimated sobol interaction curves for SobolGP and MHGP
+        for model_label, color in [('SobolGP', 'green'), ('MHGP', 'orange')]:
+            if metrics.get(model_label, {}).get('surrogate_sobols') is None:
+                continue
 
-                if surrogate_sobol_trace[t_step] is None:
-                    trace_per_dim.append(float(0.0))
-                    
-                else:
-                    val_vector = np.asarray(surrogate_sobol_trace[t_step]).flatten()
-                    trace_per_dim.append(float(val_vector[i]))
-            
-            trace_per_dim = np.asarray(trace_per_dim, dtype=float)
-            surrogate_mean.append(trace_per_dim)
-            ax.plot(x_full, trace_per_dim[:len(x_full)], color=color, linestyle='-', alpha=0.1)
+            surrogate_mean = []
+            for surrogate_sobol_trace in metrics[model_label]['surrogate_sobols']:
 
-        surrogate_mean = np.asarray(surrogate_mean)
-        surrogate_mean = np.mean(surrogate_mean, axis=0)
-        prediction_label = ax.plot(x_full, surrogate_mean[:len(x_full)], color=color, linestyle='-')
+                trace_per_dim = [0.0] * f_obj.d*3 # Init assumption
+
+                for t_step in range(len(surrogate_sobol_trace)):
+
+                    if surrogate_sobol_trace[t_step] is None:
+                        trace_per_dim.append(float(0.0))
+
+                    else:
+                        if isinstance(surrogate_sobol_trace[t_step], dict):
+                            val_vector = np.asarray(surrogate_sobol_trace[t_step]['SD']).flatten()
+                        else:
+                            val_vector = np.asarray(surrogate_sobol_trace[t_step]).flatten()
+                        trace_per_dim.append(float(val_vector[i]))
+
+                trace_per_dim = np.asarray(trace_per_dim, dtype=float)
+                surrogate_mean.append(trace_per_dim)
+                ax.plot(x_full, trace_per_dim[:len(x_full)], color=color, linestyle='-', alpha=0.1)
+
+            surrogate_mean = np.asarray(surrogate_mean)
+            surrogate_mean = np.mean(surrogate_mean, axis=0)
+            prediction_label = ax.plot(x_full, surrogate_mean[:len(x_full)], color=color, linestyle='-')
+
+            if i == 0:
+                legend_handles.append(prediction_label[0])
+                legend_labels_list.append(f'{model_label} Predicted')
 
         ax.set_ylim(-0.05, 1.1)
         ax.set_xlim(1, n_iter)
@@ -1204,11 +1229,13 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
         ax.grid(True, linestyle='--', linewidth=0.4)
 
     # Title and Saving
-    raw_title = f'Sobol Indices Traces for {f_obj.d}d-{f_obj.name} | SobolGP (kappa={kappa})'
+    raw_title = f'Sobol Indices Traces for {f_obj.d}d-{f_obj.name}'
     wrapped_title = textwrap.fill(raw_title, width=80)
 
+    all_handles = [true_label[0], threshold_label[0]] + legend_handles
+    all_labels = ['True Interaction', 'Additivity Threshold'] + legend_labels_list
     fig2.suptitle(wrapped_title, fontsize=14)
-    fig2.legend(handles=[true_label[0], threshold_label[0], prediction_label[0]], labels=labels, loc="upper right", bbox_to_anchor=(0.98, 0.98))
+    fig2.legend(handles=all_handles, labels=all_labels, loc="upper right", bbox_to_anchor=(0.98, 0.98))
     plt.tight_layout()
 
     sobol_fname = f'partitions_{f_obj.d}d-{f_obj.name}_kappa{kappa}.svg'
@@ -1308,7 +1335,7 @@ def internal_representation(f_obj, model_cls=SobolGP, n_iter=200, n_sobol=30, ka
     model = model_cls(train_x, train_y, likelihood).to(device)
     if sobol is not None:
         model.sobol = sobol
-    interactions = np.zeros(f_obj.d, dtype=float)
+    interactions = {'S1': np.zeros(f_obj.d), 'SD': np.zeros(f_obj.d), 'ST': np.zeros(f_obj.d)}
 
     # Initialize executor for Sobol background jobs
     executor = ThreadPoolExecutor(max_workers=sobol_workers)
@@ -1361,7 +1388,11 @@ def internal_representation(f_obj, model_cls=SobolGP, n_iter=200, n_sobol=30, ka
         if model_cls in [SobolGP, MHGP]:
             if space_reconfiguration is not None and space_reconfiguration.done():
                 interactions = space_reconfiguration.result()
-                new_partition = sobol.update_partition(interactions)
+                if isinstance(model, MHGP):
+                    ls_vec_part = extract_lengthscales_log(model, f_obj.d)
+                    new_partition = model.rank_and_select_partition(interactions, ls_vec_part, device=str(device))
+                else:
+                    new_partition = sobol.update_partition(interactions)
                 model.update_partition(new_partition)
                 space_reconfiguration = None
 
@@ -1633,7 +1664,7 @@ def main(argv=None):
     parser.add_argument('--n_sobol', type=int, default=20)
     parser.add_argument('--kappa', type=float, default=1.0)
     parser.add_argument('--kappa_list', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for kappa_search')
-    parser.add_argument('--kappas', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for optimization_metrics (3 values expected)')
+    parser.add_argument('--kappas', type=_parse_list_of_floats, default=None, help='Comma-separated kappas for optimization_metrics (4 values: ExactGP,AdditiveGP,SobolGP,MHGP)')
     parser.add_argument('--M_list', type=_parse_list_of_ints, default=None, help='Comma-separated M values for M_search (e.g. 256,512,1024,2048)')
     parser.add_argument('--epsilon_list', type=_parse_list_of_floats, default=None, help='Comma-separated epsilon values for epsilon_search (e.g. 0.1,0.15,0.2,0.25,0.3)')
     parser.add_argument('--M', type=int, default=1024, help='Sobol MC samples (default 1024)')
@@ -1757,7 +1788,7 @@ def main(argv=None):
                                     kappa=args.kappa, M=args.M, devices=device_list)
 
         elif args.method == 'optimization_metrics':
-            if args.kappas is None: raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values)')
+            if args.kappas is None: raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values: ExactGP,AdditiveGP,SobolGP,MHGP)')
             kappas = args.kappas
             result = optimization_metrics(f_obj, kappas, n_iter=args.n_iter, n_reps=args.n_reps, devices=device_list)
         elif args.method == 'internal_representation':
