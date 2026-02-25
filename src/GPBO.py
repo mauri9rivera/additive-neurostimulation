@@ -1304,7 +1304,6 @@ def main(argv=None):
     model_map = {
         'ExactGP': ExactGP,
         'AdditiveGP': AdditiveGP,
-        'AdditiveDuvenaudGP': AdditiveDuvenaudGP,
         'SobolGP': SobolGP,
         'MHGP': MHGP,
     }
@@ -1312,13 +1311,11 @@ def main(argv=None):
     method_map = {
         'run_bo': run_bo,
         'run_partitionbo': run_partitionbo,
-        'run_AT_BO': run_AT_BO,
         'kappa_search': kappa_search,
         'M_search': M_search,
         'epsilon_search': epsilon_search,
         'optimization_metrics': optimization_metrics,
         'internal_representation': internal_representation,
-        'visualize_lengthscales': visualize_lengthscales,
     }
 
     if args.list_models:
@@ -1375,13 +1372,6 @@ def main(argv=None):
                             M=args.M, epsilon=args.epsilon,
                             save=args.save, verbose=args.verbose, device=args.device)
 
-        elif args.method == 'run_AT_BO':
-            result = run_AT_BO(f_obj, model_cls, n_iter=args.n_iter, kappa=args.kappa,
-                               M=args.M, epsilon=args.epsilon,
-                               W=args.W, delta=args.delta,
-                               cooldown=args.cooldown, gamma=args.gamma,
-                               save=args.save, verbose=args.verbose, device=args.device)
-
         elif args.method == 'kappa_search':
             # Provide a default kappa list if none given
             k_list = args.kappa_list or [0.5, 1.0, 3.0, 5.0, 7.0, 9.0, 15.0]
@@ -1407,13 +1397,6 @@ def main(argv=None):
                 raise ValueError("internal_representation only supports 2D functions (--dim 2)")
             result = internal_representation(f_obj, model_cls, n_iter=args.n_iter, n_sobol=args.n_sobol,
                                              kappa=args.kappa, save=args.save, verbose=args.verbose, device=args.device)
-        elif args.method == 'visualize_lengthscales':
-            result = visualize_lengthscales(
-                f_obj, model_cls, n_iter=args.n_iter, n_reps=args.n_reps,
-                n_sobol=args.n_sobol,
-                kappa=args.kappa, M=args.M, epsilon=args.epsilon,
-                W=args.W, delta=args.delta, cooldown=args.cooldown, gamma=args.gamma,
-                save=True, verbose=args.verbose, devices=device_list)
         else:
             raise ValueError('Unsupported method')
 
