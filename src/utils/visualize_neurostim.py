@@ -30,7 +30,7 @@ DATASET_CONFIG = {
         'budget': 100,
         'model_names': ['NeuralExactGP', 'NeuralAdditiveGP', 'NeuralSobolGP'],
         'suffix': '',
-        'n_emgs': [4, 1]  #TODO: Change this when analysis done [4, 4, 5],
+        'n_emgs': [4, 4, 5]  
     },
     'spinal': {
         'budget': 64,
@@ -714,18 +714,113 @@ def plot_emg_exploration_traces(dataset, subject_idx, kappa_idx, show=True):
     plt.close(fig)
 
 
+def plot_subject_emg_expl_curves(dataset, subject_idx, kappa_idx, model_name=None, model_idx=0, show=True):
+    """
+    Plot exploration (PP) and exploitation (PP_t) curves for all EMGs of a given
+    subject for a single model and kappa index. Both curves are overlaid per EMG subplot.
+
+    Parameters:
+    - dataset   : str, one of 'nhp', 'rat', '5d_rat', 'spinal'
+    - subject_idx: int, subject index
+    - kappa_idx : int, index into the kappas array stored in the npz
+    - model_name: str (optional), model name as listed in DATASET_CONFIG['model_names'].
+                  If None, falls back to model_idx.
+    - model_idx : int (default 0), used when model_name is None
+    - show      : bool, whether to call plt.show()
+    """
+    config = DATASET_CONFIG[dataset]
+    model_names_cfg = config['model_names']
+
+    if model_name is not None:
+        if model_name not in model_names_cfg:
+            raise ValueError(
+                f"Model '{model_name}' not found in {dataset} config. "
+                f"Available: {model_names_cfg}"
+            )
+        model_idx = model_names_cfg.index(model_name)
+    else:
+        model_name = model_names_cfg[model_idx]
+
+    filepath = get_npz_files(dataset)[model_idx]
+    data = np.load(filepath, allow_pickle=True)
+    PP   = np.asarray(data['PP'])    # (n_subjects, n_emgs, n_kappas, n_reps, n_iters)
+    PP_t = np.asarray(data['PP_t'])
+    kappas = data['kappas']
+
+    options = set_experiment(dataset)
+    n_emgs  = options['n_emgs'][subject_idx]
+
+    try:
+        subject   = load_data(dataset, subject_idx)
+        emg_names = [str(e).strip() for e in subject['emgs']]
+    except Exception:
+        emg_names = [f'EMG {i}' for i in range(n_emgs)]
+
+    n_iters   = PP.shape[-1]
+    n_reps    = PP.shape[3]
+    iterations = np.arange(1, n_iters + 1)
+    kappa_val  = float(kappas[kappa_idx])
+
+    fig, axes = plt.subplots(n_emgs, 1, figsize=(9, 3 * n_emgs), squeeze=False)
+
+    for e_i in range(n_emgs):
+        ax = axes[e_i, 0]
+
+        expl_traces = PP[subject_idx, e_i, kappa_idx]    # (n_reps, n_iters)
+        expt_traces = PP_t[subject_idx, e_i, kappa_idx]
+
+        for r in range(n_reps):
+            ax.plot(iterations, expl_traces[r], color='steelblue',  alpha=0.12, linewidth=0.8)
+            ax.plot(iterations, expt_traces[r], color='darkorange', alpha=0.12, linewidth=0.8)
+
+        mean_expl = np.mean(expl_traces, axis=0)
+        mean_expt = np.mean(expt_traces, axis=0)
+
+        ax.plot(iterations, mean_expl, color='steelblue',  linewidth=1.8, linestyle='-',  label='Exploration (PP)')
+        ax.plot(iterations, mean_expt, color='darkorange', linewidth=1.8, linestyle='--', label='Exploitation (PP_t)')
+
+        label = emg_names[e_i] if e_i < len(emg_names) else f'EMG {e_i}'
+        ax.set_ylabel(label, fontsize=9)
+        ax.set_ylim(0.0, 1.05)
+        ax.set_xlim(1, n_iters)
+        ax.grid(True, linestyle='--', linewidth=0.4)
+
+        if e_i == 0:
+            ax.legend(loc='lower right', fontsize='small')
+        if e_i == n_emgs - 1:
+            ax.set_xlabel('Iterations')
+
+    fig.suptitle(
+        f'Exploration & Exploitation per EMG | {dataset} subject {subject_idx} | '
+        f'{model_name} (κ={kappa_val})',
+        fontsize=13)
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+    save_dir = f'output/neurostim_experiments/{dataset}'
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(
+        save_dir,
+        f'{dataset}_{model_name}_subj{subject_idx}_kappa{kappa_idx}_emg_expl_curves.svg')
+    fig.savefig(out_path, bbox_inches='tight', dpi=200)
+    print(f'Saved to {out_path}')
+    if show:
+        plt.show()
+    plt.close(fig)
+
 if __name__ == '__main__':
 
 
     # Plot optimization metrics for rat dataset
-    optimization_metrics(kappas=[4, -1, -2], dataset='spinal')
+    #optimization_metrics(kappas=[4, -1, -2], dataset='spinal')
 
     # Plot kappa comparison
     #plot_kappas(dataset='spinal')
 
     #plot_emg_exploration_traces('5d_rat', 1, -1)
     # EMG exploration traces for 5d_rat
-    # plot_emg_exploration_traces('5d_rat', subject_idx=0, kappa_idx=0)
+    #plot_emg_exploration_traces('5d_rat', subject_idx=1, kappa_idx=3)
+
+    plot_subject_emg_expl_curves('5d_rat', subject_idx=2, kappa_idx=-2, model_name='NeuralSobolGP_median', model_idx=2, show=True)
 
     # Partition metrics (still requires loading data manually for SobolGP file)
     # npz_files = get_npz_files('spinal')

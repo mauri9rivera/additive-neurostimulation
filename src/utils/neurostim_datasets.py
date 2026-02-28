@@ -45,15 +45,10 @@ def sort_valid_5drats(resp, param, ch2xy):
             mean_vec = mean_map[j, idx_pw, idx_freq, idx_duration, x_ch, y_ch] #np.mean(resp_mu, axis=0)[j]   # shape (1,)
             std_vec = std_map[j, idx_pw, idx_freq, idx_duration, x_ch, y_ch] #std_map[j] 
 
-            deviation = resp[i, j, :] - mean_vec
-            valid_mask = np.abs(deviation) <= 3*std_vec
-
-            #print(f'mean_vec: {mean_vec} and std_vec: {std_vec}')
             deviation = np.abs(resp[i, j, :] - mean_vec)
-            #print(f'deviation: {deviation}')
             valid_mask = deviation <= 2*std_vec
             if np.all(~valid_mask):
-                print(f'issue with stim {i} on emg {j}: {3*std_vec} is higher than |{deviation}| so gives invalid mask: {valid_mask}')
+                print(f'issue with stim {i} on emg {j}: {2*std_vec} is higher than |{deviation}| so gives invalid mask: {valid_mask}')
                 
             valid_resp[i, j, :] = valid_mask.astype(np.int64)
 
@@ -91,9 +86,9 @@ def set_experiment(dataset_type):
         options['rho_low']=0.001
         options['nrnd']=1 #has to be >= 1
         options['noise_max']=0.055
-        options['n_subjects']= 2 #TODO after analysis 3
+        options['n_subjects']= 3 
         options['n_queries']= 100
-        options['n_emgs'] = [4, 1] #TODO after analysis [4, 4, 5]
+        options['n_emgs'] = [4, 4, 5] 
         options['n_dims'] = 5
     elif dataset_type == 'spinal':
         options['noise_min']=0.05
@@ -147,9 +142,11 @@ def load_data(dataset_type, m_i):
         resp = data['emg_response']
         param = data['stim_combinations']
         ch2xy = param[:, [0,1,2,5,6]]
-        peak_resp = resp[:, :, :, 2].transpose((2, 1, 0)) # resp[:, :, :, 0] for unormalized response ; (nb_reps, nb_emgs, params) to (params, nb_emgs, nb_reps)
-        resp_mean = np.mean(resp[:, :, :,2], axis=0).transpose((1, 0)) #(params, nb_emgs)
+        peak_resp = resp[:, :, :, 0].transpose((2, 1, 0)) # (nb_reps, nb_emgs, params) to (params, nb_emgs, nb_reps)
         sorted_isvalid = sort_valid_5drats(peak_resp, param, ch2xy)
+        filtered_resp = peak_resp
+        filtered_resp[sorted_isvalid == 0] = np.nan
+        resp_mean = np.nanmean(filtered_resp, axis=-1)
 
         subject = {
             'emgs': emgs,

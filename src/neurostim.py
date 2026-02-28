@@ -231,7 +231,7 @@ def run_single_neurostim(subject_idx, emg_idx, kappa_idx, kappa, rep_idx,
 
             std = (0.02 * torch.mean(test_respo)).clamp(min=0.0)
             noise = torch.randn((), device=test_respo.device, dtype=test_respo.dtype) * std
-            test_respo = (test_respo + noise).clamp(min=1e-5)
+            test_respo = (test_respo + noise).clamp(min=1e-6)
             P_test[q][1] = test_respo
 
             if (test_respo > MaxSeenResp) or (MaxSeenResp == 0.0):
@@ -387,7 +387,7 @@ def neurostim_bo(dataset, model_cls, kappas, devices=['cpu'], lr=None, M=None):
         'nhp':    {'lr': 0.1, 'M': 1024},
         'spinal': {'lr': 0.1, 'M': 1024},
         'rat':    {'lr': 0.1, 'M': 4096},
-        '5d_rat': {'lr': 0.1, 'M': 4096},
+        '5d_rat': {'lr': 0.001, 'M': 1024},
     }
     defaults = dataset_defaults.get(dataset, {'lr': 0.1, 'M': 1024})
     if lr is None:
@@ -794,7 +794,6 @@ def main(argv=None):
         print('ERROR during execution:', e)
         traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == '__main__':
 
