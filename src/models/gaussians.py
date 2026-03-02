@@ -78,13 +78,57 @@ def extract_lengthscales_log(model, d=None):
     except Exception:
         return None
 
-def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points, mode='normal'):
+def eigf_scores(grid_points, gp_model, gp_likelihood):
     """
-    Grid-search UCB maximizer.
-    Returns: new_x (1 x d tensor), ucb_value (float), idx (int)
-    UCB = mean + kappa * std
+    Compute EIGF (Expected Improvement for Global Fit, Lam 2008) acquisition scores.
+
+    Formula: phi_EIGF(x) = (f_hat(x) - y_nearest)^2 + sigma^2(x)
+
+    Where y_nearest is the observed training output at the nearest training point to x
+    (Voronoi neighbor). Pushes sampling toward regions where the surrogate disagrees
+    with local observations OR is highly uncertain.
+
+    Args:
+        grid_points: Tensor (n_grid, d)
+        gp_model: trained GPyTorch model
+        gp_likelihood: corresponding likelihood
+
+    Returns:
+        scores: Tensor (n_grid,) of EIGF scores
+    """
+    train_x = gp_model.train_inputs[0]   # (n_train, d)
+    train_y = gp_model.train_targets      # (n_train,)
+
+    gp_model.eval()
+    gp_likelihood.eval()
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        output = gp_likelihood(gp_model(grid_points))
+        mean = output.mean       # (n_grid,)
+        var = output.variance    # (n_grid,)
+
+    dists = torch.cdist(grid_points, train_x)    # (n_grid, n_train)
+    nearest_idx = dists.argmin(dim=1)             # (n_grid,)
+    y_near = train_y[nearest_idx]                 # (n_grid,)
+
+    return (mean - y_near) ** 2 + var             # (n_grid,)
+
+
+def maximize_acq(kappa_val, gp_model, gp_likelihood, grid_points, mode='normal', acq='ucb'):
+    """
+    Grid-search acquisition function maximizer.
+    Returns: new_x (1 x d tensor), acq_value (float), idx (int)
+
+    Modes for kappa scheduling: 'normal', 'exponential_decay', 'log_growth'
+    Acquisition functions: 'ucb' (default), 'eigf'
     """
 
+    if acq == 'eigf':
+        scores = eigf_scores(grid_points, gp_model, gp_likelihood)
+        best_idx = torch.argmax(scores).item()
+        best_x = grid_points[best_idx].unsqueeze(0)
+        return best_x, scores[best_idx].item(), best_idx
+
+    # UCB acquisition
     if mode == 'normal':
         pass
     elif mode == 'exponential_decay':

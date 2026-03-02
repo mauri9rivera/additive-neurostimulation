@@ -3,6 +3,8 @@ import torch
 import copy
 
 from SALib.sample import sobol as sobol_sampler
+from SALib.sample import saltelli as saltelli_sampler
+from SALib.analyze import sobol as salib_analyze
 from scipy.stats import sobol_indices as scipy_sobol
 from scipy.stats import qmc, uniform
 import tntorch as tn
@@ -67,7 +69,7 @@ class Sobol:
       update_partition(interactions) -> partition (list of list of dims)
     """
 
-    def __init__(self, f_obj, method='scipy', M=2048, B=1):
+    def __init__(self, f_obj, method='salib', M=2048, B=1):
         """
         f_obj: SyntheticTestFun object for the test function to optimize
         epsilon: threshold for high-order sobol interactions
@@ -83,6 +85,7 @@ class Sobol:
 
         method_map = {
             'scipy': self.interactions_scipy,
+            'salib': self.interactions_salib,
             'wirthl': self.interactions_wirthl,
             'deriv': self.interactions_deriv,
             'tt': self.interactions_tt,
@@ -309,6 +312,73 @@ class Sobol:
         ST_mean = ST_boot_norm.mean(axis=0)
 
         return {'S1': S1_mean, 'SD': high_mean, 'ST': ST_mean}
+
+    def interactions_salib(self, train_x, train_y, metamodel):
+        """
+        Calculate Sobol indices using the stochastic process approach (Marrel et al. 2008).
+
+        Instead of wrapping the GP posterior mean as a callable, this method:
+        1. Builds the full Saltelli evaluation matrix once using SALib.
+        2. Evaluates the GP once to get the joint posterior distribution at all Saltelli points.
+        3. For each bootstrap iteration, samples a single coherent GP realization and passes it
+           to SALib's analyze function.
+        4. Averages S1, SD, ST across bootstrap samples.
+
+        This avoids the smoothing bias of the posterior mean, giving more accurate S1 estimates.
+
+        Args:
+            train_x: Tensor (n, d) - training inputs
+            train_y: Tensor (n,) - training outputs
+            metamodel: ExactGP model
+
+        Returns:
+            dict with 'S1', 'SD', 'ST' as numpy arrays of shape (d,)
+        """
+        d = self.problem['num_vars']
+
+        device = train_x.device
+        dtype = train_x.dtype
+
+        # Train the meta model
+        metamodel, metamodel.likelihood, _ = optimize(metamodel, train_x, train_y)
+        metamodel.eval(); metamodel.likelihood.eval()
+
+        # Build Saltelli matrix once: shape (M*(d+2), d)
+        X_saltelli = saltelli_sampler.sample(self.problem, self.M, calc_second_order=False)
+        X_tens = torch.tensor(X_saltelli, device=device, dtype=dtype)
+
+        # Get joint latent posterior at all Saltelli points (no likelihood noise)
+        with torch.no_grad():
+            joint_dist = metamodel(X_tens)
+
+        S1_boot  = np.zeros((self.B, d))
+        ST_boot  = np.zeros((self.B, d))   # normalised ST stored here
+        SD_boot  = np.zeros((self.B, d))
+
+        for b in range(self.B):
+            # Sample a single coherent latent GP realization over all Saltelli points
+            f_b = joint_dist.rsample(sample_shape=torch.Size([1])).squeeze(0).cpu().numpy()
+            Si = salib_analyze.analyze(
+                self.problem, f_b,
+                calc_second_order=False,
+                print_to_console=False
+            )
+            S1  = np.nan_to_num(np.clip(Si['S1'], 0, 1),    nan=0.0)
+            ST  = np.nan_to_num(np.clip(Si['ST'], 0, np.inf), nan=0.0)
+
+            # Normalise ST per bootstrap sample (matches interactions_scipy)
+            norm_factor = np.sum(ST)
+            ST_norm = ST / (norm_factor + 1e-9)
+
+            S1_boot[b] = S1
+            ST_boot[b] = ST_norm
+            SD_boot[b] = 1 - np.clip(S1 / (ST_norm + 1e-9), 0, 1)
+
+        return {
+            'S1': S1_boot.mean(axis=0),
+            'SD': SD_boot.mean(axis=0),
+            'ST': ST_boot.mean(axis=0)
+        }
 
     def interactions_deriv(self, train_x, train_y, metamodel):
         """
@@ -701,8 +771,8 @@ class NeuralSobol:
         self.M = M
         self.problem = self._build_problem(dataset_type)
         self.device = torch.device("cpu")
-        # Default method is scipy
-        self.method = self.interactions_scipy
+        # Default method is salib (stochastic process approach)
+        self.method = self.interactions_salib
 
     def _build_problem(self, dataset_type):
         """
@@ -800,6 +870,65 @@ class NeuralSobol:
 
         # Aggregation over bootstrap
         high_mean = high_boot.mean(axis=0)
+
+        return high_mean
+
+    def interactions_salib(self, train_x, train_y, metamodel):
+        """
+        Calculate Sobol indices using the stochastic process approach (Marrel et al. 2008).
+
+        Uses SALib saltelli sampler + joint GP rsample instead of wrapping the GP posterior mean.
+        This avoids the smoothing bias of the posterior mean, giving more accurate S1 estimates.
+
+        Args:
+            train_x: Tensor (n, d) - training inputs
+            train_y: Tensor (n,) - training outputs
+            metamodel: ExactGP model
+
+        Returns:
+            numpy array (d,) of high-order interactions (1 - S1/ST) averaged over bootstrap
+        """
+        d = self.problem['num_vars']
+
+        device = train_x.device
+        dtype = train_x.dtype
+
+        # Train the metamodel
+        metamodel, metamodel.likelihood, _ = optimize(metamodel, train_x, train_y, lr=0.1)
+        metamodel.eval(); metamodel.likelihood.eval()
+
+        # Build Saltelli matrix once: shape (M*(d+2), d)
+        X_saltelli = saltelli_sampler.sample(self.problem, self.M, calc_second_order=False)
+        X_tens = torch.tensor(X_saltelli, device=device, dtype=dtype)
+
+        # Get joint latent posterior at all Saltelli points (no likelihood noise)
+        with torch.no_grad():
+            joint_dist = metamodel(X_tens)
+
+        S1_boot  = np.zeros((self.B, d))
+        ST_boot  = np.zeros((self.B, d))   # normalised ST stored here
+        SD_boot  = np.zeros((self.B, d))
+
+        for b in range(self.B):
+            # Sample a single coherent latent GP realization over all Saltelli points
+            f_b = joint_dist.rsample(sample_shape=torch.Size([1])).squeeze(0).cpu().numpy()
+            Si = salib_analyze.analyze(
+                self.problem, f_b,
+                calc_second_order=False,
+                print_to_console=False
+            )
+            S1  = np.nan_to_num(np.clip(Si['S1'], 0, 1),    nan=0.0)
+            ST  = np.nan_to_num(np.clip(Si['ST'], 0, np.inf), nan=0.0)
+
+            # Normalise ST per bootstrap sample (matches interactions_scipy)
+            norm_factor = np.sum(ST)
+            ST_norm = ST / (norm_factor + 1e-9)
+
+            S1_boot[b] = S1
+            ST_boot[b] = ST_norm
+            SD_boot[b] = 1 - np.clip(S1 / (ST_norm + 1e-9), 0, 1)
+
+        high_mean = SD_boot.mean(axis=0)
 
         return high_mean
 

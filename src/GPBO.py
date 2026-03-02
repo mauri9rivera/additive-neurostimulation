@@ -40,7 +40,7 @@ warnings.filterwarnings(
 
 ### Runners ###
 
-def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0, M=1024, epsilon=0.25, save=False, verbose=False,  device='cpu'):
+def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0, M=1024, epsilon=0.25, save=False, verbose=False,  device='cpu', acq='ucb'):
     """
     Returns the same metrics as run_bo, plus:
       - partition_updates: list of partition structures (list of lists) when updates occurred
@@ -109,7 +109,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
         lengthscale_history.append(ls_vec.cpu().numpy() if ls_vec is not None else np.full(f_obj.d, np.nan))
         loss_curve.append(np.mean(epoch_losses))
 
-        new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
+        new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x, acq=acq)
         new_y = f_obj.f.forward(new_x)
 
         # Update global bounds and exploration metrics
@@ -164,10 +164,10 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
             else:
                 new_partition = sobol.update_partition(interactions)
             model.update_partition(new_partition)
-            sobol_interactions.append(interactions)
+            sobol_interactions.append(copy.deepcopy(interactions))
             space_reconfiguration = None
         else:
-            sobol_interactions.append(interactions)
+            sobol_interactions.append(copy.deepcopy(interactions))
 
         t1 = time.time()
         elapsed_train = t1 - t0
@@ -232,7 +232,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
 def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
               M=1024, epsilon=0.25,
               W=8, delta=0.01, cooldown=5, gamma=0.5,
-              save=False, verbose=False, device='cpu'):
+              save=False, verbose=False, device='cpu', acq='ucb'):
     """
     Adaptive-Trigger Bayesian Optimization.
 
@@ -321,7 +321,7 @@ def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
         loss_curve.append(np.mean(epoch_losses))
         mll_history.append(epoch_losses[-1])  # final-epoch MLL
 
-        new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
+        new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x, acq=acq)
         new_y = f_obj.f.forward(new_x)
 
         # Update global bounds
@@ -374,11 +374,11 @@ def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
             else:
                 new_partition = sobol.update_partition(interactions)
             model.update_partition(new_partition)
-            sobol_interactions.append(interactions)
+            sobol_interactions.append(copy.deepcopy(interactions))
             space_reconfiguration = None
             theta_prev = None  # dimension of lengthscale vector changed
         else:
-            sobol_interactions.append(interactions)
+            sobol_interactions.append(copy.deepcopy(interactions))
 
         t1 = time.time()
         elapsed_train = t1 - t0
@@ -468,7 +468,7 @@ def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
     }
     return result
 
-def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, device='cpu'):
+def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, device='cpu', acq='ucb'):
 
     # Setting device for computations
     device = torch.device(device)
@@ -514,7 +514,7 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
         lengthscale_history.append(ls_vec.cpu().numpy() if ls_vec is not None else np.full(f_obj.d, np.nan))
 
         loss_curve.append(np.mean(epoch_losses))
-        new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x)
+        new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x, acq=acq)
 
         new_y = f_obj.f.forward(new_x)
 
@@ -1623,6 +1623,198 @@ def visualize_lengthscales(f_obj, model_cls, n_iter=200, n_reps=10, n_sobol=30, 
     plt.close(fig)
     return {'mean_lengthscales': mean_ls, 'std_lengthscales': std_ls}
 
+def _run_single_sobol_rep(rep, device, f_obj, model_cls, n_iter, n_sobol, kappa, M, epsilon):
+    """
+    Worker function for visualize_sobols: run one rep of run_partitionbo
+    and return the sobol_interactions trace.
+    """
+    f_obj.to(device)
+    print(f"[Worker {device}] visualize_sobols rep {rep+1}")
+    try:
+        result = run_partitionbo(
+            f_obj, model_cls, n_iter=n_iter, n_sobol=n_sobol,
+            kappa=kappa, M=M, epsilon=epsilon,
+            save=False, verbose=False, device=device
+        )
+        return result['sobol_interactions']
+    except Exception as e:
+        print(f"FAILED: visualize_sobols rep {rep+1} on {device}: {e}")
+        traceback.print_exc()
+        return None
+
+
+def visualize_sobols(f_obj, model_cls=SobolGP, n_iter=200, n_reps=10, n_sobol=30,
+                     kappa=1.0, M=1024, epsilon=0.25,
+                     save=True, verbose=False, devices=['cpu']):
+    """
+    Run n_reps of run_partitionbo in parallel, then plot true vs. estimated S1, SD, ST
+    traces per dimension.
+
+    Plot layout: d rows × 3 columns
+      - Col 0: S1  — estimated mean (blue) + rep traces (blue, alpha=0.1) + true S1 (black dashed)
+      - Col 1: SD  — estimated mean (green) + rep traces (green, alpha=0.1) + true SD (black dashed)
+                     + epsilon threshold (red dashed)
+      - Col 2: ST  — estimated mean (orange) + rep traces (orange, alpha=0.1) + true ST (black dashed)
+
+    Parameters
+    ----------
+    f_obj : SyntheticTestFun
+    model_cls : class (default SobolGP)
+    n_iter : int
+    n_reps : int
+    n_sobol : int
+    kappa : float
+    M : int
+    epsilon : float
+    save : bool
+    verbose : bool
+    devices : list of str
+    """
+    d = f_obj.d
+    n_init = np.clip(d * 3, 1, 20)
+    num_workers = len(devices)
+
+    print(f"\nStarting visualize_sobols with {num_workers} workers on devices: {devices}")
+
+    # 1. Run n_reps in parallel
+    all_sobol_traces = []
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for rep in range(n_reps):
+            assigned_device = devices[rep % num_workers]
+            future = executor.submit(
+                _run_single_sobol_rep,
+                rep, assigned_device, f_obj, model_cls,
+                n_iter, n_sobol, kappa, M, epsilon
+            )
+            futures.append(future)
+
+        for future in as_completed(futures):
+            trace = future.result()
+            if trace is not None:
+                all_sobol_traces.append(trace)
+
+    if not all_sobol_traces:
+        print("All reps failed — no plot generated.")
+        return None
+
+    print(f"\nCollected {len(all_sobol_traces)} reps. Computing ground truth Sobol indices...")
+
+    # 2. Compute ground truth Sobol via SALib on actual function
+    gt_sobols = sobol_sensitivity(f_obj, n_samples=20000)
+    S1_true = np.clip(np.asarray(gt_sobols['S1']).flatten(), 0, 1)
+    ST_true = np.clip(np.asarray(gt_sobols['ST']).flatten(), 0, np.inf)
+    # Normalise ST to match interactions_salib's formula (ST / sum(ST))
+    ST_true_norm = ST_true / (np.sum(ST_true) + 1e-9)
+    SD_true = 1 - np.clip(S1_true / (ST_true_norm + 1e-9), 0, 1)
+
+    # 3. Build per-iteration arrays (n_reps, n_iter, d)
+    T = n_iter  # total budget including n_init
+    n_valid_reps = len(all_sobol_traces)
+
+    S1_arr = np.zeros((n_valid_reps, T, d))
+    SD_arr = np.zeros((n_valid_reps, T, d))
+    ST_arr = np.zeros((n_valid_reps, T, d))
+
+    for r, trace in enumerate(all_sobol_traces):
+        # trace has length n_iter - n_init (BO loop iterations)
+        # pad with zeros for n_init initialization period
+        for t, entry in enumerate(trace):
+            actual_t = n_init + t  # offset by initialization
+            if actual_t >= T:
+                break
+            if entry is None:
+                continue
+            if isinstance(entry, dict):
+                S1_arr[r, actual_t] = np.asarray(entry.get('S1', np.zeros(d))).flatten()[:d]
+                SD_arr[r, actual_t] = np.asarray(entry.get('SD', np.zeros(d))).flatten()[:d]
+                ST_arr[r, actual_t] = np.asarray(entry.get('ST', np.zeros(d))).flatten()[:d]
+
+    # Forward-fill zeros after first non-zero entry to smooth display
+    for r in range(n_valid_reps):
+        for dim in range(d):
+            for arr in [S1_arr, SD_arr, ST_arr]:
+                last_nonzero = 0.0
+                for t in range(T):
+                    if arr[r, t, dim] != 0.0:
+                        last_nonzero = arr[r, t, dim]
+                    else:
+                        arr[r, t, dim] = last_nonzero
+
+    mean_S1 = S1_arr.mean(axis=0)   # (T, d)
+    mean_SD = SD_arr.mean(axis=0)
+    mean_ST = ST_arr.mean(axis=0)
+
+    # 4. Plot: d rows × 3 columns
+    x_full = np.arange(T)
+    fig, axes = plt.subplots(d, 3, figsize=(15, 4 * d), squeeze=False)
+
+    col_colors = ['blue', 'green', 'orange']
+    col_means  = [mean_S1, mean_SD, mean_ST]
+    col_reps   = [S1_arr, SD_arr, ST_arr]
+    # ST column uses normalised ground truth to match interactions_salib output
+    col_true   = [S1_true, SD_true, ST_true_norm]
+    col_titles = ['S1 (First-order)', 'SD (Interaction)', 'ST (Total-order, normalised)']
+
+    for dim in range(d):
+        for col in range(3):
+            ax = axes[dim, col]
+            color = col_colors[col]
+
+            # Individual rep traces
+            for r in range(n_valid_reps):
+                ax.plot(x_full, col_reps[col][r, :, dim], color=color, alpha=0.1, linewidth=0.8)
+
+            # Mean trace
+            ax.plot(x_full, col_means[col][:, dim], color=color, linewidth=1.8, label='Estimated mean')
+
+            # True value (horizontal dashed) — shown on every subplot
+            true_val = float(col_true[col][dim])
+            ax.axhline(true_val, color='black', linestyle='--', linewidth=1.4, label=f'True = {true_val:.3f}')
+
+            # Epsilon threshold on every SD subplot (col=1)
+            if col == 1:
+                ax.axhline(epsilon, color='red', linestyle='--', linewidth=1.2, label=f'epsilon = {epsilon}')
+
+            ax.set_ylim(-0.05, 1.15)
+            ax.set_xlim(0, T - 1)
+            ax.grid(True, linestyle='--', linewidth=0.4, alpha=0.6)
+            if dim == 0:
+                ax.set_title(col_titles[col], fontsize=12)
+            if col == 0:
+                ax.set_ylabel(f'Dim {dim + 1}', fontsize=10)
+            if dim == d - 1:
+                ax.set_xlabel('Iteration', fontsize=10)
+            # Legend on every subplot so true/epsilon lines are always labelled
+            ax.legend(fontsize=7, loc='upper right')
+
+    fig.suptitle(
+        f'Sobol Index Traces | {model_cls.__name__} on {d}d-{f_obj.name} '
+        f'(kappa={kappa}, M={M}, epsilon={epsilon}, n_reps={n_valid_reps})',
+        fontsize=13
+    )
+    plt.tight_layout()
+
+    if save:
+        output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
+        os.makedirs(output_dir, exist_ok=True)
+        fname = f'sobol_traces_{model_cls.__name__}_{d}d-{f_obj.name}_kappa{kappa}.svg'
+        fpath = os.path.join(output_dir, fname)
+        plt.savefig(fpath, format='svg')
+        print(f"Saved Sobol traces plot to {fpath}")
+
+    plt.close(fig)
+
+    return {
+        'S1': S1_arr,
+        'SD': SD_arr,
+        'ST': ST_arr,
+        'S1_true': S1_true,
+        'SD_true': SD_true,
+        'ST_true': ST_true_norm,
+    }
+
+
 ### Parser handling
 def _parse_list_of_floats(text):
     if text is None:
@@ -1654,7 +1846,7 @@ def main(argv=None):
     parser.add_argument('--negate', choices=['auto','true','false'], default='auto', help='Negate objective? if auto will use default mapping in script')
 
     # Method selection
-    parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, run_AT_BO, kappa_search, optimization_metrics, partition_reconstruction, visualize_lengthscales')
+    parser.add_argument('--method', type=str, default='run_bo', help='Which method to run: run_bo, run_partitionbo, run_AT_BO, kappa_search, optimization_metrics, partition_reconstruction, visualize_lengthscales, visualize_sobols')
     parser.add_argument('--model_cls', type=str, default='ExactGP', help='Model class name (ExactGP, AdditiveGP, AdditiveDuvenaudGP, SobolGP, MHGP)')
     parser.add_argument('--bo_method', type=str, default='run_bo', help='BO method used by higher-level routines (run_bo or run_partitionbo)')
 
@@ -1680,6 +1872,10 @@ def main(argv=None):
     parser.add_argument('--device', type=str, default='cpu', help='Device for single runs (e.g. cuda:0)')
     parser.add_argument('--devices', type=_parse_list_of_strings, default=None, 
                         help='Comma-separated list of devices for parallel search (e.g. cuda:0,cuda:1)')
+
+    # Acquisition function
+    parser.add_argument('--acq', type=str, default='ucb', choices=['ucb', 'eigf'],
+                        help='Acquisition function: ucb (default) or eigf')
 
     # Misc
     parser.add_argument('--save', action='store_true')
@@ -1708,6 +1904,7 @@ def main(argv=None):
         'optimization_metrics': optimization_metrics,
         'internal_representation': internal_representation,
         'visualize_lengthscales': visualize_lengthscales,
+        'visualize_sobols': visualize_sobols,
     }
 
     if args.list_models:
@@ -1756,20 +1953,23 @@ def main(argv=None):
     # dispatch
     try:
         if args.method == 'run_bo':
-            result = run_bo(f_obj, model_cls, n_iter=args.n_iter, kappa=args.kappa, 
-                            save=args.save, verbose=args.verbose, device=args.device)
-        
+            result = run_bo(f_obj, model_cls, n_iter=args.n_iter, kappa=args.kappa,
+                            save=args.save, verbose=args.verbose, device=args.device,
+                            acq=args.acq)
+
         elif args.method == 'run_partitionbo':
             result = run_partitionbo(f_obj, model_cls, n_iter=args.n_iter, n_sobol=args.n_sobol, kappa=args.kappa,
                             M=args.M, epsilon=args.epsilon,
-                            save=args.save, verbose=args.verbose, device=args.device)
+                            save=args.save, verbose=args.verbose, device=args.device,
+                            acq=args.acq)
 
         elif args.method == 'run_AT_BO':
             result = run_AT_BO(f_obj, model_cls, n_iter=args.n_iter, kappa=args.kappa,
                                M=args.M, epsilon=args.epsilon,
                                W=args.W, delta=args.delta,
                                cooldown=args.cooldown, gamma=args.gamma,
-                               save=args.save, verbose=args.verbose, device=args.device)
+                               save=args.save, verbose=args.verbose, device=args.device,
+                               acq=args.acq)
 
         elif args.method == 'kappa_search':
             # Provide a default kappa list if none given
@@ -1803,6 +2003,13 @@ def main(argv=None):
                 kappa=args.kappa, M=args.M, epsilon=args.epsilon,
                 W=args.W, delta=args.delta, cooldown=args.cooldown, gamma=args.gamma,
                 save=True, verbose=args.verbose, devices=device_list)
+
+        elif args.method == 'visualize_sobols':
+            result = visualize_sobols(
+                f_obj, model_cls, n_iter=args.n_iter, n_reps=args.n_reps,
+                n_sobol=args.n_sobol, kappa=args.kappa, M=args.M, epsilon=args.epsilon,
+                save=args.save, verbose=args.verbose, devices=device_list)
+
         else:
             raise ValueError('Unsupported method')
 
