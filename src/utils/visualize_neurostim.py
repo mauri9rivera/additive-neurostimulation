@@ -84,23 +84,17 @@ def plot_kappas(dataset, show=True):
     The function will average PP and PP_t across all axes except the kappa axis and the time axis
     (time axis is assumed to be the last axis).
     """
-    # Get file paths from config
     npz_files = get_npz_files(dataset)
-    config = DATASET_CONFIG[dataset]
-    emg_map = config['n_emgs']
 
-    # colors for models in order: ExactGP, AdditiveGP, SobolGP
+    # Authoritative per-subject EMG counts (matches what was used during the experiment run)
+    emg_map = set_experiment(dataset)['n_emgs']
+
     model_names = ['ExactGP', 'AdditiveGP', 'SobolGP']
-    cmap_list = [cm.tab10, cm.tab10, cm.tab10, cm.tab10]
+    cmap_list = [cm.tab10, cm.tab10, cm.tab10]
 
-    n = np.sum(emg_map)
-
-    # Prepare save dir
-    save_dir=f'output/neurostim_experiments/{dataset}'
+    save_dir = f'output/neurostim_experiments/{dataset}'
     os.makedirs(save_dir, exist_ok=True)
-    out_fname = f"{dataset}_kappa_comparison_unresolved.svg"
-    out_path = os.path.join(save_dir, out_fname)
-
+    out_path = os.path.join(save_dir, f"{dataset}_kappa_comparison.svg")
 
     n_models = len(npz_files)
     fig, axes = plt.subplots(1, n_models, figsize=(5.5 * n_models, 5), squeeze=False)
@@ -108,50 +102,43 @@ def plot_kappas(dataset, show=True):
 
     for file_idx, filepath in enumerate(npz_files):
         ax = axes[file_idx]
-
         cmap = cmap_list[file_idx]
-        
+
         data = np.load(filepath, allow_pickle=True)
-        PP = data['PP']
-        PP_t = data['PP_t']
-        kappas =data['kappas']
+        PP = np.asarray(data['PP'])    # (nSubjects, max_nEmgs, n_kappas, nRep, MaxQueries)
+        PP_t = np.asarray(data['PP_t'])
+        kappas = data['kappas']
 
         n_iters = PP.shape[-1]
+        n_subjects_in_file = PP.shape[0]
+        max_emgs_in_file = PP.shape[1]
 
-        exploitations = np.zeros((len(kappas), n, n_iters))
-        explorations = np.zeros((len(kappas), n, n_iters))
-        
-        # Convert torch tensors to numpy if necessary (some saved torch.cpu().numpy() already)
-        PP = np.asarray(PP)
-        PP_t = np.asarray(PP_t)
+        # Accumulate per-kappa mean curves over all valid (subject, emg) slots.
+        # PP[s, e] shape: (n_kappas, nRep, MaxQueries)
+        # mean over reps (axis=1) → (n_kappas, MaxQueries)
+        all_explr = []
+        all_expl  = []
 
-        n_kappas = int(kappas.shape[0])
+        for s_i in range(min(len(emg_map), n_subjects_in_file)):
+            n_emgs_this = min(emg_map[s_i], max_emgs_in_file)
+            for e_i in range(n_emgs_this):
+                all_explr.append(PP[s_i, e_i].mean(axis=1))
+                all_expl.append(PP_t[s_i, e_i].mean(axis=1))
 
-        for k_i in range(n_kappas):
-            jj=0
-            for s_i in range(len(emg_map)):
+        # Stack → (n_valid_slots, n_kappas, MaxQueries), then mean over slots
+        explorations = np.stack(all_explr, axis=0).mean(axis=0)  # (n_kappas, MaxQueries)
+        exploitations = np.stack(all_expl,  axis=0).mean(axis=0)
 
-                for muscle in range(emg_map[s_i]):
-
-                    explorations[k_i, jj, :] = np.mean(PP[s_i, muscle, k_i], axis=0)
-                    exploitations[k_i, jj, :] = np.mean(PP_t[s_i, muscle, k_i], axis=0)
-
-                    jj+=1
-
-        explorations = np.mean(explorations, axis=1)
-        exploitations = np.mean(exploitations, axis=1)
-        iterations = np.arange(1, n_iters+1)
-        
+        iterations = np.arange(1, n_iters + 1)
         for k_idx, k_val in enumerate(kappas):
-
             c = cmap(k_idx)
-            label = f"κ={float(k_val)} exploration"
-            ax.plot(iterations, explorations[k_idx], linestyle='-', color=c, label=label)
+            ax.plot(iterations, explorations[k_idx], linestyle='-', color=c,
+                    label=f"κ={float(k_val)} exploration")
             ax.plot(iterations, exploitations[k_idx], linestyle='--', color=c)
 
         ax.set_title(model_names[file_idx])
         ax.set_xlabel('Iterations')
-        ax.set_ylabel('Metric ')
+        ax.set_ylabel('Metric')
         ax.set_ylim(0.0, 1.05)
         ax.grid(True)
         ax.legend(fontsize='small', loc='lower right', ncol=1)
@@ -661,19 +648,25 @@ def plot_emg_exploration_traces(dataset, subject_idx, kappa_idx, show=True):
                              squeeze=False)
 
     for col, filepath in enumerate(npz_files):
-        if col == 0:
-            continue
         data = np.load(filepath, allow_pickle=True)
         PP = np.asarray(data['PP'])
         kappas = data['kappas']
         n_iters = PP.shape[-1]
         iterations = np.arange(1, n_iters + 1)
 
+        # Resolve negative kappa index before using it as an array index
+        k_idx = int(kappa_idx) % len(kappas)
+
         for e_i in range(n_emgs):
             ax = axes[e_i, col]
 
+            # Guard: subject or EMG index may exceed what's stored (zero-padded slots)
+            if subject_idx >= PP.shape[0] or e_i >= PP.shape[1]:
+                ax.axis('off')
+                continue
+
             # PP shape: (n_subjects, max_n_emgs, n_kappas, n_reps, max_queries)
-            traces = PP[subject_idx, e_i, kappa_idx]  # (n_reps, n_iters)
+            traces = PP[subject_idx, e_i, k_idx]  # (n_reps, n_iters)
 
             # Individual reps
             for r in range(traces.shape[0]):
@@ -693,7 +686,7 @@ def plot_emg_exploration_traces(dataset, subject_idx, kappa_idx, show=True):
                 label = emg_names[e_i] if e_i < len(emg_names) else f'EMG {e_i}'
                 ax.set_ylabel(label, fontsize=9)
             if e_i == 0:
-                ax.set_title(f'{model_names[col]} (κ={float(kappas[kappa_idx])})')
+                ax.set_title(f'{model_names[col]} (κ={float(kappas[k_idx])})')
             if e_i == n_emgs - 1:
                 ax.set_xlabel('Iterations')
 
@@ -818,9 +811,9 @@ if __name__ == '__main__':
 
     #plot_emg_exploration_traces('5d_rat', 1, -1)
     # EMG exploration traces for 5d_rat
-    #plot_emg_exploration_traces('5d_rat', subject_idx=1, kappa_idx=3)
+    plot_emg_exploration_traces('5d_rat', subject_idx=1, kappa_idx=6)
 
-    plot_subject_emg_expl_curves('5d_rat', subject_idx=2, kappa_idx=-2, model_name='NeuralSobolGP_median', model_idx=2, show=True)
+    #plot_subject_emg_expl_curves('5d_rat', subject_idx=0, kappa_idx=4, model_name='NeuralExactGP', model_idx=0, show=True)
 
     # Partition metrics (still requires loading data manually for SobolGP file)
     # npz_files = get_npz_files('spinal')
