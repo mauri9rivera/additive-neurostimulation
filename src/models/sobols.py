@@ -69,7 +69,7 @@ class Sobol:
       update_partition(interactions) -> partition (list of list of dims)
     """
 
-    def __init__(self, f_obj, method='salib', M=2048, B=1):
+    def __init__(self, f_obj, method='scipy', M=2048, B=1):
         """
         f_obj: SyntheticTestFun object for the test function to optimize
         epsilon: threshold for high-order sobol interactions
@@ -298,13 +298,20 @@ class Sobol:
             )
 
             # Extract components
-            S1 = np.clip(result.first_order, 0, 1)
-            ST = np.clip(result.total_order, 0, np.inf)
+            S1 = np.nan_to_num(np.clip(result.first_order, 0, 1),    nan=0.0)
+            ST = np.nan_to_num(np.clip(result.total_order, 0, np.inf), nan=0.0)
 
+            # Same normalization as interactions_salib: both S1 and ST divided by
+            # sum(ST) so their per-dimension ratio is preserved.
             norm_factor = np.sum(ST)
-            S1_boot[b] = S1 #/ norm_factor
-            ST_boot_norm[b] = ST / norm_factor
-            high_boot[b] = 1 - np.clip((S1_boot[b] / (ST_boot_norm[b] + 1e-4)), 0.0 , 1.0) #ST_boot_norm[b] - S1_boot[b]     # higher-order index
+            ST_norm = ST / (norm_factor + 1e-9)
+            S1_norm = np.clip(S1 / (norm_factor + 1e-9), 0.0, 1.0)
+            # SD from raw ratio — scale-invariant, avoids nf² amplification.
+            SD = 1.0 - np.clip(S1 / (ST + 1e-9), 0.0, 1.0)
+
+            S1_boot[b]     = S1_norm
+            ST_boot_norm[b] = ST_norm
+            high_boot[b]   = SD
 
         # ---- Aggregation over bootstrap ----
         high_mean = high_boot.mean(axis=0)
@@ -313,23 +320,34 @@ class Sobol:
 
         return {'S1': S1_mean, 'SD': high_mean, 'ST': ST_mean}
 
-    def interactions_salib(self, train_x, train_y, metamodel):
+    def interactions_salib(self, train_x, train_y, metamodel,
+                           coupling='joint_latent', sd_correction='raw'):
         """
         Calculate Sobol indices using the stochastic process approach (Marrel et al. 2008).
 
-        Instead of wrapping the GP posterior mean as a callable, this method:
         1. Builds the full Saltelli evaluation matrix once using SALib.
-        2. Evaluates the GP once to get the joint posterior distribution at all Saltelli points.
-        3. For each bootstrap iteration, samples a single coherent GP realization and passes it
-           to SALib's analyze function.
+        2. Evaluates the GP once to get the posterior distribution at all Saltelli points.
+        3. For each bootstrap iteration, draws a GP realization and passes it to SALib.
         4. Averages S1, SD, ST across bootstrap samples.
 
-        This avoids the smoothing bias of the posterior mean, giving more accurate S1 estimates.
-
         Args:
-            train_x: Tensor (n, d) - training inputs
-            train_y: Tensor (n,) - training outputs
-            metamodel: ExactGP model
+            train_x:       Tensor (n, d) — training inputs
+            train_y:       Tensor (n,)   — training outputs (normalised)
+            metamodel:     ExactGP model
+            coupling:      How to sample each GP realization at Saltelli points.
+                'joint_latent'      — joint rsample from latent GP posterior (default).
+                                      Full K(X,X) covariance → coherent realizations,
+                                      but spurious cross-dim coupling inflates ST.
+                'joint_predictive'  — joint rsample from predictive distribution
+                                      (likelihood adds σ²_n·I diagonal → reduces coupling).
+                'diag'              — independent marginal samples from predictive
+                                      distribution; completely breaks cross-dim coupling
+                                      at the cost of incoherence between evaluation points.
+            sd_correction: Post-processing of the raw SD = 1 − S1/ST estimate.
+                'raw'    — no correction (default).
+                'floor'  — subtract the sample-specific S1/ST floor (= sum_S1/sum_ST)
+                           before normalising; maps additive-floor → 0 without requiring
+                           a hard-coded threshold.
 
         Returns:
             dict with 'S1', 'SD', 'ST' as numpy arrays of shape (d,)
@@ -347,17 +365,26 @@ class Sobol:
         X_saltelli = saltelli_sampler.sample(self.problem, self.M, calc_second_order=False)
         X_tens = torch.tensor(X_saltelli, device=device, dtype=dtype)
 
-        # Get joint latent posterior at all Saltelli points (no likelihood noise)
+        # Obtain the GP distribution at all Saltelli points once
         with torch.no_grad():
-            joint_dist = metamodel(X_tens)
+            if coupling == 'joint_predictive' or coupling == 'diag':
+                dist = metamodel.likelihood(metamodel(X_tens))   # predictive: adds σ²_n·I
+            else:                                                  # 'joint_latent'
+                dist = metamodel(X_tens)                          # latent GP, no noise
 
         S1_boot  = np.zeros((self.B, d))
-        ST_boot  = np.zeros((self.B, d))   # normalised ST stored here
+        ST_boot  = np.zeros((self.B, d))
         SD_boot  = np.zeros((self.B, d))
 
         for b in range(self.B):
-            # Sample a single coherent latent GP realization over all Saltelli points
-            f_b = joint_dist.rsample(sample_shape=torch.Size([1])).squeeze(0).cpu().numpy()
+            if coupling == 'diag':
+                # Lead 2b — independent marginal samples: severs all cross-dim coupling.
+                # Each point drawn independently from N(μ(x), σ²(x) + σ²_n).
+                f_b = (dist.mean + dist.stddev * torch.randn_like(dist.mean)).cpu().numpy()
+            else:
+                # 'joint_latent' or 'joint_predictive' — coherent joint rsample.
+                f_b = dist.rsample(sample_shape=torch.Size([1])).squeeze(0).cpu().numpy()
+
             Si = salib_analyze.analyze(
                 self.problem, f_b,
                 calc_second_order=False,
@@ -366,13 +393,28 @@ class Sobol:
             S1  = np.nan_to_num(np.clip(Si['S1'], 0, 1),    nan=0.0)
             ST  = np.nan_to_num(np.clip(Si['ST'], 0, np.inf), nan=0.0)
 
-            # Normalise ST per bootstrap sample (matches interactions_scipy)
+            # Normalise both S1 and ST by sum(ST): same denominator preserves ratio.
             norm_factor = np.sum(ST)
             ST_norm = ST / (norm_factor + 1e-9)
+            S1_norm = np.clip(S1 / (norm_factor + 1e-9), 0.0, 1.0)
 
-            S1_boot[b] = S1
+            # --- SD computation ---
+            if sd_correction == 'floor':
+                # Lead 3 — floor correction.
+                # The GP systematically gives sum(S1)/sum(ST) ≈ floor_ratio for ALL
+                # functions (additive and non-additive alike). Dividing each S1_i by
+                # floor_ratio raises the global S1 budget to match sum(ST), correcting
+                # the additive-floor without requiring a hard-coded constant.
+                floor_ratio = np.sum(S1_norm)          # = sum(S1_raw)/sum(ST_raw)
+                S1_debiased = np.clip(S1_norm / (floor_ratio + 1e-9), 0.0, 1.0)
+                SD = 1.0 - np.clip(S1_debiased / (ST_norm + 1e-9), 0.0, 1.0)
+            else:
+                # 'raw' — scale-invariant ratio; unbiased if deflation is proportional.
+                SD = 1.0 - np.clip(S1 / (ST + 1e-9), 0.0, 1.0)
+
+            S1_boot[b] = S1_norm
             ST_boot[b] = ST_norm
-            SD_boot[b] = 1 - np.clip(S1 / (ST_norm + 1e-9), 0, 1)
+            SD_boot[b] = SD
 
         return {
             'S1': S1_boot.mean(axis=0),
@@ -920,13 +962,17 @@ class NeuralSobol:
             S1  = np.nan_to_num(np.clip(Si['S1'], 0, 1),    nan=0.0)
             ST  = np.nan_to_num(np.clip(Si['ST'], 0, np.inf), nan=0.0)
 
-            # Normalise ST per bootstrap sample (matches interactions_scipy)
+            # Normalise both S1 and ST by sum(ST) (same denominator).
+            # SD = 1 - S1/ST is scale-invariant; using a shared denominator
+            # avoids the nf² amplification of the previous formulation.
             norm_factor = np.sum(ST)
             ST_norm = ST / (norm_factor + 1e-9)
+            S1_norm = np.clip(S1 / (norm_factor + 1e-9), 0.0, 1.0)
+            SD = 1.0 - np.clip(S1 / (ST + 1e-9), 0.0, 1.0)
 
-            S1_boot[b] = S1
+            S1_boot[b] = S1_norm
             ST_boot[b] = ST_norm
-            SD_boot[b] = 1 - np.clip(S1 / (ST_norm + 1e-9), 0, 1)
+            SD_boot[b] = SD
 
         high_mean = SD_boot.mean(axis=0)
 

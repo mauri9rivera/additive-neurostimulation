@@ -85,6 +85,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
     # Additional metrics
     sobol_interactions = []
     lengthscale_history = []
+    mll_history = []
 
     # Initialize executor
     executor = ThreadPoolExecutor(max_workers=sobol_workers)
@@ -108,6 +109,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
         ls_vec = extract_lengthscales_log(model, f_obj.d)
         lengthscale_history.append(ls_vec.cpu().numpy() if ls_vec is not None else np.full(f_obj.d, np.nan))
         loss_curve.append(np.mean(epoch_losses))
+        mll_history.append(float(np.atleast_1d(epoch_losses)[-1]))
 
         new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x, acq=acq)
         new_y = f_obj.f.forward(new_x)
@@ -224,6 +226,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
         'regrets': np.array(regrets),
         'sobol_interactions': sobol_interactions,
         'lengthscales': np.array(lengthscale_history),
+        'mll_history': np.array(mll_history),
         'train_times': train_times,
         'cumulative_time': cumulative_time
     }
@@ -231,7 +234,7 @@ def run_partitionbo(f_obj,  model_cls=SobolGP, n_iter=200, n_sobol=30, kappa=1.0
 
 def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
               M=1024, epsilon=0.25,
-              W=8, delta=0.01, cooldown=5, gamma=0.5,
+              W=10, delta=0.1, cooldown=5, gamma=0.5,
               save=False, verbose=False, device='cpu', acq='ucb'):
     """
     Adaptive-Trigger Bayesian Optimization.
@@ -319,7 +322,7 @@ def run_AT_BO(f_obj, model_cls=SobolGP, n_iter=200, kappa=1.0,
         ls_vec = extract_lengthscales_log(model, f_obj.d)
         lengthscale_history.append(ls_vec.cpu().numpy() if ls_vec is not None else np.full(f_obj.d, np.nan))
         loss_curve.append(np.mean(epoch_losses))
-        mll_history.append(epoch_losses[-1])  # final-epoch MLL
+        mll_history.append(float(np.atleast_1d(epoch_losses)[-1]))  # final-epoch MLL
 
         new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x, acq=acq)
         new_y = f_obj.f.forward(new_x)
@@ -499,6 +502,7 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
     #initialize metrics
     r_squared, loss_curve, expl_scores, exploit_scores, regrets, train_times = [0.0 for i in range(n_init)], [], [0.0 for i in range(n_init)], [0.0 for i in range(n_init)], [1.0 for i in range(n_init)], [0.0 for i in range(n_init)]
     lengthscale_history = []
+    mll_history = []
 
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
     model = model_cls(train_x, train_y, likelihood).to(device)
@@ -514,6 +518,7 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
         lengthscale_history.append(ls_vec.cpu().numpy() if ls_vec is not None else np.full(f_obj.d, np.nan))
 
         loss_curve.append(np.mean(epoch_losses))
+        mll_history.append(float(np.atleast_1d(epoch_losses)[-1]))
         new_x, acq_val, acq_idx = maximize_acq(kappa, model, likelihood, grid_x, acq=acq)
 
         new_y = f_obj.f.forward(new_x)
@@ -600,6 +605,7 @@ def run_bo(f_obj, model_cls, n_iter=200, kappa=1.0, save=False, verbose=False, d
         'loss': loss_curve,
         'regrets': regrets,
         'lengthscales': np.array(lengthscale_history),
+        'mll_history': np.array(mll_history),
         'train_times': train_times,
         'cumulative_time': cumulative_time
        }
@@ -687,23 +693,23 @@ def run_single_epsilon(eps_val, device, f_obj, model_cls, n_iter, n_reps, kappa,
     return eps_val, stacked_explore.mean(axis=0), stacked_exploit.mean(axis=0)
 
 def run_single_optm(model_label, model_cls, kappa, rep, device,
-                           f_obj, n_iter, M=1024, epsilon=0.25):
+                           f_obj, n_iter, M=1024, epsilon=0.25, acq='ucb'):
     """
     Worker to run a single repetition for a specific model class.
     """
     f_obj.to(device)
-        
+
     print(f"[Worker {device}] Starting {model_label} rep {rep+1} (k={kappa})")
-    
+
     try:
         # Select correct runner
         if model_label in ['SobolGP', 'MHGP']:
             res = run_partitionbo(f_obj, model_cls, n_iter=n_iter,
                                   kappa=kappa, M=M, epsilon=epsilon,
-                                  save=False, device=device)
+                                  save=False, device=device, acq=acq)
         else:
-            res = run_bo(f_obj, model_cls, n_iter=n_iter, 
-                         kappa=kappa, save=False, device=device)
+            res = run_bo(f_obj, model_cls, n_iter=n_iter,
+                         kappa=kappa, save=False, device=device, acq=acq)
             
         # Return lightweight data (numpy arrays)
         return (model_label, {
@@ -964,7 +970,7 @@ def epsilon_search(f_obj, epsilon_list, model_cls=SobolGP, n_iter=100, n_reps=15
     plt.close()
     print(f"Saved epsilon search plot to {plot_path}")
 
-def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['cpu']):
+def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['cpu'], acq='ucb'):
     """
     Run BO variants for f_obj and plot:
       - Plot 1: Exploration (dashed), Exploitation (solid) averaged across n_reps
@@ -1013,6 +1019,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
                 'device': device,
                 'f_obj': f_obj,
                 'n_iter': n_iter,
+                'acq': acq,
             })
             job_idx += 1
 
@@ -1103,7 +1110,8 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
     output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
     os.makedirs(output_dir, exist_ok=True)
     dim = f_obj.d
-    perf_filename = f'explr-explt_{dim}d-{f_obj.name}_budget{n_iter}.svg'
+    acq_suffix = f'_acq{acq}' if acq != 'ucb' else ''
+    perf_filename = f'explr-explt_{dim}d-{f_obj.name}_budget{n_iter}{acq_suffix}.svg'
     perf_path = os.path.join(output_dir, perf_filename)
     plt.savefig(perf_path, format='svg')
     plt.close(fig1)
@@ -1151,7 +1159,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
     ax2.grid(True)
     ax2.legend(loc='upper right', fontsize='small')
 
-    regrets_filename = f'regrets_{dim}d-{f_obj.name}_budget{n_iter}.svg'
+    regrets_filename = f'regrets_{dim}d-{f_obj.name}_budget{n_iter}{acq_suffix}.svg'
     regrets_path = os.path.join(output_dir, regrets_filename)
     plt.savefig(regrets_path, format='svg')
     plt.close(fig2)
@@ -1238,7 +1246,7 @@ def optimization_metrics(f_obj, kappas, n_iter=100, n_reps=15, ci=95, devices=['
     fig2.legend(handles=all_handles, labels=all_labels, loc="upper right", bbox_to_anchor=(0.98, 0.98))
     plt.tight_layout()
 
-    sobol_fname = f'partitions_{f_obj.d}d-{f_obj.name}_kappa{kappa}.svg'
+    sobol_fname = f'partitions_{f_obj.d}d-{f_obj.name}_kappa{kappa}{acq_suffix}.svg'
     outpath = os.path.join(output_dir, sobol_fname)
     fig2.savefig(outpath)
     plt.close(fig2)
@@ -1536,6 +1544,42 @@ def _run_single_lengthscale(rep, device, f_obj, model_cls, n_iter, kappa,
         traceback.print_exc()
         return None
 
+
+def _run_single_mll_ls_rep(rep, device, f_obj, model_cls, n_iter, kappa,
+                            n_sobol, M, epsilon, W, delta, cooldown, gamma):
+    """
+    Worker function for visualize_mll and visualize_mll_and_lengthscales.
+    Routes to the appropriate runner and returns both lengthscales and mll_history.
+    """
+    model_name = model_cls.__name__
+    f_obj.to(device)
+
+    print(f"[Worker {device}] Starting {model_name} rep {rep+1}")
+
+    try:
+        if model_cls is MHGP:
+            result = run_AT_BO(f_obj, model_cls, n_iter=n_iter, kappa=kappa,
+                               M=M, epsilon=epsilon,
+                               W=W, delta=delta, cooldown=cooldown, gamma=gamma,
+                               save=False, verbose=False, device=device)
+        elif model_cls is SobolGP:
+            result = run_partitionbo(f_obj, model_cls, n_iter=n_iter, n_sobol=n_sobol,
+                                     kappa=kappa, M=M, epsilon=epsilon,
+                                     save=False, verbose=False, device=device)
+        else:
+            result = run_bo(f_obj, model_cls, n_iter=n_iter, kappa=kappa,
+                            save=False, verbose=False, device=device)
+
+        return {
+            'lengthscales': result['lengthscales'],
+            'mll_history': result['mll_history'],
+        }
+    except Exception as e:
+        print(f"FAILED: {model_name} rep {rep+1} on {device}: {e}")
+        traceback.print_exc()
+        return None
+
+
 def visualize_lengthscales(f_obj, model_cls, n_iter=200, n_reps=10, n_sobol=30, kappa=1.0,
                            M=1024, epsilon=0.25,
                            W=8, delta=0.01, cooldown=5, gamma=0.5,
@@ -1623,7 +1667,251 @@ def visualize_lengthscales(f_obj, model_cls, n_iter=200, n_reps=10, n_sobol=30, 
     plt.close(fig)
     return {'mean_lengthscales': mean_ls, 'std_lengthscales': std_ls}
 
-def _run_single_sobol_rep(rep, device, f_obj, model_cls, n_iter, n_sobol, kappa, M, epsilon):
+def visualize_mll(f_obj, model_cls, n_iter=200, n_reps=10, n_sobol=30, kappa=1.0,
+                  M=1024, epsilon=0.25, W=8, delta=0.01, cooldown=5, gamma=0.5,
+                  save=True, verbose=False, devices=['cpu']):
+    """
+    Run n_reps BO experiments in parallel and plot MLL and G_t (rolling-window MLL gain) traces.
+
+    Figure: 1 row × 2 columns
+      - Col 0: MLL trace (mean ± std band)
+      - Col 1: G_t signal (mean ± std band) + red dashed axhline at delta
+
+    Save path: output/synthetic_experiments/<name>/mll_{ModelName}_{d}d-{name}_kappa{kappa}.svg
+    """
+    model_name = model_cls.__name__
+    d = f_obj.d
+    num_workers = len(devices)
+
+    print(f"\nStarting visualize_mll ({model_name}) with {num_workers} workers on devices: {devices}")
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for rep in range(n_reps):
+            assigned_device = devices[rep % num_workers]
+            future = executor.submit(
+                _run_single_mll_ls_rep,
+                rep, assigned_device, f_obj, model_cls, n_iter, kappa,
+                n_sobol, M, epsilon, W, delta, cooldown, gamma
+            )
+            futures.append(future)
+
+        results = []
+        for future in as_completed(futures):
+            res = future.result()
+            if res is not None:
+                results.append(res)
+
+    if not results:
+        print("All reps failed — no plot generated.")
+        return None
+
+    # Stack mll_history: (n_reps, T_bo) — stored as negative MLL (Adam loss)
+    all_mll = np.array([r['mll_history'] for r in results])   # (n_reps, T_bo)
+    mll_vals = -all_mll   # negate → positive MLL
+
+    T_bo = mll_vals.shape[1]
+    n_init = np.clip(d * 3, 1, 20)
+    iters = np.arange(n_init + 1, n_init + 1 + T_bo)
+
+    # Compute G_t per rep then average
+    G_t_all = np.full_like(mll_vals, np.nan)
+    for t in range(2 * W, T_bo):
+        curr = mll_vals[:, t - W:t].mean(axis=1)
+        prev = mll_vals[:, t - 2 * W:t - W].mean(axis=1)
+        G_t_all[:, t] = np.abs(curr - prev)
+
+    mll_mean = mll_vals.mean(axis=0)
+    mll_std = mll_vals.std(axis=0)
+    G_t_mean = np.nanmean(G_t_all, axis=0)
+    G_t_std = np.nanstd(G_t_all, axis=0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Col 0: MLL trace
+    ax0 = axes[0]
+    ax0.plot(iters, mll_mean, linewidth=1.5)
+    ax0.fill_between(iters, mll_mean - mll_std, mll_mean + mll_std, alpha=0.2)
+    ax0.set_xlabel('Iteration')
+    ax0.set_ylabel('MLL')
+    ax0.set_title(f'MLL trace | {model_name}')
+    ax0.grid(True, linestyle='--', linewidth=0.4, alpha=0.5)
+
+    # Col 1: G_t signal
+    ax1 = axes[1]
+    ax1.plot(iters, G_t_mean, linewidth=1.5)
+    ax1.fill_between(iters, np.maximum(G_t_mean - G_t_std, 0), G_t_mean + G_t_std, alpha=0.2)
+    ax1.axhline(delta, color='red', linestyle='--', linewidth=1.2, label=f'delta = {delta}')
+    ax1.set_xlabel('Iteration')
+    ax1.set_ylabel('G_t')
+    ax1.set_title(f'G_t (W={W}, delta={delta}) | {model_name}')
+    ax1.legend(fontsize=8)
+    ax1.grid(True, linestyle='--', linewidth=0.4, alpha=0.5)
+
+    fig.suptitle(
+        f'MLL Diagnostics | {model_name} on {d}d-{f_obj.name} (kappa={kappa}, n={len(results)})',
+        fontsize=13
+    )
+    plt.tight_layout()
+
+    if save:
+        output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
+        os.makedirs(output_dir, exist_ok=True)
+        fname = f'mll_{model_name}_{d}d-{f_obj.name}_kappa{kappa}.svg'
+        fpath = os.path.join(output_dir, fname)
+        plt.savefig(fpath, format='svg')
+        print(f"Saved MLL plot to {fpath}")
+
+    plt.close(fig)
+    return {'mll_mean': mll_mean, 'mll_std': mll_std, 'G_t_mean': G_t_mean, 'G_t_std': G_t_std}
+
+
+def visualize_mll_and_lengthscales(f_obj, n_iter=200, n_reps=10, n_sobol=30,
+                                    kappas=None,
+                                    M=1024, epsilon=0.25, W=8, delta=0.01,
+                                    cooldown=5, gamma=0.5,
+                                    save=True, verbose=False, devices=['cpu']):
+    """
+    Run n_reps for ExactGP, AdditiveGP, and SobolGP in parallel and produce a
+    3-row × 3-column diagnostic figure:
+
+      Col 0: Log-lengthscales (all dims overlaid, tab10 colors)
+      Col 1: MLL trace (mean ± std)
+      Col 2: G_t signal (mean ± std) + delta threshold
+
+    Save path: output/synthetic_experiments/<name>/mll_ls_{d}d-{name}_k{k0}-{k1}-{k2}.svg
+    """
+    if kappas is None:
+        kappas = [1.0, 1.0, 1.0]
+
+    d = f_obj.d
+    n_init = np.clip(d * 3, 1, 20)
+    num_workers = len(devices)
+
+    model_specs = [
+        (ExactGP,    'ExactGP',    kappas[0], 'tab:blue'),
+        (AdditiveGP, 'AdditiveGP', kappas[1], 'tab:orange'),
+        (SobolGP,    'SobolGP',    kappas[2], 'tab:green'),
+    ]
+
+    print(f"\nStarting visualize_mll_and_lengthscales with {num_workers} workers on devices: {devices}")
+
+    # Collect all 3 × n_reps jobs in one executor
+    job_list = []
+    for model_cls, model_name, kappa, color in model_specs:
+        for rep in range(n_reps):
+            job_list.append((model_cls, model_name, kappa, color, rep))
+
+    raw_results = {spec[1]: [] for spec in model_specs}
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        future_to_tag = {}
+        for idx, (model_cls, model_name, kappa, color, rep) in enumerate(job_list):
+            assigned_device = devices[idx % num_workers]
+            future = executor.submit(
+                _run_single_mll_ls_rep,
+                rep, assigned_device, f_obj, model_cls, n_iter, kappa,
+                n_sobol, M, epsilon, W, delta, cooldown, gamma
+            )
+            future_to_tag[future] = model_name
+
+        for future in as_completed(future_to_tag):
+            model_name = future_to_tag[future]
+            res = future.result()
+            if res is not None:
+                raw_results[model_name].append(res)
+
+    # Build figure: 3 rows × 3 cols
+    fig, axes = plt.subplots(3, 3, figsize=(15, 15))
+    dim_colors = plt.cm.tab10(np.linspace(0, 1, d))
+
+    for row, (model_cls, model_name, kappa, model_color) in enumerate(model_specs):
+        reps_data = raw_results[model_name]
+        if not reps_data:
+            print(f"No successful reps for {model_name} — skipping row.")
+            continue
+
+        all_ls = np.array([r['lengthscales'] for r in reps_data])    # (n_reps, T_bo, d)
+        all_mll = np.array([r['mll_history'] for r in reps_data])    # (n_reps, T_bo)
+        mll_vals = -all_mll   # positive MLL
+
+        T_bo = mll_vals.shape[1]
+        iters = np.arange(n_init + 1, n_init + 1 + T_bo)
+
+        mean_ls = all_ls.mean(axis=0)   # (T_bo, d)
+        mll_mean = mll_vals.mean(axis=0)
+        mll_std = mll_vals.std(axis=0)
+
+        # G_t
+        G_t_all = np.full_like(mll_vals, np.nan)
+        for t in range(2 * W, T_bo):
+            curr = mll_vals[:, t - W:t].mean(axis=1)
+            prev = mll_vals[:, t - 2 * W:t - W].mean(axis=1)
+            G_t_all[:, t] = np.abs(curr - prev)
+        G_t_mean = np.nanmean(G_t_all, axis=0)
+        G_t_std = np.nanstd(G_t_all, axis=0)
+
+        # Col 0: Log-lengthscales
+        ax0 = axes[row, 0]
+        for dim_i in range(d):
+            ax0.plot(iters, mean_ls[:, dim_i], color=dim_colors[dim_i],
+                     linewidth=1.2, label=f'$\\ell_{{{dim_i+1}}}$')
+        ax0.axhline(0, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
+        ax0.set_ylim(-1, 1)
+        ax0.set_ylabel(f'{model_name}\nlog-LS', fontsize=9)
+        ax0.legend(fontsize=7, ncol=min(d, 4), loc='upper right')
+        ax0.grid(True, linestyle='--', linewidth=0.4, alpha=0.5)
+        if row == 0:
+            ax0.set_title('Log-lengthscales', fontsize=11)
+        if row == 2:
+            ax0.set_xlabel('Iteration')
+
+        # Col 1: MLL trace
+        ax1 = axes[row, 1]
+        ax1.plot(iters, mll_mean, color=model_color, linewidth=1.5)
+        ax1.fill_between(iters, mll_mean - mll_std, mll_mean + mll_std,
+                         color=model_color, alpha=0.2)
+        ax1.set_ylabel('MLL')
+        ax1.grid(True, linestyle='--', linewidth=0.4, alpha=0.5)
+        if row == 0:
+            ax1.set_title('MLL trace', fontsize=11)
+        if row == 2:
+            ax1.set_xlabel('Iteration')
+
+        # Col 2: G_t signal
+        ax2 = axes[row, 2]
+        ax2.plot(iters, G_t_mean, color=model_color, linewidth=1.5)
+        ax2.fill_between(iters, np.maximum(G_t_mean - G_t_std, 0), G_t_mean + G_t_std,
+                         color=model_color, alpha=0.2)
+        ax2.axhline(delta, color='red', linestyle='--', linewidth=1.2, label=f'delta={delta}')
+        ax2.set_ylabel('G_t')
+        ax2.legend(fontsize=7)
+        ax2.grid(True, linestyle='--', linewidth=0.4, alpha=0.5)
+        if row == 0:
+            ax2.set_title(f'G_t (W={W}, delta={delta})', fontsize=11)
+        if row == 2:
+            ax2.set_xlabel('Iteration')
+
+    k0, k1, k2 = kappas[0], kappas[1], kappas[2]
+    fig.suptitle(
+        f'MLL & Lengthscale Diagnostics | {d}d-{f_obj.name} | kappas={k0}/{k1}/{k2}',
+        fontsize=13
+    )
+    plt.tight_layout()
+
+    if save:
+        output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
+        os.makedirs(output_dir, exist_ok=True)
+        fname = f'mll_ls_{d}d-{f_obj.name}_k{k0}-{k1}-{k2}.svg'
+        fpath = os.path.join(output_dir, fname)
+        plt.savefig(fpath, format='svg')
+        print(f"Saved MLL+LS plot to {fpath}")
+
+    plt.close(fig)
+    return {'raw_results': raw_results}
+
+
+def _run_single_sobol_rep(rep, device, f_obj, model_cls, n_iter, n_sobol, kappa, M, epsilon, acq='ucb'):
     """
     Worker function for visualize_sobols: run one rep of run_partitionbo
     and return the sobol_interactions trace.
@@ -1634,7 +1922,7 @@ def _run_single_sobol_rep(rep, device, f_obj, model_cls, n_iter, n_sobol, kappa,
         result = run_partitionbo(
             f_obj, model_cls, n_iter=n_iter, n_sobol=n_sobol,
             kappa=kappa, M=M, epsilon=epsilon,
-            save=False, verbose=False, device=device
+            save=False, verbose=False, device=device, acq=acq
         )
         return result['sobol_interactions']
     except Exception as e:
@@ -1645,7 +1933,7 @@ def _run_single_sobol_rep(rep, device, f_obj, model_cls, n_iter, n_sobol, kappa,
 
 def visualize_sobols(f_obj, model_cls=SobolGP, n_iter=200, n_reps=10, n_sobol=30,
                      kappa=1.0, M=1024, epsilon=0.25,
-                     save=True, verbose=False, devices=['cpu']):
+                     save=True, verbose=False, devices=['cpu'], acq='ucb'):
     """
     Run n_reps of run_partitionbo in parallel, then plot true vs. estimated S1, SD, ST
     traces per dimension.
@@ -1685,7 +1973,7 @@ def visualize_sobols(f_obj, model_cls=SobolGP, n_iter=200, n_reps=10, n_sobol=30
             future = executor.submit(
                 _run_single_sobol_rep,
                 rep, assigned_device, f_obj, model_cls,
-                n_iter, n_sobol, kappa, M, epsilon
+                n_iter, n_sobol, kappa, M, epsilon, acq
             )
             futures.append(future)
 
@@ -1798,7 +2086,8 @@ def visualize_sobols(f_obj, model_cls=SobolGP, n_iter=200, n_reps=10, n_sobol=30
     if save:
         output_dir = os.path.join('output', 'synthetic_experiments', f_obj.name)
         os.makedirs(output_dir, exist_ok=True)
-        fname = f'sobol_traces_{model_cls.__name__}_{d}d-{f_obj.name}_kappa{kappa}.svg'
+        acq_suffix = f'_acq{acq}' if acq != 'ucb' else ''
+        fname = f'sobol_traces_{model_cls.__name__}_{d}d-{f_obj.name}_kappa{kappa}{acq_suffix}.svg'
         fpath = os.path.join(output_dir, fname)
         plt.savefig(fpath, format='svg')
         print(f"Saved Sobol traces plot to {fpath}")
@@ -1905,6 +2194,8 @@ def main(argv=None):
         'internal_representation': internal_representation,
         'visualize_lengthscales': visualize_lengthscales,
         'visualize_sobols': visualize_sobols,
+        'visualize_mll': visualize_mll,
+        'visualize_mll_and_lengthscales': visualize_mll_and_lengthscales,
     }
 
     if args.list_models:
@@ -1990,7 +2281,7 @@ def main(argv=None):
         elif args.method == 'optimization_metrics':
             if args.kappas is None: raise ValueError('--kappas must be provided for optimization_metrics (comma-separated 4 values: ExactGP,AdditiveGP,SobolGP,MHGP)')
             kappas = args.kappas
-            result = optimization_metrics(f_obj, kappas, n_iter=args.n_iter, n_reps=args.n_reps, devices=device_list)
+            result = optimization_metrics(f_obj, kappas, n_iter=args.n_iter, n_reps=args.n_reps, devices=device_list, acq=args.acq)
         elif args.method == 'internal_representation':
             if args.dim != 2:
                 raise ValueError("internal_representation only supports 2D functions (--dim 2)")
@@ -2008,7 +2299,25 @@ def main(argv=None):
             result = visualize_sobols(
                 f_obj, model_cls, n_iter=args.n_iter, n_reps=args.n_reps,
                 n_sobol=args.n_sobol, kappa=args.kappa, M=args.M, epsilon=args.epsilon,
-                save=args.save, verbose=args.verbose, devices=device_list)
+                save=args.save, verbose=args.verbose, devices=device_list, acq=args.acq)
+
+        elif args.method == 'visualize_mll':
+            result = visualize_mll(
+                f_obj, model_cls, n_iter=args.n_iter, n_reps=args.n_reps,
+                n_sobol=args.n_sobol, kappa=args.kappa,
+                M=args.M, epsilon=args.epsilon,
+                W=args.W, delta=args.delta, cooldown=args.cooldown, gamma=args.gamma,
+                save=True, verbose=args.verbose, devices=device_list)
+
+        elif args.method == 'visualize_mll_and_lengthscales':
+            if args.kappas is None:
+                raise ValueError('--kappas 3 values required: ExactGP,AdditiveGP,SobolGP')
+            result = visualize_mll_and_lengthscales(
+                f_obj, n_iter=args.n_iter, n_reps=args.n_reps,
+                n_sobol=args.n_sobol, kappas=args.kappas,
+                M=args.M, epsilon=args.epsilon,
+                W=args.W, delta=args.delta, cooldown=args.cooldown, gamma=args.gamma,
+                save=True, verbose=args.verbose, devices=device_list)
 
         else:
             raise ValueError('Unsupported method')

@@ -714,15 +714,128 @@ def plot_emg_exploration_traces(dataset, subject_idx, kappa_idx, show=True):
     plt.close(fig)
 
 
+def plot_train_time(dataset, model_idx=0, kappa=3, show=True):
+    """
+    Plot mean per-iteration training time for a single model, averaged over all
+    valid (subject, EMG, rep) slots.
+
+    Parameters:
+    - dataset  : str, one of 'nhp', 'rat', '5d_rat', 'spinal'
+    - model_idx: int, 0=ExactGP, 1=AdditiveGP, 2=SobolGP
+    - kappa    : float, UCB kappa value (default 3); nearest stored kappa is used
+    - show     : bool
+    """
+    npz_files = get_npz_files(dataset)
+    model_display = ['ExactGP', 'AdditiveGP', 'SobolGP'][model_idx]
+    emg_map = set_experiment(dataset)['n_emgs']
+
+    data = np.load(npz_files[model_idx], allow_pickle=True)
+    Train_time = np.asarray(data['Train_time'])   # (nSubj, max_nEmgs, n_kappas, nRep, MaxQ)
+    kappas = data['kappas']
+
+    k_idx = int(np.argmin(np.abs(kappas - kappa)))
+
+    n_subjects_in_file = Train_time.shape[0]
+    max_emgs_in_file   = Train_time.shape[1]
+    n_iters            = Train_time.shape[-1]
+
+    # Collect all valid (subject, emg) rep traces → (nRep, MaxQueries) each
+    all_traces = []
+    for s_i in range(min(len(emg_map), n_subjects_in_file)):
+        for e_i in range(min(emg_map[s_i], max_emgs_in_file)):
+            all_traces.append(Train_time[s_i, e_i, k_idx])   # (nRep, MaxQueries)
+
+    # Stack → (n_valid_slots * nRep, MaxQueries)
+    all_traces = np.concatenate(all_traces, axis=0)
+    mean_t = all_traces.mean(axis=0)
+    ci     = 1.96 * all_traces.std(axis=0) / np.sqrt(all_traces.shape[0])
+
+    iterations = np.arange(1, n_iters + 1)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(iterations, mean_t, color='steelblue', linewidth=1.5)
+    ax.fill_between(iterations, mean_t - ci, mean_t + ci, color='steelblue', alpha=0.2)
+    ax.set_title(f'Per-iteration train time | {dataset} | {model_display} (κ={float(kappas[k_idx])})')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Time (s)')
+    ax.grid(True, linestyle='--', linewidth=0.4)
+    plt.tight_layout()
+
+    save_dir = f'output/neurostim_experiments/{dataset}'
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir,
+                            f'{dataset}_{model_display}_traintime_kappa{float(kappas[k_idx])}.svg')
+    fig.savefig(out_path, bbox_inches='tight', dpi=200)
+    print(f'Saved train time plot to {out_path}')
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_cumulative_time(dataset, model_idx=0, kappa=3, show=True):
+    """
+    Plot mean cumulative training time for a single model, averaged over all
+    valid (subject, EMG, rep) slots.
+
+    Parameters:
+    - dataset  : str, one of 'nhp', 'rat', '5d_rat', 'spinal'
+    - model_idx: int, 0=ExactGP, 1=AdditiveGP, 2=SobolGP
+    - kappa    : float, UCB kappa value (default 3); nearest stored kappa is used
+    - show     : bool
+    """
+    npz_files = get_npz_files(dataset)
+    model_display = ['ExactGP', 'AdditiveGP', 'SobolGP'][model_idx]
+    emg_map = set_experiment(dataset)['n_emgs']
+
+    data = np.load(npz_files[model_idx], allow_pickle=True)
+    Cum_train = np.asarray(data['Cum_train'])   # (nSubj, max_nEmgs, n_kappas, nRep, MaxQ)
+    kappas = data['kappas']
+
+    k_idx = int(np.argmin(np.abs(kappas - kappa)))
+
+    n_subjects_in_file = Cum_train.shape[0]
+    max_emgs_in_file   = Cum_train.shape[1]
+    n_iters            = Cum_train.shape[-1]
+
+    all_traces = []
+    for s_i in range(min(len(emg_map), n_subjects_in_file)):
+        for e_i in range(min(emg_map[s_i], max_emgs_in_file)):
+            all_traces.append(Cum_train[s_i, e_i, k_idx])   # (nRep, MaxQueries)
+
+    all_traces = np.concatenate(all_traces, axis=0)
+    mean_t = all_traces.mean(axis=0)
+    ci     = 1.96 * all_traces.std(axis=0) / np.sqrt(all_traces.shape[0])
+
+    iterations = np.arange(1, n_iters + 1)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(iterations, mean_t, color='darkorange', linewidth=1.5)
+    ax.fill_between(iterations, mean_t - ci, mean_t + ci, color='darkorange', alpha=0.2)
+    ax.set_title(f'Cumulative train time | {dataset} | {model_display} (κ={float(kappas[k_idx])})')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Cumulative time (s)')
+    ax.grid(True, linestyle='--', linewidth=0.4)
+    plt.tight_layout()
+
+    save_dir = f'output/neurostim_experiments/{dataset}'
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir,
+                            f'{dataset}_{model_display}_cumtime_kappa{float(kappas[k_idx])}.svg')
+    fig.savefig(out_path, bbox_inches='tight', dpi=200)
+    print(f'Saved cumulative time plot to {out_path}')
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
 if __name__ == '__main__':
 
 
     # Plot optimizacdtion metrics for rat dataset
-    optimization_metrics(kappas=[2, 3, 2], dataset='5d_rat')
+    #optimization_metrics(kappas=[2, 3, 2], dataset='5d_rat')
 
     # Plot kappa comparison
-
     #plot_kappas(dataset='5d_rat')
+
+    plot_train_time('5d_rat', model_idx=1, show=True)
 
     #plot_emg_exploration_traces('5d_rat', 1, -1)
     # EMG exploration traces for 5d_rat
